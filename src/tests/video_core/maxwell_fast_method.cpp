@@ -797,6 +797,55 @@ TEST_CASE("Split consumption does not complete deferred downstream callbacks",
     REQUIRE(output == std::array<u32, 3>{1, 2, 3});
 }
 
+TEST_CASE("Split remembers the semaphore writes its back has not run yet",
+          "[video_core][gpu_split_dependencies]") {
+    using Access = VideoCommon::GpuSplitTestAccess;
+    Fixture f;
+    f.system.Initialize();
+    VideoCommon::GpuSplit split;
+    std::atomic<bool> release{};
+    Access::Start(split, f.system);
+    SCOPE_EXIT {
+        split.Stop();
+    };
+    // Runs before Stop: a failed check must not leave the back in the entry below.
+    SCOPE_EXIT {
+        release = true;
+    };
+    // Releases behind an entry the back is still in.
+    split.Defer([&release] {
+        while (!release.load()) {
+            std::this_thread::yield();
+        }
+    });
+    split.Defer([] {});
+    split.NoteSemaphoreWrite(0x1000, 5, true);
+    split.Defer([] {});
+    split.NoteSemaphoreWrite(0x2002, 7, false);
+    split.Publish();
+    auto queued = split.QueuedSemaphoreWriteAt(0x1000);
+    REQUIRE(queued.has_value());
+    REQUIRE(queued->known);
+    REQUIRE(queued->payload == 5);
+    // By 4-byte word: the second write is at 0x2000. No write was sent to 0x1004.
+    queued = split.QueuedSemaphoreWriteAt(0x2000);
+    REQUIRE(queued.has_value());
+    REQUIRE_FALSE(queued->known);
+    REQUIRE_FALSE(split.QueuedSemaphoreWriteAt(0x1004).has_value());
+    // The last write sent to a word decides.
+    split.Defer([] {});
+    split.NoteSemaphoreWrite(0x1000, 9, true);
+    split.Publish();
+    queued = split.QueuedSemaphoreWriteAt(0x1000);
+    REQUIRE(queued.has_value());
+    REQUIRE(queued->payload == 9);
+    // Once the back ran them, the words hold their values in memory.
+    release = true;
+    split.Drain(VideoCommon::DrainSite::Other);
+    REQUIRE_FALSE(split.QueuedSemaphoreWriteAt(0x1000).has_value());
+    REQUIRE_FALSE(split.QueuedSemaphoreWriteAt(0x2000).has_value());
+}
+
 TEST_CASE("Split restart resets writer positions without replaying old releases",
           "[video_core][gpu_split_dependencies]") {
     using Access = VideoCommon::GpuSplitTestAccess;
