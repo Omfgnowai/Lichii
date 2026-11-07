@@ -223,8 +223,18 @@ bool DmaPusher::Step() {
         // (the split only starts with unsafe reads; the settings can change mid-game).
         const bool use_safe = !VideoCommon::GpuSplit::Get().Active() &&
                               (Settings::IsDMALevelDefault() ? Settings::IsGPULevelHigh() : Settings::IsDMALevelSafe());
+        // Pages no GPU work has written yet may still get the list from compute or copy work
+        // queued before it. The GPU fetches the list after that work only past a host-level wait
+        // (NoteSync): later work is not ordered before the fetch, and the list does not wait for
+        // it (nor for draws, which write memory too; draw-written lists wait for the last sync).
+        // EDEN_NX2_SYNCED_LIST_WRITERS=0 waits for every writer sent so far, as before #805.
+        static const bool synced_list_writers = [] {
+            const char* value = std::getenv("EDEN_NX2_SYNCED_LIST_WRITERS");
+            return value == nullptr || value[0] != '0';
+        }();
         if (!gpu_written && VideoCommon::GpuSplit::Get().Active() &&
-            VideoCommon::GpuSplit::Get().WaitForWriters()) {
+            (synced_list_writers ? VideoCommon::GpuSplit::Get().WaitForSyncedWriters()
+                                 : VideoCommon::GpuSplit::Get().WaitForWriters())) {
             gpu_written =
                 IsGpuWrittenCommands(dma_state.dma_get, size_t{header.size} * sizeof(u32));
         }

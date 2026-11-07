@@ -74,6 +74,11 @@ struct GpuSplitTestAccess {
         return GpuSplit::RingWords - 1;
     }
 
+    /// The front waits for the back to reach a position (WaitFor).
+    static bool FrontWaits(const GpuSplit& split) {
+        return split.wait_target.load() != ~u64{0};
+    }
+
     static u64 Execute(GpuSplit& split, u64 position, u64 available) {
         const size_t index = position & GpuSplit::RingMask;
         const size_t size = split.Execute(
@@ -905,6 +910,88 @@ TEST_CASE("Split drain waits for the back's idle hook",
         split.Drain(VideoCommon::DrainSite::Acquire);
         REQUIRE(hooks.load() >= i);
     }
+}
+
+TEST_CASE("Split command list fetches wait only for the writers before the last host sync",
+          "[video_core][gpu_split_dependencies]") {
+    using Access = VideoCommon::GpuSplitTestAccess;
+    Fixture f;
+    f.system.Initialize();
+    VideoCommon::GpuSplit split;
+    std::array<std::atomic<bool>, 3> release{};
+    std::atomic<bool> done{};
+    bool waited{};
+    std::thread waiter;
+    Access::Start(split, f.system);
+    SCOPE_EXIT {
+        split.Stop();
+    };
+    // Runs before Stop: a failed check must not leave the back in an entry or the waiter waiting.
+    SCOPE_EXIT {
+        for (auto& flag : release) {
+            flag = true;
+        }
+        if (waiter.joinable()) {
+            waiter.join();
+        }
+    };
+    // An entry the back stays in until its flag is set.
+    const auto blocking = [&split](std::atomic<bool>& flag) {
+        split.Defer([&flag] {
+            while (!flag.load()) {
+                std::this_thread::yield();
+            }
+        });
+    };
+    const auto finishes = [&done] {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{5};
+        while (!done.load() && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds{1});
+        }
+        return done.load();
+    };
+
+    // A writer sent after the last host-level wait: the fetch does not wait for it.
+    split.NoteSync();
+    blocking(release[0]);
+    split.NoteWriter();
+    split.Publish();
+    REQUIRE_FALSE(split.WaitForSyncedWriters());
+
+    // A wait after it orders that writer before the fetch, but not the writer sent after the wait.
+    split.NoteSync();
+    blocking(release[1]);
+    split.NoteWriter();
+    split.Publish();
+    waiter = std::thread([&] {
+        waited = split.WaitForSyncedWriters();
+        done = true;
+    });
+    // The back reports its position at the target only if the front waits before it passes it.
+    const auto wait_deadline = std::chrono::steady_clock::now() + std::chrono::seconds{5};
+    while (!Access::FrontWaits(split) && !done.load() &&
+           std::chrono::steady_clock::now() < wait_deadline) {
+        std::this_thread::yield();
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds{20});
+    REQUIRE_FALSE(done.load());
+    release[0] = true;
+    REQUIRE(finishes());
+    waiter.join();
+    REQUIRE(waited);
+    release[1] = true;
+    split.Drain(VideoCommon::DrainSite::Other);
+
+    // Other work before the wait is not a writer: the fetch does not wait for it either.
+    split.Defer([] {});
+    split.NoteWriter();
+    split.Drain(VideoCommon::DrainSite::Other);
+    blocking(release[2]);
+    split.NoteSync();
+    split.Publish();
+    REQUIRE_FALSE(split.WaitForSyncedWriters());
+    release[2] = true;
+    split.Drain(VideoCommon::DrainSite::Other);
 }
 
 TEST_CASE("Split restart resets writer positions without replaying old releases",

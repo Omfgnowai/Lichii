@@ -340,6 +340,11 @@ std::optional<GpuSplit::QueuedSemaphoreWrite> GpuSplit::QueuedSemaphoreWriteAt(
     return QueuedSemaphoreWrite{it->second.payload, it->second.known};
 }
 
+bool GpuSplit::WaitForSyncedWriters() {
+    return WaitFor(std::min({last_writer_position, last_sync_position, write_position}),
+                   DrainSite::ListWriters);
+}
+
 bool GpuSplit::WaitFor(u64 target, DrainSite site) {
     consumed_cache = consumed.load(std::memory_order_acquire);
     if (consumed_cache >= target) {

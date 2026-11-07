@@ -336,6 +336,10 @@ public:
     /// it yet.
     [[nodiscard]] std::optional<QueuedSemaphoreWrite> QueuedSemaphoreWriteAt(
         u64 device_address) const;
+    /// Waits until the back executed the compute and copy work sent before the last NoteSync:
+    /// the writers a command list fetched now is ordered after. Returns whether any of it was
+    /// still queued.
+    bool WaitForSyncedWriters();
 
 private:
     friend struct GpuSplitTestAccess;
