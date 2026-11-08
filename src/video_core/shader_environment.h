@@ -305,6 +305,16 @@ public:
                (!recorded_read_properties || *recorded_read_properties == read_properties);
     }
 
+    /// Whether translating this recorded environment gives what translating `live`, the same
+    /// program as the game draws it now, would (the same code is assumed: the pipeline keys
+    /// match). Translation is decided by the answers to its questions, so each recorded question
+    /// is asked of `live`: a constant buffer value must be the same, unless it was only used as a
+    /// texture handle (then the texture it names now must have the same type and the same pixel
+    /// format traits as the recorded one) or as a storage buffer pointer word (then its
+    /// classification must be the same); texture questions, storage pointer classifications and
+    /// the other recorded answers must be the same. Sets `why` to the first answer that differs.
+    [[nodiscard]] bool AnswersHoldFor(Shader::Environment& live, const char** why = nullptr);
+
 private:
     std::vector<u64> code;
     ::Common::unordered_map<u32, Shader::TextureType> texture_types;
