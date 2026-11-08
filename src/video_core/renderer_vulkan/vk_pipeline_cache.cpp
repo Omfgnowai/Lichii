@@ -390,6 +390,34 @@ void CountPrecompiledReason(const char* reason) {
 }
 
 constexpr std::string_view PrecompiledInfosMagic{"NX2INFO2"};
+
+/// A shader stage from the SPIR-V the preparation step kept (precompiled_infos), on a worker.
+vk::ShaderModule BuildKeptSpirv(const Device& device, const std::filesystem::path& path,
+                                std::pair<u64, u32> blob, u64 pipeline_hash) {
+    thread_local std::ifstream file;
+    thread_local std::filesystem::path file_path;
+    thread_local std::vector<u8> compressed;
+    if (!file.is_open() || file_path != path) {
+        file.close();
+        file.clear();
+        file.open(path, std::ios::binary);
+        file_path = path;
+    }
+    const auto [offset, size] = blob;
+    compressed.resize(size);
+    file.clear();
+    file.seekg(static_cast<std::streamoff>(offset));
+    file.read(reinterpret_cast<char*>(compressed.data()), size);
+    const std::vector<u8> words =
+        file ? Common::Compression::DecompressDataZSTD(compressed) : std::vector<u8>{};
+    if (words.empty() || words.size() % sizeof(u32) != 0) {
+        file.close();
+        throw Shader::LogicError("Precompiled pipeline {:016x}: kept SPIR-V unreadable",
+                                 pipeline_hash);
+    }
+    return BuildShader(device, std::span<const u32>(reinterpret_cast<const u32*>(words.data()),
+                                                    words.size() / sizeof(u32)));
+}
 constexpr u32 NoInfo = ~0U;
 
 void AddRuntimeSpirvTime(size_t thread, std::chrono::steady_clock::time_point begin) {
@@ -989,6 +1017,12 @@ ComputePipeline* PipelineCache::CurrentComputePipeline(u64& native_key) {
     const auto [pair, is_new]{compute_cache.try_emplace(key)};
     auto& entry{pair->second};
     if (is_new) {
+        entry = CreateComputePipeline(key, shader);
+    } else if (entry.pipeline && entry.pipeline->IsPrecompiled() &&
+               entry.pipeline->BuildFailed()) {
+        precompiled_rejected.insert(key.Hash());
+        precompiled_failed.fetch_add(1, std::memory_order_relaxed);
+        retired_compute_pipelines.emplace_back(scheduler.CurrentTick(), std::move(entry.pipeline));
         entry = CreateComputePipeline(key, shader);
     } else if (!entry.null_pointer_slots.empty() && entry.rebuilds < MaxComputeRebuilds &&
                StaleNullPointerSlot(entry)) {
@@ -1712,7 +1746,8 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
     // the file as they come.
     // NX2INFO2: magic, u32 stamp size, the stamp, u64 index offset, the blobs (an info:
     // Shader::SerializeInfo; SPIR-V: one zstd frame of its words); at the index: u32 record
-    // count, u32 blob count, per record u64 key hash, u8 environment count, 3 bytes 0, u32
+    // count, u32 blob count, per record u64 key hash, u8 environment count, u8 kind (0
+    // graphics, 1 compute: its info and SPIR-V are stage 0's), 2 bytes 0, u32
     // environments[5], u32 info blobs[5] and u32 SPIR-V blobs[5] (per pipeline stage, ~0 for
     // none), per blob u64 offset, u32 size, u32 0.
     struct {
@@ -1752,10 +1787,12 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
         }
         return it->second;
     };
+    // A compute pipeline's info and SPIR-V are its stage 0.
     const auto keep_infos = [&kept, &keep_blob](
-                                size_t index, const GraphicsPipeline& pipeline,
+                                size_t index, const Shader::Info* compute_info,
+                                const GraphicsPipeline* graphics,
                                 const std::array<std::vector<u32>, Maxwell::MaxShaderStage>& spirv) {
-        if (pipeline.IsEmulatedMesh()) {
+        if (graphics && graphics->IsEmulatedMesh()) {
             return;
         }
         std::array<std::vector<u8>, 5> infos;
@@ -1763,7 +1800,8 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
         std::array<u64, 5> info_hash{};
         std::array<u64, 5> spirv_hash{};
         for (size_t stage = 0; stage < infos.size(); ++stage) {
-            const Shader::Info* const info = pipeline.StageInfo(stage);
+            const Shader::Info* const info =
+                graphics ? graphics->StageInfo(stage) : (stage == 0 ? compute_info : nullptr);
             if (!info) {
                 continue;
             }
@@ -1890,9 +1928,13 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
                 auto envs = read_envs(record.envs);
                 ShaderPools pools;
                 if (record.compute) {
+                    std::array<std::vector<u32>, Maxwell::MaxShaderStage> spirv;
                     const auto entry{CreateComputePipeline(pools, record.compute_key, envs.front(),
-                                                           nullptr, false)};
+                                                           nullptr, false, &spirv[0])};
                     ok = entry.pipeline != nullptr;
+                    if (ok) {
+                        keep_infos(index, &entry.pipeline->StageInfo(), nullptr, spirv);
+                    }
                 } else {
                     boost::container::static_vector<Shader::Environment*, Maxwell::MaxShaderProgram>
                         env_ptrs;
@@ -1905,7 +1947,7 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
                                                                nullptr, nullptr, &spirv)};
                     ok = pipeline && !pipeline->Failed();
                     if (ok) {
-                        keep_infos(index, *pipeline, spirv);
+                        keep_infos(index, nullptr, pipeline.get(), spirv);
                     }
                 }
             } catch (const std::exception& e) {
@@ -1927,8 +1969,7 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
     {
         std::vector<size_t> kept_records;
         for (size_t index = 0; index < total; ++index) {
-            if (!records[index].compute &&
-                std::ranges::any_of(kept.record_infos[index], [](u32 id) { return id != NoInfo; })) {
+            if (std::ranges::any_of(kept.record_infos[index], [](u32 id) { return id != NoInfo; })) {
                 kept_records.push_back(index);
             }
         }
@@ -1937,9 +1978,9 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
         put(kept.file, static_cast<u32>(kept.blobs.size()));
         for (const size_t index : kept_records) {
             const auto& record = records[index];
-            put(kept.file, record.graphics_key.Hash());
+            put(kept.file, record.compute ? record.compute_key.Hash() : record.graphics_key.Hash());
             put(kept.file, static_cast<u8>(record.envs.size()));
-            put(kept.file, std::array<u8, 3>{});
+            put(kept.file, std::array<u8, 3>{static_cast<u8>(record.compute ? 1 : 0)});
             std::array<u32, 5> envs{NoInfo, NoInfo, NoInfo, NoInfo, NoInfo};
             std::ranges::copy(record.envs, envs.begin());
             put(kept.file, envs);
@@ -1972,6 +2013,7 @@ bool PipelineCache::LoadPrecompiledInfos(const std::filesystem::path& precompile
                                          const std::filesystem::path& infos,
                                          const std::string& stamp) {
     precompiled_records.clear();
+    precompiled_compute_records.clear();
     try {
         std::ifstream file(infos, std::ios::binary);
         file.exceptions(std::ifstream::failbit | std::ifstream::badbit);
@@ -2009,7 +2051,8 @@ bool PipelineCache::LoadPrecompiledInfos(const std::filesystem::path& precompile
             get(record.infos);
             get(record.spirv);
             record.env_count = env_count;
-            precompiled_records.emplace(key_hash, record);
+            (pad[0] == 1 ? precompiled_compute_records : precompiled_records)
+                .emplace(key_hash, record);
         }
         precompiled_info_blobs.resize(blob_count);
         for (auto& [offset, size] : precompiled_info_blobs) {
@@ -2029,12 +2072,13 @@ bool PipelineCache::LoadPrecompiledInfos(const std::filesystem::path& precompile
                   precompiled_env_index.size() * sizeof(precompiled_env_index[0]));
     } catch (const std::ios_base::failure&) {
         precompiled_records.clear();
+        precompiled_compute_records.clear();
         return false;
     }
     precompiled_path = precompiled;
     precompiled_infos_path = infos;
-    LOG_INFO(Render_Vulkan, "Precompiled shader infos for {} pipelines",
-             precompiled_records.size());
+    LOG_INFO(Render_Vulkan, "Precompiled shader infos for {} graphics and {} compute pipelines",
+             precompiled_records.size(), precompiled_compute_records.size());
     return true;
 }
 
@@ -2143,35 +2187,11 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreatePrecompiledGraphicsPipeli
     if (kept_spirv) {
         auto build_kept = [this, key = graphics_key, path = precompiled_infos_path, spirv_blobs,
                            present] {
-            thread_local std::ifstream file;
-            thread_local std::filesystem::path file_path;
-            if (!file.is_open() || file_path != path) {
-                file.close();
-                file.clear();
-                file.open(path, std::ios::binary);
-                file_path = path;
-            }
             std::array<vk::ShaderModule, Maxwell::MaxShaderStage> modules;
-            std::vector<u8> compressed;
             for (size_t stage = 0; stage < modules.size(); ++stage) {
-                if (!present[stage]) {
-                    continue;
+                if (present[stage]) {
+                    modules[stage] = BuildKeptSpirv(device, path, spirv_blobs[stage], key.Hash());
                 }
-                const auto [offset, size] = spirv_blobs[stage];
-                compressed.resize(size);
-                file.clear();
-                file.seekg(static_cast<std::streamoff>(offset));
-                file.read(reinterpret_cast<char*>(compressed.data()), size);
-                const std::vector<u8> words =
-                    file ? Common::Compression::DecompressDataZSTD(compressed) : std::vector<u8>{};
-                if (words.empty() || words.size() % sizeof(u32) != 0) {
-                    file.close();
-                    throw Shader::LogicError("Precompiled pipeline {:016x}: kept SPIR-V unreadable",
-                                             key.Hash());
-                }
-                modules[stage] = BuildShader(
-                    device, std::span<const u32>(reinterpret_cast<const u32*>(words.data()),
-                                                 words.size() / sizeof(u32)));
             }
             precompiled_from_spirv.fetch_add(1, std::memory_order_relaxed);
             return modules;
@@ -2230,6 +2250,85 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreatePrecompiledGraphicsPipeli
         info_ptrs, std::move(emit_stages), std::nullopt);
     pipeline->MarkPrecompiled();
     return pipeline;
+}
+
+ComputePipelineCacheEntry PipelineCache::CreatePrecompiledComputePipeline(
+    const ComputePipelineCacheKey& key, ComputeEnvironment& env) {
+    if (precompiled_compute_records.empty()) {
+        return {};
+    }
+    const u64 hash = key.Hash();
+    const auto it = precompiled_compute_records.find(hash);
+    if (it == precompiled_compute_records.end() || precompiled_rejected.contains(hash)) {
+        return {};
+    }
+    const PrecompiledRecord& record = it->second;
+    if (record.env_count != 1 || record.infos[0] == NoInfo || record.spirv[0] == NoInfo ||
+        record.spirv[0] >= precompiled_info_blobs.size()) {
+        return {};
+    }
+    FileEnvironment recorded;
+    Shader::Info info{};
+    try {
+        if (!precompiled_file.is_open()) {
+            precompiled_file.open(precompiled_path, std::ios::binary);
+            precompiled_file.exceptions(std::ifstream::failbit | std::ifstream::badbit);
+        }
+        precompiled_file.clear();
+        precompiled_file.seekg(
+            static_cast<std::streamoff>(precompiled_env_index.at(record.envs[0]).first));
+        recorded.Deserialize(precompiled_file);
+        if (!precompiled_infos_file.is_open()) {
+            precompiled_infos_file.open(precompiled_infos_path, std::ios::binary);
+            precompiled_infos_file.exceptions(std::ifstream::failbit | std::ifstream::badbit);
+        }
+        const auto [offset, size] = precompiled_info_blobs.at(record.infos[0]);
+        std::vector<u8> bytes(size);
+        precompiled_infos_file.clear();
+        precompiled_infos_file.seekg(static_cast<std::streamoff>(offset));
+        precompiled_infos_file.read(reinterpret_cast<char*>(bytes.data()), size);
+        std::span<const u8> in{bytes};
+        if (!Shader::DeserializeInfo(in, info)) {
+            CountPrecompiledReason("infos unreadable or with layer emulation");
+            return {};
+        }
+    } catch (const std::exception&) {
+        CountPrecompiledReason("files unreadable");
+        precompiled_file.close();
+        precompiled_infos_file.close();
+        return {};
+    }
+    u32 format_traits = FileEnvironment::FormatTraitInteger;
+    if (std::ranges::any_of(info.image_descriptors,
+                            [](const auto& desc) { return desc.is_byte_addressed; })) {
+        format_traits |= FileEnvironment::FormatTraitByteAddressed;
+    }
+    if (!info.texture_buffer_descriptors.empty()) {
+        format_traits |= FileEnvironment::FormatTraitSnorm;
+    }
+    const char* why = "";
+    if (!recorded.AnswersHoldFor(env, &why, format_traits)) {
+        CountPrecompiledReason(why);
+        return {};
+    }
+    auto emit_module = [this, path = precompiled_infos_path,
+                        blob = precompiled_info_blobs[record.spirv[0]], hash] {
+        auto module = BuildKeptSpirv(device, path, blob, hash);
+        precompiled_from_spirv.fetch_add(1, std::memory_order_relaxed);
+        return module;
+    };
+    ComputePipelineCacheEntry entry{
+        .pipeline = std::make_unique<ComputePipeline>(
+            device, scheduler, vulkan_pipeline_cache, descriptor_pool, guest_descriptor_queue,
+            descriptor_buffer_ring, &workers, nullptr, &shader_notify, info, vk::ShaderModule{},
+            key.unique_hash, std::move(emit_module)),
+        // The live environment answered the same questions, as the translation would have.
+        .null_pointer_slots = env.IsNativeProgram() ? env.NullStoragePointerSlots()
+                                                    : std::vector<std::pair<u32, u32>>{},
+        .mapped_pointers =
+            env.IsNativeProgram() ? env.MappedStoragePointerKeys() : std::vector<u64>{}};
+    entry.pipeline->MarkPrecompiled();
+    return entry;
 }
 
 GraphicsPipeline* PipelineCache::ReplaceFailedPrecompiled() {
@@ -3203,8 +3302,22 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(const ComputePipe
     env.SetCachedSize(shader->size_bytes);
     env.KeepStoragePointers(keep_pointers);
 
-    main_pools.ReleaseContents();
-    auto entry{CreateComputePipeline(main_pools, key, env, nullptr, true)};
+    ComputePipelineCacheEntry entry;
+    if (keep_pointers.empty()) {
+        const auto precompiled_begin = std::chrono::steady_clock::now();
+        entry = CreatePrecompiledComputePipeline(key, env);
+        if (entry.pipeline) {
+            precompiled_created.fetch_add(1, std::memory_order_relaxed);
+            precompiled_gpu_ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                             std::chrono::steady_clock::now() - precompiled_begin)
+                                             .count(),
+                                         std::memory_order_relaxed);
+        }
+    }
+    if (!entry.pipeline) {
+        main_pools.ReleaseContents();
+        entry = CreateComputePipeline(main_pools, key, env, nullptr, true);
+    }
     if (const char* directory = std::getenv("EDEN_NX2_SHADER_DUMP");
         directory && !entry.pipeline && env.CanBeSerialized()) {
         const auto path = std::filesystem::path{directory} /
@@ -3230,7 +3343,7 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(const ComputePipe
 
 ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
     ShaderPools& pools, const ComputePipelineCacheKey& key, Shader::Environment& env,
-    PipelineStatistics* statistics, bool build_in_parallel) try {
+    PipelineStatistics* statistics, bool build_in_parallel, std::vector<u32>* spirv_out) try {
     auto hash = key.Hash();
     if (device.HasBrokenCompute()) {
         LOG_ERROR(Render_Vulkan, "Skipping {:#016x}", hash);
@@ -3261,6 +3374,9 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
         program.shared_memory_size = max_shared_memory;
     }
     std::vector<u32> code{EmitSPIRV(profile, program)};
+    if (spirv_out) {
+        *spirv_out = code;
+    }
     device.SaveShader(code);
     vk::ShaderModule spv_module{BuildShader(device, code)};
 

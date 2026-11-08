@@ -176,7 +176,13 @@ private:
                                                      const ComputePipelineCacheKey& key,
                                                      Shader::Environment& env,
                                                      PipelineStatistics* statistics,
-                                                     bool build_in_parallel);
+                                                     bool build_in_parallel,
+                                                     std::vector<u32>* spirv_out = nullptr);
+
+    /// The compute counterpart of CreatePrecompiledGraphicsPipeline: an entry without a
+    /// pipeline when the key is not precompiled or its answers differ.
+    ComputePipelineCacheEntry CreatePrecompiledComputePipeline(const ComputePipelineCacheKey& key,
+                                                               VideoCommon::ComputeEnvironment& env);
 
     void SerializeVulkanPipelineCache(const std::filesystem::path& filename,
                                       const vk::PipelineCache& pipeline_cache, u32 cache_version);
@@ -241,6 +247,7 @@ private:
         std::array<u32, 5> spirv{}; ///< Per pipeline stage: a SPIR-V blob (zstd), ~0U for none
     };
     std::unordered_map<u64, PrecompiledRecord> precompiled_records; ///< By key hash
+    std::unordered_map<u64, PrecompiledRecord> precompiled_compute_records; ///< By key hash
     std::vector<std::pair<u64, u64>> precompiled_env_index;         ///< Offset, size
     std::vector<std::pair<u64, u32>> precompiled_info_blobs;        ///< Offset, size (all blobs)
     std::filesystem::path precompiled_path;
