@@ -1340,6 +1340,9 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
 }
 
 void Maxwell3D::FrontNoteReport(VideoCommon::GpuSplit& split, const FrontState& fs) {
+    if (!split.AcquireSkip()) {
+        return;
+    }
     // What ProcessQueryGet will write on the back: a payload report writes the payload, a counter
     // what the GPU counted.
     Regs::ReportSemaphore report;

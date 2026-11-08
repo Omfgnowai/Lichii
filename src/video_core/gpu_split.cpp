@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <thread>
 
@@ -89,6 +90,14 @@ void GpuSplit::CheckOwner(const char* where) {
 
 GpuSplit GpuSplit::instance;
 
+bool GpuSplit::AcquireSkipWanted() {
+    static const bool wanted = [] {
+        const char* value = std::getenv("EDEN_NX2_EGLA66_ACQUIRE");
+        return value != nullptr && value[0] == '1';
+    }();
+    return wanted;
+}
+
 void GpuSplit::MaybeStart(Core::System& system_) {
     static const char mode = [] {
         const char* value = std::getenv("EDEN_NX2_SPLIT");
@@ -116,6 +125,13 @@ void GpuSplit::MaybeStart(Core::System& system_) {
     }
     system = &system_;
     check_owner = std::getenv("EDEN_NX2_SPLIT_CHECK") != nullptr;
+    acquire_skip = AcquireSkipWanted();
+    const char* perf4 = std::getenv("EDEN_NX2_EGLA66_ACQUIRE_PERF4");
+    acquire_feed = acquire_skip && (perf4 == nullptr || perf4[0] != '1');
+    if (acquire_skip) {
+        LOG_INFO(HW_GPU, "EGLA66 acquire: on, {}",
+                 acquire_feed ? "the back is fed and settled" : "as perf-4 (the back is not fed)");
+    }
     ring = std::make_unique<u64[]>(RingWords);
     back_thread = std::jthread([this](std::stop_token stop_token) { BackLoop(stop_token); });
     active = true;
@@ -153,6 +169,7 @@ void GpuSplit::Stop() {
     front_macros = false;
     published.store(0, std::memory_order_relaxed);
     consumed.store(0, std::memory_order_relaxed);
+    back_idle_at.store(~u64{0}, std::memory_order_relaxed);
     back_waiting.store(false, std::memory_order_relaxed);
     front_waiting.store(false, std::memory_order_relaxed);
 }
@@ -205,7 +222,7 @@ void GpuSplit::Publish() {
 
 void GpuSplit::Drain(DrainSite site) {
     consumed_cache = consumed.load(std::memory_order_acquire);
-    if (consumed_cache == write_position && BackQuiet()) {
+    if (consumed_cache == write_position && (!acquire_skip || BackQuiet())) {
         return;
     }
     Publish();
@@ -217,7 +234,7 @@ void GpuSplit::Drain(DrainSite site) {
     for (u32 spins = 0;; ++spins) {
         consumed_cache = consumed.load(std::memory_order_acquire);
         if (consumed_cache == write_position) {
-            if (BackQuiet()) {
+            if (!acquire_skip || BackQuiet()) {
                 publish_every = 8;
                 Nx2Profile::AddDrain(site, start);
                 return;
@@ -470,12 +487,19 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
 #ifdef _WIN32
     g_back_thread_id.store(GetCurrentThreadId(), std::memory_order_relaxed);
 #endif
+    const bool skip = acquire_skip;
     u64 read_position = 0;
     while (!stop_token.stop_requested()) {
         Nx2Profile::Report("GPU back thread");
         u64 available = published.load(std::memory_order_acquire);
         if (available == read_position) {
             Nx2Profile::Scope scope{Nx2Profile::Zone::SplitWait};
+            std::chrono::steady_clock::time_point spin_start{};
+            if (skip) {
+                // The front publishes what it holds after a few more words from now on.
+                back_idle_at.store(read_position, std::memory_order_relaxed);
+                spin_start = std::chrono::steady_clock::now();
+            }
             // The front usually sends more within microseconds: spin briefly before sleeping.
             for (u32 spins = 0; spins < 8192 && available == read_position &&
                                 !hook_requested.load(std::memory_order_relaxed);
@@ -483,11 +507,18 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
                 Pause();
                 available = published.load(std::memory_order_acquire);
             }
-            if (available == read_position) {
+            if (skip) {
+                Count(g_acquire_stats.back_waits);
+                Count(g_acquire_stats.back_spin_ns,
+                      static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                           std::chrono::steady_clock::now() - spin_start)
+                                           .count()));
+            }
+            if (available == read_position && (skip || idle_hook != nullptr)) {
                 hook_requested.store(false, std::memory_order_seq_cst);
                 // The front may already see everything consumed: Drain() waits for back_quiet
                 // too, so the deferred submit can't overlap whatever the front does next.
-                if (!back_quiet.load(std::memory_order_relaxed)) {
+                if (!skip || !back_quiet.load(std::memory_order_relaxed)) {
                     if (idle_hook != nullptr) {
                         idle_hook(idle_argument);
                     }
@@ -504,6 +535,9 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
                 // A request made after the hook ran (RequestIdleHook) runs it before sleeping.
                 if (available == read_position && !stop_token.stop_requested() &&
                     !hook_requested.load(std::memory_order_seq_cst)) {
+                    if (skip) {
+                        Count(g_acquire_stats.back_sleeps);
+                    }
                     wake.wait(seen, std::memory_order_seq_cst);
                 }
                 back_waiting.store(false, std::memory_order_relaxed);
@@ -511,8 +545,10 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
             }
         }
         u64 last_store = read_position;
-        // Before any entry runs, so a front that sees these entries consumed also sees this.
-        back_quiet.store(false, std::memory_order_seq_cst);
+        if (skip) {
+            // Before any entry runs, so a front that sees these entries consumed also sees this.
+            back_quiet.store(false, std::memory_order_seq_cst);
+        }
         while (read_position != available) {
             const size_t index = read_position & RingMask;
             const size_t size =
@@ -539,6 +575,49 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
     back_running.store(false, std::memory_order_seq_cst);
     front_wake.fetch_add(1, std::memory_order_seq_cst);
     front_wake.notify_all();
+}
+
+void GpuSplit::ReportAcquire() {
+    static u32 calls{};
+    static auto next = std::chrono::steady_clock::now() + std::chrono::seconds{10};
+    if (++calls % 256 != 0) {
+        return;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (now < next) {
+        return;
+    }
+    next = now + std::chrono::seconds{10};
+    auto& stats = g_acquire_stats;
+    const auto take = [](std::atomic<u64>& counter) {
+        return counter.exchange(0, std::memory_order_relaxed);
+    };
+    const u64 passed = take(stats.passed);
+    const u64 by_queued = take(stats.by_queued);
+    const u64 latched = take(stats.latched);
+    const u64 drained = take(stats.drained);
+    const u64 polls = take(stats.polls);
+    const u64 early_publishes = take(stats.early_publishes);
+    const u64 settles = take(stats.settles);
+    const u64 back_waits = take(stats.back_waits);
+    const u64 back_sleeps = take(stats.back_sleeps);
+    const double spin_ms = static_cast<double>(take(stats.back_spin_ns)) / 1e6;
+    LOG_INFO(HW_GPU,
+             "EGLA66 acquire: {} passed without a drain ({} by a queued release), {} resumed by "
+             "a latch, {} drained, {} polls waited without a drain in 10 s; back: {} waits for "
+             "work, {} slept, {:.1f} ms spinning; {} early publishes, {} idle hooks asked by polls",
+             passed, by_queued, latched, drained, polls, back_waits, back_sleeps, spin_ms,
+             early_publishes, settles);
+    const u64 mismatches = take(stats.mismatches);
+    const u64 unlanded = take(stats.unlanded);
+    const u64 late = take(stats.late);
+    if (mismatches != 0 || unlanded != 0 || late != 0) {
+        LOG_WARNING(HW_GPU,
+                    "EGLA66 acquire verify: {} passed but not met after a drain, {} met by a "
+                    "queued release not in memory after it, {} polls waited though a drain meets "
+                    "them, in 10 s",
+                    mismatches, unlanded, late);
+    }
 }
 
 } // namespace VideoCommon

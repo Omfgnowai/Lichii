@@ -78,6 +78,9 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
         while (!stop_token.stop_requested()) {
             Profile::Report();
             split.MaybeStart(system);
+            if (split.AcquireSkip()) {
+                split.ReportAcquire();
+            }
             if (scheduler.HasPendingChannels()) {
                 // Suspended channels wait on semaphores the CPU releases: poll them meanwhile.
                 bool resumed = false;
@@ -98,6 +101,7 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                     // present waited ~17 ms a frame in Kokiri village, with 50 us ~1 ms. A channel
                     // still waiting after 2 s (menus, loading) goes back to 1 ms sleeps.
                     Profile::Scope scope{Profile::Zone::PendingSleep};
+                    split.SettleIdleBack();
                     const auto waited = std::chrono::steady_clock::now() - last_progress;
                     if (waited < std::chrono::microseconds{500}) {
                         std::this_thread::yield();

@@ -225,7 +225,8 @@ void BufferCache<P>::WriteMemory(DAddr device_addr, u64 size, bool keep_page_gpu
     // guest CPU writes come through TryCacheInvalidation, which sends such pages to the GPU thread.
     const DAddr page_begin = Common::AlignDown(device_addr, DEVICE_PAGESIZE);
     const DAddr page_end = Common::AlignUp(device_addr + size, DEVICE_PAGESIZE);
-    if (keep_page_gpu_data && VideoCommon::GpuSplit::OwnsScheduler() &&
+    if (keep_page_gpu_data &&
+        (!VideoCommon::GpuSplit::AcquireSkipWanted() || VideoCommon::GpuSplit::OwnsScheduler()) &&
         gpu_modified_ranges.Intersects(page_begin, page_end - page_begin)) {
         // Switch 2 titles: upload the CPU's bytes into the buffer instead, as CachedWriteMemory
         // does, so the page stays GPU-owned and nothing waits for the host GPU.
