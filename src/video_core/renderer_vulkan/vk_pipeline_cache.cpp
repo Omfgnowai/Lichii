@@ -406,6 +406,28 @@ bool PrecompiledFastPath() {
     return enabled;
 }
 
+bool PrecompiledAudit() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_PRECOMPILED_AUDIT");
+        return value != nullptr && value[0] == '1';
+    }();
+    return enabled;
+}
+std::atomic<u32> audit_same{};
+std::atomic<u32> audit_differ{};
+
+/// The words of a kept SPIR-V blob, on the GPU thread.
+std::vector<u32> ReadKeptSpirv(std::ifstream& file, std::pair<u64, u32> blob) {
+    std::vector<u8> compressed(blob.second);
+    file.clear();
+    file.seekg(static_cast<std::streamoff>(blob.first));
+    file.read(reinterpret_cast<char*>(compressed.data()), blob.second);
+    const std::vector<u8> bytes = Common::Compression::DecompressDataZSTD(compressed);
+    std::vector<u32> words(bytes.size() / sizeof(u32));
+    std::memcpy(words.data(), bytes.data(), words.size() * sizeof(u32));
+    return words;
+}
+
 /// A shader stage from the SPIR-V the preparation step kept (precompiled_infos), on a worker.
 vk::ShaderModule BuildKeptSpirv(const Device& device, const std::filesystem::path& path,
                                 std::pair<u64, u32> blob, u64 pipeline_hash) {
@@ -2346,6 +2368,86 @@ ComputePipelineCacheEntry PipelineCache::CreatePrecompiledComputePipeline(
     return entry;
 }
 
+void PipelineCache::AuditPrecompiled(std::span<Shader::Environment* const> envs, bool compute,
+                                     u64 key_hash) {
+    const auto& records = compute ? precompiled_compute_records : precompiled_records;
+    const auto it = records.find(key_hash);
+    if (it == records.end()) {
+        return;
+    }
+    const PrecompiledRecord& record = it->second;
+    const auto differ = [&](size_t stage, const char* what) {
+        if (audit_differ.fetch_add(1, std::memory_order_relaxed) < 32) {
+            LOG_ERROR(Render_Vulkan, "Precompiled audit: {} pipeline {:016x} stage {}: {} differ",
+                      compute ? "compute" : "graphics", key_hash, stage, what);
+        }
+    };
+    try {
+        std::array<std::vector<u32>, Maxwell::MaxShaderStage> live_code;
+        std::array<std::vector<u8>, Maxwell::MaxShaderStage> live_info;
+        std::array<bool, Maxwell::MaxShaderStage> present{};
+        main_pools.ReleaseContents();
+        if (compute) {
+            Shader::Maxwell::Flow::CFG cfg{*envs[0], main_pools.flow_block,
+                                           envs[0]->StartAddress()};
+            auto program{TranslateProgram(main_pools.inst, main_pools.block, *envs[0], cfg,
+                                          host_info)};
+            live_code[0] = EmitSPIRV(profile, program);
+            Shader::SerializeInfo(program.info, live_info[0]);
+            present[0] = true;
+        } else {
+            GraphicsStages stages;
+            if (!TranslateGraphicsStages(main_pools, graphics_key, envs, stages, false)) {
+                differ(0, "the pipeline (skipped by its translation)");
+                return;
+            }
+            Shader::Backend::Bindings binding;
+            for (size_t stage = 0; stage < live_code.size(); ++stage) {
+                if (!stages.runtime_infos[stage]) {
+                    continue;
+                }
+                live_code[stage] =
+                    EmitPipelineShader(profile, *stages.runtime_infos[stage],
+                                       stages.programs[stage + 1], binding,
+                                       graphics_key.unique_hashes[stage + 1], {});
+                Shader::SerializeInfo(stages.programs[stage + 1].info, live_info[stage]);
+                present[stage] = true;
+            }
+        }
+        bool same = true;
+        for (size_t stage = 0; stage < present.size(); ++stage) {
+            if (present[stage] != (record.infos[stage] != NoInfo)) {
+                differ(stage, "stages");
+                same = false;
+                continue;
+            }
+            if (!present[stage]) {
+                continue;
+            }
+            const auto [offset, size] = precompiled_info_blobs.at(record.infos[stage]);
+            std::vector<u8> kept_info(size);
+            precompiled_infos_file.clear();
+            precompiled_infos_file.seekg(static_cast<std::streamoff>(offset));
+            precompiled_infos_file.read(reinterpret_cast<char*>(kept_info.data()), size);
+            if (kept_info != live_info[stage]) {
+                differ(stage, "infos");
+                same = false;
+            }
+            if (record.spirv[stage] != NoInfo &&
+                ReadKeptSpirv(precompiled_infos_file,
+                              precompiled_info_blobs.at(record.spirv[stage])) != live_code[stage]) {
+                differ(stage, "SPIR-V words");
+                same = false;
+            }
+        }
+        if (same) {
+            audit_same.fetch_add(1, std::memory_order_relaxed);
+        }
+    } catch (const std::exception& exception) {
+        differ(0, exception.what());
+    }
+}
+
 GraphicsPipeline* PipelineCache::ReplaceFailedPrecompiled() {
     precompiled_rejected.insert(graphics_key.Hash());
     precompiled_failed.fetch_add(1, std::memory_order_relaxed);
@@ -3223,6 +3325,13 @@ void ReportRuntimePipeline(const char* kind, std::chrono::steady_clock::time_poi
                  precompiled_from_spirv.exchange(0, std::memory_order::relaxed),
                  precompiled_drawn.exchange(0, std::memory_order::relaxed),
                  precompiled_failed.exchange(0, std::memory_order::relaxed), reasons);
+        if (PrecompiledAudit()) {
+            LOG_INFO(Render_Vulkan,
+                     "Precompiled audit in the last 10 s: {} pipelines translated from the game's "
+                     "state gave the kept SPIR-V and infos, {} differed",
+                     audit_same.exchange(0, std::memory_order::relaxed),
+                     audit_differ.exchange(0, std::memory_order::relaxed));
+        }
         total = {};
         count = 0;
         window = now;
@@ -3253,6 +3362,9 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() {
                                                                  precompiled_begin)
                 .count(),
             std::memory_order_relaxed);
+        if (PrecompiledAudit()) {
+            AuditPrecompiled(environments.Span(), false, graphics_key.Hash());
+        }
     } else {
         std::shared_ptr<ShaderPools> emit_pools;
         auto reservation =
@@ -3321,6 +3433,10 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(const ComputePipe
     if (keep_pointers.empty()) {
         const auto precompiled_begin = std::chrono::steady_clock::now();
         entry = CreatePrecompiledComputePipeline(key, env);
+        if (entry.pipeline && PrecompiledAudit()) {
+            Shader::Environment* const env_ptr = &env;
+            AuditPrecompiled(std::span(&env_ptr, 1), true, key.Hash());
+        }
         if (entry.pipeline) {
             precompiled_created.fetch_add(1, std::memory_order_relaxed);
             precompiled_gpu_ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(

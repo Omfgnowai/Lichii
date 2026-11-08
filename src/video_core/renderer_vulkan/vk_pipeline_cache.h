@@ -236,6 +236,13 @@ private:
     std::unique_ptr<GraphicsPipeline> CreatePrecompiledGraphicsPipeline(
         GraphicsEnvironments& environments);
 
+    /// EDEN_NX2_PRECOMPILED_AUDIT=1: a precompiled pipeline just created is also translated from
+    /// the game's state, on the GPU thread, and its SPIR-V and infos compared with the kept ones
+    /// (counted in the 10 s report, the first differences logged). Slow: a check of the
+    /// relational answers (FileEnvironment::AnswersHoldFor), not for play.
+    void AuditPrecompiled(std::span<Shader::Environment* const> envs, bool compute,
+                          u64 key_hash);
+
     /// The current pipeline was precompiled and its build failed (its translation did not give
     /// the infos it was drawn with): replaced by one translated from the game's state.
     GraphicsPipeline* ReplaceFailedPrecompiled();
