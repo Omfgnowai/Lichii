@@ -44,6 +44,7 @@
 #include "video_core/pipeline_cache_files.h"
 #include "video_core/renderer_vulkan/async_draw_policy.h"
 #include "shader_recompiler/info_serialize.h"
+#include "common/zstd_compression.h"
 #include "video_core/renderer_vulkan/fixed_pipeline_state.h"
 #include "video_core/renderer_vulkan/mesh_fallback_limits.h"
 #include "video_core/renderer_vulkan/maxwell_to_vk.h"
@@ -378,6 +379,7 @@ std::array<std::atomic<std::chrono::nanoseconds::rep>, 2> runtime_spirv_ns{};
 std::atomic<u32> precompiled_drawn{};
 std::atomic<u32> precompiled_failed{};
 std::atomic<u32> precompiled_created{};
+std::atomic<u32> precompiled_from_spirv{};
 std::atomic<std::chrono::nanoseconds::rep> precompiled_gpu_ns{};
 std::mutex precompiled_reasons_mutex;
 std::map<std::string, u32> precompiled_reasons;
@@ -387,7 +389,7 @@ void CountPrecompiledReason(const char* reason) {
     ++precompiled_reasons[reason];
 }
 
-constexpr std::string_view PrecompiledInfosMagic{"NX2INFO1"};
+constexpr std::string_view PrecompiledInfosMagic{"NX2INFO2"};
 constexpr u32 NoInfo = ~0U;
 
 void AddRuntimeSpirvTime(size_t thread, std::chrono::steady_clock::time_point begin) {
@@ -401,9 +403,13 @@ vk::ShaderModule EmitShaderModule(const Device& device, const Shader::Profile& p
                                  const Shader::RuntimeInfo& runtime_info,
                                  Shader::IR::Program& program, Shader::Backend::Bindings& binding,
                                  u64 shader_hash, size_t stage_index,
-                                 std::span<const u32> reference = {}) {
+                                 std::span<const u32> reference = {},
+                                 std::vector<u32>* code_out = nullptr) {
     const auto code =
         EmitPipelineShader(profile, runtime_info, program, binding, shader_hash, reference);
+    if (code_out) {
+        *code_out = code;
+    }
     device.SaveShader(code);
     vk::ShaderModule module{BuildShader(device, code)};
 
@@ -1701,40 +1707,92 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
         std::vector<u8> done;
     } state;
     state.done.assign(total, 0);
-    // The shader infos of each graphics pipeline built, kept once each (most pipelines share
-    // their programs' infos with others).
+    // The shader infos and SPIR-V of each graphics pipeline built, kept once each (most
+    // pipelines share their programs' infos with others, and stages their SPIR-V), written to
+    // the file as they come.
+    // NX2INFO2: magic, u32 stamp size, the stamp, u64 index offset, the blobs (an info:
+    // Shader::SerializeInfo; SPIR-V: one zstd frame of its words); at the index: u32 record
+    // count, u32 blob count, per record u64 key hash, u8 environment count, 3 bytes 0, u32
+    // environments[5], u32 info blobs[5] and u32 SPIR-V blobs[5] (per pipeline stage, ~0 for
+    // none), per blob u64 offset, u32 size, u32 0.
     struct {
         std::mutex mutex;
-        std::unordered_map<u64, u32> by_hash;
-        std::vector<std::vector<u8>> blobs;
+        std::ofstream file;
+        u64 offset{};
+        std::unordered_map<u64, u32> infos_by_hash;
+        std::unordered_map<u64, u32> spirv_by_hash;
+        std::vector<std::pair<u64, u32>> blobs;
         std::vector<std::array<u32, 5>> record_infos;
+        std::vector<std::array<u32, 5>> record_spirv;
+        u64 spirv_bytes{};
     } kept;
     kept.record_infos.assign(total, {NoInfo, NoInfo, NoInfo, NoInfo, NoInfo});
-    const auto keep_infos = [&kept](size_t index, const GraphicsPipeline& pipeline) {
+    kept.record_spirv.assign(total, {NoInfo, NoInfo, NoInfo, NoInfo, NoInfo});
+    auto kept_temporary = infos_path;
+    kept_temporary += ".tmp";
+    kept.file.open(kept_temporary, std::ios::binary | std::ios::trunc);
+    const auto put = [](std::ofstream& file, const auto& value) {
+        file.write(reinterpret_cast<const char*>(&value), sizeof(value));
+    };
+    kept.file.write(PrecompiledInfosMagic.data(), PrecompiledInfosMagic.size());
+    put(kept.file, static_cast<u32>(stamp.size()));
+    kept.file.write(stamp.data(), static_cast<std::streamsize>(stamp.size()));
+    const u64 index_offset_at = static_cast<u64>(kept.file.tellp());
+    put(kept.file, u64{0});
+    kept.offset = static_cast<u64>(kept.file.tellp());
+    // Under kept.mutex: the blob's id, written once.
+    const auto keep_blob = [&kept](std::unordered_map<u64, u32>& by_hash, u64 hash,
+                                   std::span<const u8> bytes) -> u32 {
+        const auto [it, added] = by_hash.try_emplace(hash, static_cast<u32>(kept.blobs.size()));
+        if (added) {
+            kept.file.write(reinterpret_cast<const char*>(bytes.data()),
+                            static_cast<std::streamsize>(bytes.size()));
+            kept.blobs.emplace_back(kept.offset, static_cast<u32>(bytes.size()));
+            kept.offset += bytes.size();
+        }
+        return it->second;
+    };
+    const auto keep_infos = [&kept, &keep_blob](
+                                size_t index, const GraphicsPipeline& pipeline,
+                                const std::array<std::vector<u32>, Maxwell::MaxShaderStage>& spirv) {
         if (pipeline.IsEmulatedMesh()) {
             return;
         }
-        std::array<std::vector<u8>, 5> bytes;
-        for (size_t stage = 0; stage < bytes.size(); ++stage) {
-            if (const Shader::Info* const info = pipeline.StageInfo(stage)) {
-                Shader::SerializeInfo(*info, bytes[stage]);
+        std::array<std::vector<u8>, 5> infos;
+        std::array<std::vector<u8>, 5> compressed;
+        std::array<u64, 5> info_hash{};
+        std::array<u64, 5> spirv_hash{};
+        for (size_t stage = 0; stage < infos.size(); ++stage) {
+            const Shader::Info* const info = pipeline.StageInfo(stage);
+            if (!info) {
+                continue;
+            }
+            Shader::SerializeInfo(*info, infos[stage]);
+            info_hash[stage] = Common::CityHash64(reinterpret_cast<const char*>(infos[stage].data()),
+                                                  infos[stage].size());
+            if (!spirv[stage].empty()) {
+                const auto* const words = reinterpret_cast<const u8*>(spirv[stage].data());
+                const size_t size = spirv[stage].size() * sizeof(u32);
+                spirv_hash[stage] =
+                    Common::CityHash64(reinterpret_cast<const char*>(words), size);
+                compressed[stage] = Common::Compression::CompressDataZSTD(words, size, 3);
             }
         }
         std::scoped_lock lock{kept.mutex};
-        for (size_t stage = 0; stage < bytes.size(); ++stage) {
-            if (bytes[stage].empty()) {
+        for (size_t stage = 0; stage < infos.size(); ++stage) {
+            if (infos[stage].empty()) {
                 continue;
             }
-            const u64 hash = Common::CityHash64(reinterpret_cast<const char*>(bytes[stage].data()),
-                                                bytes[stage].size());
-            const auto [it, added] =
-                kept.by_hash.try_emplace(hash, static_cast<u32>(kept.blobs.size()));
-            if (added) {
-                kept.blobs.push_back(std::move(bytes[stage]));
-            } else if (kept.blobs[it->second] != bytes[stage]) {
-                continue; // a hash collision: this stage gets no infos
+            kept.record_infos[index][stage] =
+                keep_blob(kept.infos_by_hash, info_hash[stage], infos[stage]);
+            if (!compressed[stage].empty()) {
+                const size_t before = kept.blobs.size();
+                kept.record_spirv[index][stage] =
+                    keep_blob(kept.spirv_by_hash, spirv_hash[stage], compressed[stage]);
+                if (kept.blobs.size() != before) {
+                    kept.spirv_bytes += compressed[stage].size();
+                }
             }
-            kept.record_infos[index][stage] = it->second;
         }
     };
     state.low_water = state.checkpoint = start_index;
@@ -1841,11 +1899,13 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
                     for (auto& env : envs) {
                         env_ptrs.push_back(&env);
                     }
+                    std::array<std::vector<u32>, Maxwell::MaxShaderStage> spirv;
                     const auto pipeline{CreateGraphicsPipeline(pools, record.graphics_key,
-                                                               MakeSpan(env_ptrs), nullptr, false)};
+                                                               MakeSpan(env_ptrs), nullptr, false,
+                                                               nullptr, nullptr, &spirv)};
                     ok = pipeline && !pipeline->Failed();
                     if (ok) {
-                        keep_infos(index, *pipeline);
+                        keep_infos(index, *pipeline, spirv);
                     }
                 }
             } catch (const std::exception& e) {
@@ -1860,12 +1920,10 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
     LOG_INFO(Render_Vulkan, "Precompiled pipelines: {} prepared, {} failed, {} skipped, in {:.1f} s",
              state.built, state.failed, state.skipped, seconds);
     if (stop_loading.stop_requested()) {
+        kept.file.close();
+        std::filesystem::remove(kept_temporary, error);
         return;
     }
-    // NX2INFO1: magic, u32 format (1), u32 stamp size, the stamp, u32 record count, u32 blob
-    // count; per record u64 key hash, u8 environment count, 3 bytes 0, u32 environments[5], u32
-    // info blobs[5] (per pipeline stage, ~0 for none); per blob u64 offset, u32 size, u32 0; the
-    // blobs (Shader::SerializeInfo).
     {
         std::vector<size_t> kept_records;
         for (size_t index = 0; index < total; ++index) {
@@ -1874,43 +1932,34 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
                 kept_records.push_back(index);
             }
         }
-        const auto put = [](std::ofstream& file, const auto& value) {
-            file.write(reinterpret_cast<const char*>(&value), sizeof(value));
-        };
-        auto temporary = infos_path;
-        temporary += ".tmp";
-        std::ofstream file(temporary, std::ios::binary | std::ios::trunc);
-        file.write(PrecompiledInfosMagic.data(), PrecompiledInfosMagic.size());
-        put(file, u32{1});
-        put(file, static_cast<u32>(stamp.size()));
-        file.write(stamp.data(), static_cast<std::streamsize>(stamp.size()));
-        put(file, static_cast<u32>(kept_records.size()));
-        put(file, static_cast<u32>(kept.blobs.size()));
+        const u64 index_offset = kept.offset;
+        put(kept.file, static_cast<u32>(kept_records.size()));
+        put(kept.file, static_cast<u32>(kept.blobs.size()));
         for (const size_t index : kept_records) {
             const auto& record = records[index];
-            put(file, record.graphics_key.Hash());
-            put(file, static_cast<u8>(record.envs.size()));
-            put(file, std::array<u8, 3>{});
+            put(kept.file, record.graphics_key.Hash());
+            put(kept.file, static_cast<u8>(record.envs.size()));
+            put(kept.file, std::array<u8, 3>{});
             std::array<u32, 5> envs{NoInfo, NoInfo, NoInfo, NoInfo, NoInfo};
             std::ranges::copy(record.envs, envs.begin());
-            put(file, envs);
-            put(file, kept.record_infos[index]);
+            put(kept.file, envs);
+            put(kept.file, kept.record_infos[index]);
+            put(kept.file, kept.record_spirv[index]);
         }
-        u64 offset = static_cast<u64>(file.tellp()) + kept.blobs.size() * 16;
-        for (const auto& blob : kept.blobs) {
-            put(file, offset);
-            put(file, static_cast<u32>(blob.size()));
-            put(file, u32{0});
-            offset += blob.size();
+        for (const auto& [offset, size] : kept.blobs) {
+            put(kept.file, offset);
+            put(kept.file, size);
+            put(kept.file, u32{0});
         }
-        for (const auto& blob : kept.blobs) {
-            file.write(reinterpret_cast<const char*>(blob.data()),
-                       static_cast<std::streamsize>(blob.size()));
-        }
-        file.close();
-        std::filesystem::rename(temporary, infos_path, error);
-        LOG_INFO(Render_Vulkan, "Precompiled shader infos kept for {} pipelines, {} distinct, {} MiB",
-                 kept_records.size(), kept.blobs.size(), (offset >> 20));
+        kept.file.seekp(static_cast<std::streamoff>(index_offset_at));
+        put(kept.file, index_offset);
+        kept.file.close();
+        std::filesystem::rename(kept_temporary, infos_path, error);
+        LOG_INFO(Render_Vulkan,
+                 "Precompiled shader infos and SPIR-V kept for {} pipelines: {} distinct infos, "
+                 "{} distinct stages of SPIR-V ({} MiB compressed), {} MiB in all",
+                 kept_records.size(), kept.infos_by_hash.size(), kept.spirv_by_hash.size(),
+                 kept.spirv_bytes >> 20, kept.offset >> 20);
     }
     std::ofstream stamp_file(stamp_path, std::ios::binary | std::ios::trunc);
     stamp_file << stamp;
@@ -1930,11 +1979,11 @@ bool PipelineCache::LoadPrecompiledInfos(const std::filesystem::path& precompile
             file.read(reinterpret_cast<char*>(&value), sizeof(value));
         };
         std::array<char, 8> magic{};
-        u32 format{}, stamp_size{}, record_count{}, blob_count{};
+        u32 stamp_size{}, record_count{}, blob_count{};
+        u64 index_offset{};
         file.read(magic.data(), magic.size());
-        get(format);
         get(stamp_size);
-        if (std::string_view{magic.data(), magic.size()} != PrecompiledInfosMagic || format != 1 ||
+        if (std::string_view{magic.data(), magic.size()} != PrecompiledInfosMagic ||
             stamp_size != stamp.size()) {
             return false;
         }
@@ -1943,6 +1992,8 @@ bool PipelineCache::LoadPrecompiledInfos(const std::filesystem::path& precompile
         if (file_stamp != stamp) {
             return false;
         }
+        get(index_offset);
+        file.seekg(static_cast<std::streamoff>(index_offset));
         get(record_count);
         get(blob_count);
         precompiled_records.reserve(record_count);
@@ -1956,6 +2007,7 @@ bool PipelineCache::LoadPrecompiledInfos(const std::filesystem::path& precompile
             get(pad);
             get(record.envs);
             get(record.infos);
+            get(record.spirv);
             record.env_count = env_count;
             precompiled_records.emplace(key_hash, record);
         }
@@ -2065,12 +2117,76 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreatePrecompiledGraphicsPipeli
             return nullptr;
         }
     }
-    // The worker translates the recorded environments, which give the same programs as the
-    // game's state does; the infos drawn with must be the ones that translation gives.
     std::array<bool, 5> present{};
     for (size_t stage = 0; stage < present.size(); ++stage) {
         present[stage] = info_ptrs[stage] != nullptr;
     }
+    // The worker builds the SPIR-V the preparation step kept: the translation of the recorded
+    // environments by this build, which the check above found to give the game state's.
+    // EDEN_NX2_PRECOMPILED_VERIFY=1 translates them again instead and compares the infos.
+    static const bool verify = [] {
+        const char* value = std::getenv("EDEN_NX2_PRECOMPILED_VERIFY");
+        return value != nullptr && value[0] == '1';
+    }();
+    bool kept_spirv = !verify;
+    std::array<std::pair<u64, u32>, 5> spirv_blobs{};
+    for (size_t stage = 0; stage < present.size() && kept_spirv; ++stage) {
+        if (!present[stage]) {
+            continue;
+        }
+        if (record.spirv[stage] == NoInfo || record.spirv[stage] >= precompiled_info_blobs.size()) {
+            kept_spirv = false;
+            break;
+        }
+        spirv_blobs[stage] = precompiled_info_blobs[record.spirv[stage]];
+    }
+    if (kept_spirv) {
+        auto build_kept = [this, key = graphics_key, path = precompiled_infos_path, spirv_blobs,
+                           present] {
+            thread_local std::ifstream file;
+            thread_local std::filesystem::path file_path;
+            if (!file.is_open() || file_path != path) {
+                file.close();
+                file.clear();
+                file.open(path, std::ios::binary);
+                file_path = path;
+            }
+            std::array<vk::ShaderModule, Maxwell::MaxShaderStage> modules;
+            std::vector<u8> compressed;
+            for (size_t stage = 0; stage < modules.size(); ++stage) {
+                if (!present[stage]) {
+                    continue;
+                }
+                const auto [offset, size] = spirv_blobs[stage];
+                compressed.resize(size);
+                file.clear();
+                file.seekg(static_cast<std::streamoff>(offset));
+                file.read(reinterpret_cast<char*>(compressed.data()), size);
+                const std::vector<u8> words =
+                    file ? Common::Compression::DecompressDataZSTD(compressed) : std::vector<u8>{};
+                if (words.empty() || words.size() % sizeof(u32) != 0) {
+                    file.close();
+                    throw Shader::LogicError("Precompiled pipeline {:016x}: kept SPIR-V unreadable",
+                                             key.Hash());
+                }
+                modules[stage] = BuildShader(
+                    device, std::span<const u32>(reinterpret_cast<const u32*>(words.data()),
+                                                 words.size() / sizeof(u32)));
+            }
+            precompiled_from_spirv.fetch_add(1, std::memory_order_relaxed);
+            return modules;
+        };
+        auto pipeline = std::make_unique<GraphicsPipeline>(
+            scheduler, buffer_cache, texture_cache, vulkan_pipeline_cache, &shader_notify, device,
+            descriptor_pool, guest_descriptor_queue, descriptor_buffer_ring, &workers, nullptr,
+            render_pass_cache, graphics_key,
+            std::array<vk::ShaderModule, Maxwell::MaxShaderStage>{}, info_ptrs,
+            std::move(build_kept), std::nullopt);
+        pipeline->MarkPrecompiled();
+        return pipeline;
+    }
+    // The worker translates the recorded environments, which give the same programs as the
+    // game's state does; the infos drawn with must be the ones that translation gives.
     auto emit_stages = [this, key = graphics_key, recorded, infos, present] {
         ShaderPools pools;
         boost::container::static_vector<Shader::Environment*, Maxwell::MaxShaderProgram> env_ptrs;
@@ -2841,7 +2957,8 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     ShaderPools& pools, const GraphicsPipelineCacheKey& key,
     std::span<Shader::Environment* const> envs, PipelineStatistics* statistics,
     bool build_in_parallel, std::shared_ptr<ShaderPools> emit_pools,
-    std::unique_ptr<EmissionBudget::Reservation> reservation) try {
+    std::unique_ptr<EmissionBudget::Reservation> reservation,
+    std::array<std::vector<u32>, Maxwell::MaxShaderStage>* spirv_out) try {
     LOG_DEBUG(Render_Vulkan, "{:#016x}", key.Hash());
     GraphicsStages stages;
     if (!TranslateGraphicsStages(pools, key, envs, stages, emit_pools != nullptr)) {
@@ -2900,7 +3017,8 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
             const auto begin = std::chrono::steady_clock::now();
             modules[stage] = EmitShaderModule(device, profile, *stages.runtime_infos[stage],
                                               stages.programs[stage + 1], binding,
-                                              key.unique_hashes[stage + 1], stage);
+                                              key.unique_hashes[stage + 1], stage, {},
+                                              spirv_out ? &(*spirv_out)[stage] : nullptr);
             if (build_in_parallel) {
                 AddRuntimeSpirvTime(0, begin);
             }
@@ -2983,11 +3101,12 @@ void ReportRuntimePipeline(const char* kind, std::chrono::steady_clock::time_poi
         }
         LOG_INFO(Render_Vulkan,
                  "Precompiled pipelines in the last 10 s: {} created from kept infos ({:.1f} ms on "
-                 "the GPU thread), {} translated on workers from their recorded environments, {} "
-                 "failed and replaced{}",
+                 "the GPU thread), {} built from kept SPIR-V, {} translated on workers from their "
+                 "recorded environments, {} failed and replaced{}",
                  precompiled_created.exchange(0, std::memory_order::relaxed),
                  ms(std::chrono::nanoseconds{
                      precompiled_gpu_ns.exchange(0, std::memory_order::relaxed)}),
+                 precompiled_from_spirv.exchange(0, std::memory_order::relaxed),
                  precompiled_drawn.exchange(0, std::memory_order::relaxed),
                  precompiled_failed.exchange(0, std::memory_order::relaxed), reasons);
         total = {};

@@ -161,7 +161,8 @@ private:
         ShaderPools& pools, const GraphicsPipelineCacheKey& key,
         std::span<Shader::Environment* const> envs, PipelineStatistics* statistics,
         bool build_in_parallel, std::shared_ptr<ShaderPools> emit_pools = nullptr,
-        std::unique_ptr<EmissionBudget::Reservation> reservation = nullptr);
+        std::unique_ptr<EmissionBudget::Reservation> reservation = nullptr,
+        std::array<std::vector<u32>, 5>* spirv_out = nullptr);
 
     [[nodiscard]] bool StaleNullPointerSlot(const ComputePipelineCacheEntry& entry) const;
 
@@ -214,18 +215,18 @@ private:
     void PreparePrecompiled(const std::filesystem::path& base_dir, std::stop_token stop_loading,
                             const VideoCore::DiskResourceLoadCallback& callback);
 
-    /// The shader infos the preparation step kept for the precompiled pipelines
+    /// The shader infos and SPIR-V the preparation step kept for the precompiled pipelines
     /// (precompiled_infos.fork-v<N>.bin, written for the file, driver and build of `stamp`), and
     /// the precompiled file's environment index; false when there are none for this stamp.
     bool LoadPrecompiledInfos(const std::filesystem::path& precompiled,
                               const std::filesystem::path& infos, const std::string& stamp);
 
     /// A precompiled pipeline for the current key, drawn with the shader infos the preparation
-    /// step kept while its programs are translated on a worker from the recorded environments:
-    /// the GPU thread checks that the game's state now answers the recorded environments'
-    /// questions as they were answered (FileEnvironment::AnswersHoldFor), so the translation is
-    /// the one the game's state would give, instead of translating. Null when the key is not
-    /// precompiled, its answers differ, or its infos are missing.
+    /// step kept while a worker builds it from the SPIR-V it kept (or, without it, translates
+    /// the recorded environments): the GPU thread checks that the game's state now answers the
+    /// recorded environments' questions as they were answered (FileEnvironment::AnswersHoldFor),
+    /// so the kept translation is the one the game's state would give, instead of translating.
+    /// Null when the key is not precompiled, its answers differ, or its infos are missing.
     std::unique_ptr<GraphicsPipeline> CreatePrecompiledGraphicsPipeline(
         GraphicsEnvironments& environments);
 
@@ -237,10 +238,11 @@ private:
         std::array<u32, 5> envs{};  ///< The precompiled file's environments, in stage order
         u8 env_count{};
         std::array<u32, 5> infos{}; ///< Per pipeline stage: an info blob, ~0U for none
+        std::array<u32, 5> spirv{}; ///< Per pipeline stage: a SPIR-V blob (zstd), ~0U for none
     };
     std::unordered_map<u64, PrecompiledRecord> precompiled_records; ///< By key hash
     std::vector<std::pair<u64, u64>> precompiled_env_index;         ///< Offset, size
-    std::vector<std::pair<u64, u32>> precompiled_info_blobs;        ///< Offset, size
+    std::vector<std::pair<u64, u32>> precompiled_info_blobs;        ///< Offset, size (all blobs)
     std::filesystem::path precompiled_path;
     std::filesystem::path precompiled_infos_path;
     std::ifstream precompiled_file;       ///< GPU thread only
