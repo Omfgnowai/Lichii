@@ -25,6 +25,7 @@
 #include "video_core/memory_manager.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_fast_draw.h"
+#include "video_core/nx2_acquire_test.h"
 #include "video_core/rasterizer_interface.h"
 
 namespace Tegra::Engines {
@@ -166,6 +167,20 @@ void VerifyWithoutDrain(DmaPusher& dma_pusher, const Puller::PendingAcquire& acq
     }
 }
 
+// Test build: a fence-flagged release the back processed meets the acquire before its memory
+// write (EDEN_NX2_FIX_LATCH).
+bool PendingReleaseMeets(DmaPusher& dma_pusher, const Puller::PendingAcquire& acquire) {
+    if (!VideoCommon::Nx2AcquireTest::FixLatch()) {
+        return false;
+    }
+    const auto device = dma_pusher.memory_manager.GpuToCpuAddress(acquire.address);
+    if (!device) {
+        return false;
+    }
+    const auto pending = VideoCommon::Nx2AcquireTest::PendingReleases::Get().Find(*device);
+    return pending && acquire.Matches(pending->value);
+}
+
 } // Anonymous namespace
 
 bool Puller::PendingAcquire::Matches(u32 current) const {
@@ -239,7 +254,7 @@ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
         }
         return true;
     }
-    if (pending_acquire->Matches(current)) {
+    if (pending_acquire->Matches(current) || PendingReleaseMeets(dma_pusher, *pending_acquire)) {
         return true;
     }
     // With delayed fence operations (Balanced or Accurate fences, accurate GPU), a release
@@ -250,7 +265,8 @@ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
                              : Settings::IsGPUFenceBehaviorBalanced() ||
                                    Settings::IsGPUFenceBehaviorAccurate();
     if (const auto now = std::chrono::steady_clock::now();
-        delayed && now - pending_acquire->last_fences >= std::chrono::milliseconds{1}) {
+        delayed && !VideoCommon::Nx2AcquireTest::T687Off() &&
+        now - pending_acquire->last_fences >= std::chrono::milliseconds{1}) {
         pending_acquire->last_fences = now;
         ReleaseFences(dma_pusher);
         if (Nx2SemaphoreWaiters::Get().Latched(this) ||
@@ -283,6 +299,27 @@ bool Puller::ResumeAcquire(DmaPusher& dma_pusher) {
     // counting those made the count odd ("suspended") at random, so submit-time snapshots were
     // thrown away for about half of all entries (CommandList::snapshot_suspensions).
     if (pending_acquire) {
+        namespace AcquireTest = VideoCommon::Nx2AcquireTest;
+        const auto waited = std::chrono::steady_clock::now() - pending_acquire->since;
+        AcquireTest::Stats::Get().Acquire(waited);
+        if (AcquireTest::WarnMs() > 0 &&
+            waited >= std::chrono::milliseconds{AcquireTest::WarnMs()}) {
+            const auto device = dma_pusher.memory_manager.GpuToCpuAddress(pending_acquire->address);
+            const auto pending =
+                device ? AcquireTest::PendingReleases::Get().Find(*device) : std::nullopt;
+            LOG_INFO(HW_GPU,
+                     "EGLA86 channel {} waited {} ms on semaphore {:#x} device {:#x} (op {}, {:#x}, "
+                     "now {:#x}); unwritten fence-flagged release: {} value {:#x} for {} ms",
+                     dma_pusher.channel_state.bind_id,
+                     std::chrono::duration_cast<std::chrono::milliseconds>(waited).count(),
+                     pending_acquire->address, device.value_or(0), pending_acquire->operation,
+                     pending_acquire->value, dma_pusher.memory_manager.Read<u32>(pending_acquire->address),
+                     pending.has_value(), pending ? pending->value : 0,
+                     pending ? std::chrono::duration_cast<std::chrono::milliseconds>(
+                                   std::chrono::steady_clock::now() - pending->at)
+                                   .count()
+                             : 0);
+        }
         pending_acquire.reset();
         dma_pusher.suspensions.fetch_add(1, std::memory_order_release);
         Nx2SemaphoreWaiters::Get().Remove(this);
@@ -429,7 +466,8 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
             VideoCommon::Count(stats.drained);
         }
         DrainBack();
-        if (acquire.Matches(ReadSemaphoreWord(dma_pusher, acquire.address))) {
+        if (acquire.Matches(ReadSemaphoreWord(dma_pusher, acquire.address)) ||
+            PendingReleaseMeets(dma_pusher, acquire)) {
             return;
         }
         // Registered before the fences run, so a release among them that meets the value counts

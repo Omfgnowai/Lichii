@@ -24,6 +24,7 @@
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2.h"
+#include "video_core/nx2_acquire_test.h"
 #include "video_core/query_cache/bank_base.h"
 #include "video_core/query_cache/frame_trace.h"
 #include "video_core/query_cache/query_base.h"
@@ -282,7 +283,17 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
     };
     u8* pointer = impl->device_memory.template GetPointer<u8>(cpu_addr);
     u8* pointer_timestamp = impl->device_memory.template GetPointer<u8>(cpu_addr + 8);
-    std::function<void()> operation([this, streamer, query_base = query, query_location,
+    namespace AcquireTest = VideoCommon::Nx2AcquireTest;
+    const bool is_synced = AcquireTest::T337Off() &&
+                           (Settings::IsGPUFenceBehaviorDefault()
+                                ? !Settings::IsGPULevelHigh()
+                                : !Settings::IsGPUFenceBehaviorBalanced() &&
+                                      !Settings::IsGPUFenceBehaviorAccurate()) &&
+                           is_fence;
+    const bool payload_fence = is_fence && counter_type == QueryType::Payload;
+    std::function<void()> operation([this, is_synced, payload_fence,
+                                     signaled = std::chrono::steady_clock::now(), streamer,
+                                     query_base = query, query_location,
                                      pointer, pointer_timestamp, cpu_addr, addr,
                                      asid = gpu_memory->GetID(), counter_type] {
         if (True(query_base->flags & QueryFlagBits::IsInvalidated)) {
@@ -293,7 +304,9 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
                          trace, asid, addr, cpu_addr, static_cast<u32>(counter_type),
                          static_cast<u32>(query_base->flags));
             }
-            impl->pending_unregister.push_back(query_location);
+            if (!is_synced) {
+                impl->pending_unregister.push_back(query_location);
+            }
             return;
         }
         if (False(query_base->flags & QueryFlagBits::IsFinalValueSynced)) [[unlikely]] {
@@ -306,7 +319,9 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
             }
             LOG_ERROR(HW_GPU,
                       "Query report value not synchronized. Consider increasing GPU accuracy.");
-            impl->pending_unregister.push_back(query_location);
+            if (!is_synced) {
+                impl->pending_unregister.push_back(query_location);
+            }
             return;
         }
         query_base->value += streamer->GetAmendValue();
@@ -320,6 +335,12 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
             std::memcpy(pointer, &value, sizeof(value));
         }
         Tegra::Nx2SemaphoreWaiters::Get().OnWrite(cpu_addr, static_cast<u32>(query_base->value));
+        if (payload_fence) {
+            VideoCommon::Nx2AcquireTest::PendingReleases::Get().Written(
+                cpu_addr, static_cast<u32>(query_base->value));
+            VideoCommon::Nx2AcquireTest::Stats::Get().Release(std::chrono::steady_clock::now() -
+                                                              signaled);
+        }
         if (const u64 trace = QueryTrace::Sample(QueryTrace::Event::Write)) {
             const bool wide = True(query_base->flags & QueryFlagBits::HasTimestamp);
             LOG_INFO(HW_GPU,
@@ -329,9 +350,17 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
                      wide ? query_base->value : static_cast<u32>(query_base->value),
                      static_cast<u32>(query_base->flags));
         }
-        impl->pending_unregister.push_back(query_location);
+        if (!is_synced) {
+            impl->pending_unregister.push_back(query_location);
+        }
     });
     if (is_fence) {
+        if (payload_fence) {
+            AcquireTest::PendingReleases::Get().Note(cpu_addr, payload);
+            if (AcquireTest::FixLatch()) {
+                Tegra::Nx2SemaphoreWaiters::Get().OnWrite(cpu_addr, payload);
+            }
+        }
         VideoCore::g_signaling_query_report_fence = true;
         impl->rasterizer.SignalFence(std::move(operation));
         VideoCore::g_signaling_query_report_fence = false;
@@ -358,6 +387,10 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
             return;
         }
         impl->rasterizer.SyncOperation(std::move(operation));
+    }
+    if (is_synced) {
+        streamer->Free(new_query_id);
+        return;
     }
     auto [cont_addr, base] = gen_caching_indexing(cpu_addr);
     {
