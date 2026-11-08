@@ -665,7 +665,10 @@ void GpuSplit::ReportAcquire() {
     const u64 by_queued = take(stats.by_queued);
     const u64 latched = take(stats.latched);
     const u64 drained = take(stats.drained);
+    const u64 valve_drains = take(stats.valve_drains);
     const u64 polls = take(stats.polls);
+    const u64 acquire_polls = take(stats.acquire_polls);
+    const u64 list_polls = take(stats.list_polls);
     const u64 early_publishes = take(stats.early_publishes);
     const u64 settles = take(stats.settles);
     const u64 back_waits = take(stats.back_waits);
@@ -673,10 +676,11 @@ void GpuSplit::ReportAcquire() {
     const double spin_ms = static_cast<double>(take(stats.back_spin_ns)) / 1e6;
     LOG_INFO(HW_GPU,
              "EGLA66 acquire: {} passed without a drain ({} by a queued release), {} resumed by "
-             "a latch, {} drained, {} polls waited without a drain in 10 s; back: {} waits for "
-             "work, {} slept, {:.1f} ms spinning; {} early publishes, {} idle hooks asked by polls",
-             passed, by_queued, latched, drained, polls, back_waits, back_sleeps, spin_ms,
-             early_publishes, settles);
+             "a latch, {} drained ({} by the 1 ms valve), {} polls waited without a drain in 10 s; "
+             "polls: {} of acquires, {} of GPU-written list copies; back: {} waits for work, {} "
+             "slept, {:.1f} ms spinning; {} early publishes, {} idle hooks asked by polls",
+             passed, by_queued, latched, drained, valve_drains, polls, acquire_polls, list_polls,
+             back_waits, back_sleeps, spin_ms, early_publishes, settles);
     const u64 mismatches = take(stats.mismatches);
     const u64 unlanded = take(stats.unlanded);
     const u64 late = take(stats.late);

@@ -200,21 +200,26 @@ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
         VideoCommon::Count(stats.passed);
         VerifyWithoutDrain(dma_pusher, *pending_acquire, check);
         return true;
-    case AcquireCheck::NotMet:
+    case AcquireCheck::NotMet: {
         // A release the back ran latches the waiter. Otherwise poll again later, without waiting
-        // for the back: until it runs one, nothing sent to the word meets it. After 2 s, the
-        // drain below reports the wait.
+        // for the back: until it runs one, nothing sent to the word meets it. Work only a drain
+        // finishes (the back's idle hook submits what the host GPU writes) still lands: a waiting
+        // acquire drains at most once per 1 ms (PantACRO4life's valve, b837e742c4), and the drain
+        // reports waits over 2 s.
         if (Nx2SemaphoreWaiters::Get().Latched(this)) {
             VideoCommon::Count(stats.latched);
             return true;
         }
-        if (pending_acquire->reported ||
-            std::chrono::steady_clock::now() - pending_acquire->since <= std::chrono::seconds{2}) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now - pending_acquire->last_drain < std::chrono::milliseconds{1}) {
             VideoCommon::Count(stats.polls);
             VerifyWithoutDrain(dma_pusher, *pending_acquire, check);
             return false;
         }
+        pending_acquire->last_drain = now;
+        VideoCommon::Count(stats.valve_drains);
         break;
+    }
     case AcquireCheck::Drain:
         break;
     }
@@ -398,6 +403,7 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
             .operation = static_cast<u32>(op),
             .since = std::chrono::steady_clock::now(),
             .last_fences = std::chrono::steady_clock::now(),
+            .last_drain = std::chrono::steady_clock::now(),
             .reported = false,
         };
         if (op != GpuSemaphoreOperation::AcquireEqual && op != GpuSemaphoreOperation::AcquireGequal &&
