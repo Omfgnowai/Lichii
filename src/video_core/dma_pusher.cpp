@@ -59,8 +59,15 @@ DmaPusher::DmaPusher(Core::System& system_, MemoryManager& memory_manager_, Cont
 DmaPusher::~DmaPusher() = default;
 
 bool DmaPusher::CanResumeAcquire() {
+    const bool count = VideoCommon::GpuSplit::Get().AcquireSkip();
     if (pending_list_tick) {
+        if (count) {
+            VideoCommon::Count(VideoCommon::g_acquire_stats.list_polls);
+        }
         return rasterizer->IsGpuTickDone(*pending_list_tick);
+    }
+    if (count) {
+        VideoCommon::Count(VideoCommon::g_acquire_stats.acquire_polls);
     }
     return puller.CanResumeAcquire(*this);
 }

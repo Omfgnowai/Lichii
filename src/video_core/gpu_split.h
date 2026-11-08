@@ -51,7 +51,10 @@ struct AcquireStats {
     std::atomic<u64> by_queued{}; ///< Of passed: met by a release the back had not run yet
     std::atomic<u64> latched{};   ///< Polls resumed by a release the back ran (no drain)
     std::atomic<u64> drained{};   ///< Acquires and polls that drained the split
+    std::atomic<u64> valve_drains{}; ///< Of drained: polls of an unmet acquire, once per 1 ms
     std::atomic<u64> polls{};     ///< Polls that keep waiting without a drain
+    std::atomic<u64> acquire_polls{}; ///< Polls of suspended channels waiting on an acquire
+    std::atomic<u64> list_polls{};    ///< ...and on a command list copy the GPU writes
     std::atomic<u64> early_publishes{}; ///< Publishes to a back that waits for work (Commit)
     std::atomic<u64> settles{};   ///< Idle hooks asked of a back that ran everything (SettleIdleBack)
     std::atomic<u64> back_waits{};      ///< The back ran out of work
