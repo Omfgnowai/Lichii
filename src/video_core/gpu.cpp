@@ -277,6 +277,7 @@ struct GPU::Impl {
                      raster_area.start_address, raster_area.end_address,
                      reads.load(std::memory_order_relaxed));
         }
+        const auto wait_start = std::chrono::steady_clock::now();
         namespace AsyncReadback = VideoCore::AsyncReadback;
         const u64 request = AsyncReadback::Now();
         const bool async = AsyncReadback::Enabled();
@@ -313,8 +314,57 @@ struct GPU::Impl {
         if (async || VideoCommon::Nx2Profile::Enabled()) {
             AsyncReadback::MaybeReport();
         }
+        cpu_read_waits.Add(raster_area.source, std::chrono::steady_clock::now() - wait_start);
         return raster_area;
     }
+
+    /// How long guest threads waited in OnCPURead, logged every 10 s while it happens.
+    struct CpuReadWaits {
+        static constexpr size_t Sources = 3;
+        std::array<std::atomic<u64>, Sources> count{};
+        std::array<std::atomic<u64>, Sources> total_ns{};
+        std::atomic<u64> max_ns{};
+        std::atomic<s64> window_start_ns{};
+
+        void Add(VideoCore::DownloadAreaSource source, std::chrono::steady_clock::duration wait) {
+            const u64 ns = static_cast<u64>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(wait).count());
+            const size_t index = static_cast<size_t>(source) < Sources ? static_cast<size_t>(source) : 0;
+            count[index].fetch_add(1, std::memory_order_relaxed);
+            total_ns[index].fetch_add(ns, std::memory_order_relaxed);
+            u64 max = max_ns.load(std::memory_order_relaxed);
+            while (ns > max && !max_ns.compare_exchange_weak(max, ns, std::memory_order_relaxed)) {
+            }
+            const s64 now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now().time_since_epoch())
+                                .count();
+            s64 start = window_start_ns.load(std::memory_order_relaxed);
+            if (start == 0) {
+                window_start_ns.compare_exchange_strong(start, now, std::memory_order_relaxed);
+                return;
+            }
+            constexpr s64 Window = 10'000'000'000;
+            if (now - start < Window ||
+                !window_start_ns.compare_exchange_strong(start, now, std::memory_order_relaxed)) {
+                return;
+            }
+            const double seconds = static_cast<double>(now - start) / 1e9;
+            std::array<u64, Sources> counts{};
+            std::array<double, Sources> ms{};
+            for (size_t i = 0; i < Sources; ++i) {
+                counts[i] = count[i].exchange(0, std::memory_order_relaxed);
+                ms[i] = static_cast<double>(total_ns[i].exchange(0, std::memory_order_relaxed)) / 1e6;
+            }
+            const double max_ms =
+                static_cast<double>(max_ns.exchange(0, std::memory_order_relaxed)) / 1e6;
+            LOG_INFO(HW_GPU,
+                     "CPU reads of GPU-written memory in the last {:.1f} s: texture {} ({:.1f} ms), "
+                     "buffer {} ({:.1f} ms), other {} ({:.1f} ms); {:.1f} ms/s waited, max {:.2f} ms",
+                     seconds, counts[1], ms[1], counts[2], ms[2], counts[0], ms[0],
+                     (ms[0] + ms[1] + ms[2]) / seconds, max_ms);
+        }
+    };
+    CpuReadWaits cpu_read_waits;
 
     /// Notify rasterizer that any caches of the specified region should be invalidated
     void InvalidateRegion(DAddr addr, u64 size, bool preserve_gpu_writes) {

@@ -16,10 +16,13 @@
 
 namespace VideoCore {
 
+enum class DownloadAreaSource : u8 { Other, Texture, Buffer };
+
 struct RasterizerDownloadArea {
     VAddr start_address;
     VAddr end_address;
     bool preemtive;
+    DownloadAreaSource source{DownloadAreaSource::Other};
     /// What guest memory lacks there is on its way for an earlier read: nothing to flush, only to
     /// wait for (RasterizerInterface::FinishRead).
     bool in_flight{};
