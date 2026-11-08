@@ -365,7 +365,8 @@ inline bool Nx2SparseUnwritten(u64 gpu_address, u64 size) {
 
 /// Channels suspended on a semaphore acquire. A console channel polls and sees every release;
 /// Eden writes releases in bursts when fences signal and resumes waiters only between command
-/// lists, so an acquire-equal could miss its value. Writes latch the waiters they satisfy.
+/// lists, so an acquire-equal could miss its value. Writes latch the waiters they satisfy, and so do
+/// releases whose write waits for the host GPU (OnDelayedRelease).
 /// The channels' acquires (Add, Remove, Latched) all run on the GPU thread (the split's front);
 /// writes (OnWrite) come from the thread that runs the engines. Latched takes no lock: a waiter
 /// polls its own slot, which only its own thread fills and empties.
@@ -403,7 +404,11 @@ public:
         free_slot->address = device_address;
         free_slot->value = value;
         free_slot->operation = operation;
-        free_slot->latched.store(false, std::memory_order_relaxed);
+        bool latched = false;
+        if (const auto it = delayed.find(device_address); it != delayed.end()) {
+            latched = Matches(*free_slot, it->second);
+        }
+        free_slot->latched.store(latched, std::memory_order_release);
         free_slot->owner.store(owner, std::memory_order_relaxed);
         count.fetch_add(1, std::memory_order_release);
         return true;
@@ -441,12 +446,32 @@ public:
             return;
         }
         std::scoped_lock lk{mutex};
-        for (Slot& slot : slots) {
-            if (slot.owner.load(std::memory_order_relaxed) != nullptr &&
-                slot.address == device_address && Matches(slot, value)) {
-                slot.latched.store(true, std::memory_order_release);
-            }
+        Latch(device_address, value);
+    }
+
+    /// A release the GPU reached in command order whose write waits for the host GPU to finish
+    /// the work before it (fence-flagged reports, see FenceManager::SignalFence). It meets
+    /// acquires now: work a channel runs after its acquire reaches the host GPU after that work.
+    /// Waiting for the write instead made every handoff between channels wait for the host GPU.
+    void OnDelayedRelease(u64 device_address, u32 value) {
+        std::scoped_lock lk{mutex};
+        delayed.insert_or_assign(device_address, value);
+        Latch(device_address, value);
+    }
+
+    /// The fence of a delayed release ran: memory holds its value or a later write.
+    void OnDelayedReleaseDone(u64 device_address, u32 value) {
+        std::scoped_lock lk{mutex};
+        if (const auto it = delayed.find(device_address);
+            it != delayed.end() && it->second == value) {
+            delayed.erase(it);
         }
+    }
+
+    /// A new emulation session starts: the last one's fences may never have run.
+    void ClearDelayedReleases() {
+        std::scoped_lock lk{mutex};
+        delayed.clear();
     }
 
 private:
@@ -457,6 +482,16 @@ private:
         u32 operation{};
         std::atomic<bool> latched{};
     };
+
+    /// Called with the mutex held.
+    void Latch(u64 device_address, u32 value) {
+        for (Slot& slot : slots) {
+            if (slot.owner.load(std::memory_order_relaxed) != nullptr &&
+                slot.address == device_address && Matches(slot, value)) {
+                slot.latched.store(true, std::memory_order_release);
+            }
+        }
+    }
 
     static bool Matches(const Slot& slot, u32 current) {
         switch (slot.operation) {
@@ -473,6 +508,7 @@ private:
 
     std::mutex mutex; ///< Held to fill, empty and latch slots
     std::array<Slot, MaxWaiters> slots{};
+    std::map<u64, u32> delayed; ///< OnDelayedRelease values whose fence hasn't run, by address
     std::atomic<size_t> count{};
 };
 
