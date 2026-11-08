@@ -731,11 +731,13 @@ bool TextureCache<P>::ResolveMemoizedTextures(SampledTextureMemo& memo,
         views[i] = ImageViewInOut{.index = entry.view_index, .blacklist = false, .id = entry.view};
         samplers[i] = entry.sampler;
         PrepareImageView(entry.view, false, false);
-    }
-    if (has_deleted_images) {
-        // Preparing an image deleted others: the full path resolves the views again.
-        memo.valid = false;
-        return false;
+        if (has_deleted_images) {
+            // Preparing an image deleted views (SynchronizeAliases -> ScaleDown ->
+            // InvalidateScale), possibly ones the remaining entries name: preparing those would
+            // read erased slots. The full path resolves the views again.
+            memo.valid = false;
+            return false;
+        }
     }
     return true;
 }
