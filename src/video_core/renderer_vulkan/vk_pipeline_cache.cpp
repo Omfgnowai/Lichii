@@ -2090,8 +2090,11 @@ bool PipelineCache::LoadPrecompiledInfos(const std::filesystem::path& precompile
             get(record.infos);
             get(record.spirv);
             record.env_count = env_count;
-            (pad[0] == 1 ? precompiled_compute_records : precompiled_records)
-                .emplace(key_hash, record);
+            if (pad[0] == 1) {
+                precompiled_compute_records.emplace(key_hash, record);
+            } else {
+                precompiled_records.emplace(key_hash, record);
+            }
         }
         precompiled_info_blobs.resize(blob_count);
         for (auto& [offset, size] : precompiled_info_blobs) {
@@ -2293,92 +2296,109 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreatePrecompiledGraphicsPipeli
 }
 
 ComputePipelineCacheEntry PipelineCache::CreatePrecompiledComputePipeline(
-    const ComputePipelineCacheKey& key, ComputeEnvironment& env) {
+    const ComputePipelineCacheKey& key, ComputeEnvironment& env,
+    const PrecompiledRecord** matched) {
     if (precompiled_compute_records.empty() || !PrecompiledFastPath()) {
         return {};
     }
     const u64 hash = key.Hash();
-    const auto it = precompiled_compute_records.find(hash);
-    if (it == precompiled_compute_records.end() || precompiled_rejected.contains(hash)) {
+    if (precompiled_rejected.contains(hash)) {
         return {};
     }
-    const PrecompiledRecord& record = it->second;
-    if (record.env_count != 1 || record.infos[0] == NoInfo || record.spirv[0] == NoInfo ||
-        record.spirv[0] >= precompiled_info_blobs.size()) {
-        return {};
-    }
-    FileEnvironment recorded;
-    Shader::Info info{};
-    try {
-        if (!precompiled_file.is_open()) {
-            precompiled_file.open(precompiled_path, std::ios::binary);
-            precompiled_file.exceptions(std::ifstream::failbit | std::ifstream::badbit);
+    // One record for each storage pointer state the program was prepared in.
+    const auto [first, last] = precompiled_compute_records.equal_range(hash);
+    const char* first_reason = nullptr;
+    for (auto it = first; it != last; ++it) {
+        const PrecompiledRecord& record = it->second;
+        if (record.env_count != 1 || record.infos[0] == NoInfo || record.spirv[0] == NoInfo ||
+            record.spirv[0] >= precompiled_info_blobs.size()) {
+            continue;
         }
-        precompiled_file.clear();
-        const auto [env_offset, env_size] = precompiled_env_index.at(record.envs[0]);
-        precompiled_file.seekg(static_cast<std::streamoff>(env_offset));
-        recorded.Deserialize(precompiled_file, static_cast<std::streamoff>(env_offset + env_size));
-        if (!precompiled_infos_file.is_open()) {
-            precompiled_infos_file.open(precompiled_infos_path, std::ios::binary);
-            precompiled_infos_file.exceptions(std::ifstream::failbit | std::ifstream::badbit);
-        }
-        const auto [offset, size] = precompiled_info_blobs.at(record.infos[0]);
-        std::vector<u8> bytes(size);
-        precompiled_infos_file.clear();
-        precompiled_infos_file.seekg(static_cast<std::streamoff>(offset));
-        precompiled_infos_file.read(reinterpret_cast<char*>(bytes.data()), size);
-        std::span<const u8> in{bytes};
-        if (!Shader::DeserializeInfo(in, info)) {
-            CountPrecompiledReason("infos unreadable or with layer emulation");
+        FileEnvironment recorded;
+        Shader::Info info{};
+        try {
+            if (!precompiled_file.is_open()) {
+                precompiled_file.open(precompiled_path, std::ios::binary);
+                precompiled_file.exceptions(std::ifstream::failbit | std::ifstream::badbit);
+            }
+            precompiled_file.clear();
+            const auto [env_offset, env_size] = precompiled_env_index.at(record.envs[0]);
+            precompiled_file.seekg(static_cast<std::streamoff>(env_offset));
+            recorded.Deserialize(precompiled_file,
+                                 static_cast<std::streamoff>(env_offset + env_size));
+            if (!precompiled_infos_file.is_open()) {
+                precompiled_infos_file.open(precompiled_infos_path, std::ios::binary);
+                precompiled_infos_file.exceptions(std::ifstream::failbit |
+                                                  std::ifstream::badbit);
+            }
+            const auto [offset, size] = precompiled_info_blobs.at(record.infos[0]);
+            std::vector<u8> bytes(size);
+            precompiled_infos_file.clear();
+            precompiled_infos_file.seekg(static_cast<std::streamoff>(offset));
+            precompiled_infos_file.read(reinterpret_cast<char*>(bytes.data()), size);
+            std::span<const u8> in{bytes};
+            if (!Shader::DeserializeInfo(in, info)) {
+                if (!first_reason) {
+                    first_reason = "infos unreadable or with layer emulation";
+                }
+                continue;
+            }
+        } catch (const std::exception&) {
+            CountPrecompiledReason("files unreadable");
+            precompiled_file.close();
+            precompiled_infos_file.close();
             return {};
         }
-    } catch (const std::exception&) {
-        CountPrecompiledReason("files unreadable");
-        precompiled_file.close();
-        precompiled_infos_file.close();
-        return {};
+        u32 format_traits = FileEnvironment::FormatTraitInteger;
+        if (std::ranges::any_of(info.image_descriptors,
+                                [](const auto& desc) { return desc.is_byte_addressed; })) {
+            format_traits |= FileEnvironment::FormatTraitByteAddressed;
+        }
+        if (!info.texture_buffer_descriptors.empty()) {
+            format_traits |= FileEnvironment::FormatTraitSnorm;
+        }
+        const char* why = "";
+        if (!recorded.AnswersHoldFor(env, &why, format_traits)) {
+            if (!first_reason) {
+                first_reason = why;
+            }
+            continue;
+        }
+        auto emit_module = [this, path = precompiled_infos_path,
+                            blob = precompiled_info_blobs[record.spirv[0]], hash] {
+            auto module = BuildKeptSpirv(device, path, blob, hash);
+            precompiled_from_spirv.fetch_add(1, std::memory_order_relaxed);
+            return module;
+        };
+        ComputePipelineCacheEntry entry{
+            .pipeline = std::make_unique<ComputePipeline>(
+                device, scheduler, vulkan_pipeline_cache, descriptor_pool, guest_descriptor_queue,
+                descriptor_buffer_ring, &workers, nullptr, &shader_notify, info,
+                vk::ShaderModule{}, key.unique_hash, std::move(emit_module)),
+            // The live environment answered the same questions, as the translation would have.
+            .null_pointer_slots = env.IsNativeProgram() ? env.NullStoragePointerSlots()
+                                                        : std::vector<std::pair<u32, u32>>{},
+            .mapped_pointers =
+                env.IsNativeProgram() ? env.MappedStoragePointerKeys() : std::vector<u64>{}};
+        entry.pipeline->MarkPrecompiled();
+        if (matched) {
+            *matched = &record;
+        }
+        return entry;
     }
-    u32 format_traits = FileEnvironment::FormatTraitInteger;
-    if (std::ranges::any_of(info.image_descriptors,
-                            [](const auto& desc) { return desc.is_byte_addressed; })) {
-        format_traits |= FileEnvironment::FormatTraitByteAddressed;
+    if (first_reason) {
+        CountPrecompiledReason(first_reason);
     }
-    if (!info.texture_buffer_descriptors.empty()) {
-        format_traits |= FileEnvironment::FormatTraitSnorm;
-    }
-    const char* why = "";
-    if (!recorded.AnswersHoldFor(env, &why, format_traits)) {
-        CountPrecompiledReason(why);
-        return {};
-    }
-    auto emit_module = [this, path = precompiled_infos_path,
-                        blob = precompiled_info_blobs[record.spirv[0]], hash] {
-        auto module = BuildKeptSpirv(device, path, blob, hash);
-        precompiled_from_spirv.fetch_add(1, std::memory_order_relaxed);
-        return module;
-    };
-    ComputePipelineCacheEntry entry{
-        .pipeline = std::make_unique<ComputePipeline>(
-            device, scheduler, vulkan_pipeline_cache, descriptor_pool, guest_descriptor_queue,
-            descriptor_buffer_ring, &workers, nullptr, &shader_notify, info, vk::ShaderModule{},
-            key.unique_hash, std::move(emit_module)),
-        // The live environment answered the same questions, as the translation would have.
-        .null_pointer_slots = env.IsNativeProgram() ? env.NullStoragePointerSlots()
-                                                    : std::vector<std::pair<u32, u32>>{},
-        .mapped_pointers =
-            env.IsNativeProgram() ? env.MappedStoragePointerKeys() : std::vector<u64>{}};
-    entry.pipeline->MarkPrecompiled();
-    return entry;
+    return {};
 }
 
 void PipelineCache::AuditPrecompiled(std::span<Shader::Environment* const> envs, bool compute,
-                                     u64 key_hash) {
-    const auto& records = compute ? precompiled_compute_records : precompiled_records;
-    const auto it = records.find(key_hash);
-    if (it == records.end()) {
+                                     u64 key_hash, const PrecompiledRecord* given) {
+    const auto it = precompiled_records.find(key_hash);
+    if (!given && (compute || it == precompiled_records.end())) {
         return;
     }
-    const PrecompiledRecord& record = it->second;
+    const PrecompiledRecord& record = given ? *given : it->second;
     const auto differ = [&](size_t stage, const char* what) {
         if (audit_differ.fetch_add(1, std::memory_order_relaxed) < 32) {
             LOG_ERROR(Render_Vulkan, "Precompiled audit: {} pipeline {:016x} stage {}: {} differ",
@@ -3432,13 +3452,16 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(const ComputePipe
     env.SetCachedSize(shader->size_bytes);
     env.KeepStoragePointers(keep_pointers);
 
+    // A rebuild too (keep_pointers): its environment answers the kept pointers as pointers before
+    // anything is asked, as its translation would see them.
     ComputePipelineCacheEntry entry;
-    if (keep_pointers.empty()) {
+    {
         const auto precompiled_begin = std::chrono::steady_clock::now();
-        entry = CreatePrecompiledComputePipeline(key, env);
+        const PrecompiledRecord* matched = nullptr;
+        entry = CreatePrecompiledComputePipeline(key, env, &matched);
         if (entry.pipeline && PrecompiledAudit()) {
             Shader::Environment* const env_ptr = &env;
-            AuditPrecompiled(std::span(&env_ptr, 1), true, key.Hash());
+            AuditPrecompiled(std::span(&env_ptr, 1), true, key.Hash(), matched);
         }
         if (entry.pipeline) {
             precompiled_created.fetch_add(1, std::memory_order_relaxed);

@@ -179,10 +179,14 @@ private:
                                                      bool build_in_parallel,
                                                      std::vector<u32>* spirv_out = nullptr);
 
+    struct PrecompiledRecord;
+
     /// The compute counterpart of CreatePrecompiledGraphicsPipeline: an entry without a
-    /// pipeline when the key is not precompiled or its answers differ.
-    ComputePipelineCacheEntry CreatePrecompiledComputePipeline(const ComputePipelineCacheKey& key,
-                                                               VideoCommon::ComputeEnvironment& env);
+    /// pipeline when the key is not precompiled or its answers differ. A key may have several
+    /// records (storage pointer states): the first whose answers hold is used (set to `matched`).
+    ComputePipelineCacheEntry CreatePrecompiledComputePipeline(
+        const ComputePipelineCacheKey& key, VideoCommon::ComputeEnvironment& env,
+        const PrecompiledRecord** matched = nullptr);
 
     void SerializeVulkanPipelineCache(const std::filesystem::path& filename,
                                       const vk::PipelineCache& pipeline_cache, u32 cache_version);
@@ -239,9 +243,10 @@ private:
     /// EDEN_NX2_PRECOMPILED_AUDIT=1: a precompiled pipeline just created is also translated from
     /// the game's state, on the GPU thread, and its SPIR-V and infos compared with the kept ones
     /// (counted in the 10 s report, the first differences logged). Slow: a check of the
-    /// relational answers (FileEnvironment::AnswersHoldFor), not for play.
+    /// relational answers (FileEnvironment::AnswersHoldFor), not for play. A compute pipeline
+    /// passes the record it was made from.
     void AuditPrecompiled(std::span<Shader::Environment* const> envs, bool compute,
-                          u64 key_hash);
+                          u64 key_hash, const PrecompiledRecord* record = nullptr);
 
     /// The current pipeline was precompiled and its build failed (its translation did not give
     /// the infos it was drawn with): replaced by one translated from the game's state.
@@ -254,7 +259,8 @@ private:
         std::array<u32, 5> spirv{}; ///< Per pipeline stage: a SPIR-V blob (zstd), ~0U for none
     };
     std::unordered_map<u64, PrecompiledRecord> precompiled_records; ///< By key hash
-    std::unordered_map<u64, PrecompiledRecord> precompiled_compute_records; ///< By key hash
+    /// By key hash; a compute key has a record for each storage pointer state it was prepared in
+    std::unordered_multimap<u64, PrecompiledRecord> precompiled_compute_records;
     std::vector<std::pair<u64, u64>> precompiled_env_index;         ///< Offset, size
     std::vector<std::pair<u64, u32>> precompiled_info_blobs;        ///< Offset, size (all blobs)
     std::filesystem::path precompiled_path;
