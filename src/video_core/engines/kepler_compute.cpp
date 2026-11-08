@@ -1533,6 +1533,9 @@ void KeplerCompute::FrontCallMethod(Core::System& system, VideoCommon::GpuSplit&
 
 void KeplerCompute::FrontNoteReport(VideoCommon::GpuSplit& split, const FrontState& fs,
                                     u32 control) {
+    if (!split.AcquireSkip()) {
+        return;
+    }
     // SET_REPORT_SEMAPHORE_D was sent: what ProcessNativeReportSemaphore will write on the back.
     const u32 operation = control & 3;
     if (operation != 0 && operation != 2) {

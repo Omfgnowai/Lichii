@@ -595,6 +595,9 @@ void DmaPusher::CallMultiMethod(const u32* base_start, u32 num_methods) {
 }
 
 void DmaPusher::NoteDmaSemaphore(u32 method, u32 argument) {
+    if (!VideoCommon::GpuSplit::Get().AcquireSkip()) {
+        return;
+    }
     using Engines::MaxwellDMA;
     if (method >= MaxwellDMA::SemaphoreMethod && method < MaxwellDMA::SemaphoreMethod + 3) {
         dma_semaphore[method - MaxwellDMA::SemaphoreMethod] = argument;
