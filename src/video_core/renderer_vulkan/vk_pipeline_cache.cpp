@@ -1737,7 +1737,10 @@ void PipelineCache::EvictUnusedPipelines() {
     // this long is destroyed; rebuilding it later requires a full GPU-thread shader translation
     // (~8.5 ms each) plus a driver pipeline cache hit.
     constexpr u64 EvictAfterFrames = 9000;
-    if (frame_count <= EvictAfterFrames) {
+    // Switch 2 titles keep theirs: a rebuilt pipeline translates its shaders on the GPU thread
+    // again, and with a raised frame rate limit 9000 frames is as little as 37 s (Eglantine
+    // 4d4e1858; its boot preload half isn't ported, the used list and background builds stay).
+    if (frame_count <= EvictAfterFrames || Settings::CurrentProgramIsSwitch2()) {
         return;
     }
     const u64 cutoff = frame_count - EvictAfterFrames;

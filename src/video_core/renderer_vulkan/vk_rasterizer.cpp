@@ -2374,12 +2374,14 @@ VideoCore::RasterizerDownloadArea RasterizerVulkan::GetFlushArea(DAddr addr, u64
         std::scoped_lock lock{buffer_cache.mutex};
         buffer_cache.ForgetReadTraps(texture_area->start_address,
                                      texture_area->end_address - texture_area->start_address);
+        texture_area->source = VideoCore::DownloadAreaSource::Texture;
         return *texture_area;
     }
     if (buffer_cache.FlushesOnCpuRead()) {
         std::scoped_lock lock{buffer_cache.mutex};
         auto area = buffer_cache.GetFlushArea(addr, size);
         if (area) {
+            area->source = VideoCore::DownloadAreaSource::Buffer;
             return *area;
         }
     }

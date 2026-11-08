@@ -818,6 +818,9 @@ private:
     }
 
     ReadTrapTracker read_trapped_ranges;
+    /// EDEN_NX2_HOT_PREFLUSH=<n> (experiment): flushes a native title's CPU reads forced, per
+    /// first page; a range flushed n times is marked Preflushable like a Switch 1 title's.
+    std::unordered_map<DAddr, u32> hot_read_flushes;
     /// Ranges the guest CPU read after GPU writes. A read that must flush downloads the GPU
     /// writes in all of them, so the reads that usually follow it find nothing left to flush.
     Common::RangeSet<DAddr> cpu_read_ranges;
