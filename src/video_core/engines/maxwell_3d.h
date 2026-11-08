@@ -41,6 +41,7 @@ class MemoryManager;
 
 namespace VideoCommon {
 class GpuSplit;
+enum class DrainSite : u32;
 }
 
 namespace VideoCore {
@@ -3800,5 +3801,11 @@ ASSERT_REG_POSITION(shader_performance, 0x333C);
 ASSERT_REG_POSITION(shadow_scratch, 0x3400);
 
 #undef ASSERT_REG_POSITION
+
+/// With the GPU thread split: reads `words` words of report memory (semaphores, reports) at
+/// `source` as the back will see them once it ran what is queued, without draining it: guest
+/// memory with the queued writes the front knows on top. False when they can't be known that way.
+bool ReadReportWordsQueued(MemoryManager& memory_manager, VideoCommon::GpuSplit& split,
+                           GPUVAddr source, u32* out, u32 words, VideoCommon::DrainSite site);
 
 } // namespace Tegra::Engines

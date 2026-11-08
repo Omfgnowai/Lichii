@@ -1671,8 +1671,8 @@ bool Maxwell3D::FrontContiguous(GPUVAddr address, u64 size, u64 device) const {
     return true;
 }
 
-bool Maxwell3D::FrontDmaReadQueued(VideoCommon::GpuSplit& split, FrontState& fs, u32 macro,
-                                   u32 method, GPUVAddr source, u32 words) {
+bool ReadReportWordsQueued(MemoryManager& memory_manager, VideoCommon::GpuSplit& split,
+                           GPUVAddr source, u32* out, u32 words, VideoCommon::DrainSite site) {
     // Without draining the back, for reads of report memory only (pages 3D reports and
     // semaphore releases write, such as occlusion results): the words in guest memory, with the
     // queued writes the front knows the words of on top (fence releases, inline uploads), once
@@ -1689,7 +1689,7 @@ bool Maxwell3D::FrontDmaReadQueued(VideoCommon::GpuSplit& split, FrontState& fs,
     }
     // Queued compute and copy work can write any page, and the back marks the pages GPU-written
     // only once it runs it.
-    split.WaitForWriters(VideoCommon::DrainSite::MacroDmaRead);
+    split.WaitForWriters(site);
     // Every page where a contiguous device range puts it: the queued-write checks look at
     // [*device, *device + read_bytes).
     for (GPUVAddr page = source & ~GPUVAddr{0xfff}; page < source + read_bytes; page += 0x1000) {
@@ -1705,8 +1705,6 @@ bool Maxwell3D::FrontDmaReadQueued(VideoCommon::GpuSplit& split, FrontState& fs,
                                 !Tegra::Nx2AsyncReportsSettled(*device, read_bytes))) {
         return false;
     }
-    thread_local std::vector<u32> fast;
-    fast.resize(words);
     const u64 since = split.ConsumedNow();
     // A fence release the back already ran lands when its host fence signals; one still queued
     // is overlaid below.
@@ -1715,13 +1713,25 @@ bool Maxwell3D::FrontDmaReadQueued(VideoCommon::GpuSplit& split, FrontState& fs,
         !Tegra::Nx2AsyncReportsSettled(*device, read_bytes)) {
         return false;
     }
-    memory_manager.ReadBlockUnsafe(source, fast.data(), read_bytes);
-    if (!split.OverlayQueuedWrites(since, *device, fast.data(), words)) {
+    memory_manager.ReadBlockUnsafe(source, out, read_bytes);
+    if (!split.OverlayQueuedWrites(since, *device, out, words)) {
         if (!split.WaitForWritesTo(*device, read_bytes)) {
             return false;
         }
-        memory_manager.ReadBlockUnsafe(source, fast.data(), read_bytes);
+        memory_manager.ReadBlockUnsafe(source, out, read_bytes);
     }
+    return true;
+}
+
+bool Maxwell3D::FrontDmaReadQueued(VideoCommon::GpuSplit& split, FrontState& fs, u32 macro,
+                                   u32 method, GPUVAddr source, u32 words) {
+    thread_local std::vector<u32> fast;
+    fast.resize(words);
+    if (!ReadReportWordsQueued(memory_manager, split, source, fast.data(), words,
+                               VideoCommon::DrainSite::MacroDmaRead)) {
+        return false;
+    }
+    const size_t read_bytes = size_t{words} * sizeof(u32);
     // EDEN_NX2_DMA_READ_CHECK=1: also drain, read again and log reads that differ.
     static const bool check = std::getenv("EDEN_NX2_DMA_READ_CHECK") != nullptr;
     if (check) [[unlikely]] {

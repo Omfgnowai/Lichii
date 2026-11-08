@@ -28,6 +28,7 @@
 #include "video_core/nx2.h"
 #include "video_core/nx2_acquire_test.h"
 #include "video_core/nx2_fast_draw.h"
+#include "video_core/nx2_perf.h"
 #include "video_core/rasterizer_interface.h"
 
 namespace Tegra::Engines {
@@ -69,6 +70,64 @@ void OnBack(const Func& func) {
 
 void DrainBack() {
     VideoCommon::GpuSplit::Get().Drain(VideoCommon::DrainSite::Acquire);
+}
+
+/// EDEN_NX2_REPORT_ACQUIRE=0 turns it off (on by default).
+bool ReportAcquireEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_REPORT_ACQUIRE");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+}
+
+/// With the GPU thread split and the macros on the front: whether the semaphore word at
+/// `address`, as the back will see it once it ran what is queued, is known without draining it
+/// and meets `met` (#956: guest memory with the queued writes the front knows on top, after the
+/// queued compute and copy writers ran, for report memory only). For the acquires
+/// CheckWithoutDrain sends to the drained path, mostly equal and mask ones (Ocarina of Time: over
+/// 99% of those that drain). Words the semaphore mirror shadows and fence releases the back ran
+/// that wait for their host fence take the drained path. EDEN_NX2_PERF_VERIFY drains anyway and
+/// reports an acquire the drained read doesn't meet (EDEN_NX2_ACQUIRE_VERIFY counts it).
+template <typename Met>
+bool AcquireMetQueued(DmaPusher& dma_pusher, GPUVAddr address, const Met& met) {
+    auto& split = VideoCommon::GpuSplit::Get();
+    if (!ReportAcquireEnabled() || !split.Active() || !split.FrontMacros()) {
+        return false;
+    }
+    const auto device = dma_pusher.memory_manager.GpuToCpuAddress(address);
+    if (!device || Nx2MirrorShadow::Get().Diverts(*device) ||
+        Nx2SemaphoreWaiters::Get().HasDelayedRelease(*device)) {
+        return false;
+    }
+    u32 word{};
+    if (!ReadReportWordsQueued(dma_pusher.memory_manager, split, address, &word, 1,
+                               VideoCommon::DrainSite::Acquire) ||
+        !met(word)) {
+        return false;
+    }
+    if (const auto shadowed = Nx2MirrorShadow::Get().Read(*device, word);
+        shadowed && !met(*shadowed)) {
+        return false;
+    }
+    if (VideoCommon::Nx2Perf::Verify()) {
+        DrainBack();
+        if (const u32 drained = ReadSemaphoreWord(dma_pusher, address); !met(drained)) {
+            static std::atomic<u32> reports{};
+            if (reports.fetch_add(1, std::memory_order_relaxed) < 16) {
+                LOG_ERROR(HW_GPU,
+                          "Nx2Perf acquire: semaphore {:#x} read {:#x} without draining, {:#x} "
+                          "drained",
+                          address, word, drained);
+            }
+            return false;
+        }
+    }
+    // A drain would have run the work queued before the acquire: GPU-written command lists
+    // fetched after it wait for that work (WaitForSync) instead.
+    split.NoteSync();
+    VideoCommon::Count(VideoCommon::g_acquire_stats.by_report_read);
+    return true;
 }
 
 // The fence manager records into the scheduler and downloads the CPU's writes over GPU data:
@@ -260,6 +319,12 @@ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
         break;
     }
     case AcquireCheck::Drain:
+        if (AcquireMetQueued(dma_pusher, pending_acquire->address,
+                             [&](u32 word) { return pending_acquire->Matches(word); })) {
+            VideoCommon::Count(stats.passed);
+            VerifyWithoutDrain(dma_pusher, *pending_acquire, AcquireCheck::Met);
+            return true;
+        }
         break;
     }
     VideoCommon::Count(stats.drained);
@@ -471,6 +536,12 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
             }
             VideoCommon::Count(stats.passed);
             VerifyWithoutDrain(dma_pusher, acquire, without_drain);
+            return;
+        } else if (without_drain == AcquireCheck::Drain &&
+                   AcquireMetQueued(dma_pusher, acquire.address,
+                                    [&](u32 word) { return acquire.Matches(word); })) {
+            VideoCommon::Count(stats.passed);
+            VerifyWithoutDrain(dma_pusher, acquire, AcquireCheck::Met);
             return;
         }
         VideoCommon::Count(stats.drained);

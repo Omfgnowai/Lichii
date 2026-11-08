@@ -51,6 +51,7 @@ enum class DrainSite : u32 {
 struct AcquireStats {
     std::atomic<u64> passed{};    ///< Acquires and polls met without a drain
     std::atomic<u64> by_queued{}; ///< Of passed: met by a release the back had not run yet
+    std::atomic<u64> by_report_read{}; ///< Of passed: met by the queued report-memory read (#956)
     std::atomic<u64> latched{};   ///< Polls resumed by a release the back ran (no drain)
     std::atomic<u64> drained{};   ///< Acquires and polls that drained the split
     std::atomic<u64> drain_operation{}; ///< Of drained: an equal or mask acquire
