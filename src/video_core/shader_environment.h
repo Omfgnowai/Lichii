@@ -313,7 +313,17 @@ public:
     /// format traits as the recorded one) or as a storage buffer pointer word (then its
     /// classification must be the same); texture questions, storage pointer classifications and
     /// the other recorded answers must be the same. Sets `why` to the first answer that differs.
-    [[nodiscard]] bool AnswersHoldFor(Shader::Environment& live, const char** why = nullptr);
+    /// `format_traits` limits the pixel format traits compared to those the program's
+    /// translation used (PixelFormatTraits bits; see PipelineCache's precompiled pipelines).
+    [[nodiscard]] bool AnswersHoldFor(Shader::Environment& live, const char** why = nullptr,
+                                      u32 format_traits = ~0U);
+
+    /// Pixel format traits translation uses: integer formats (sampled textures).
+    static constexpr u32 FormatTraitInteger = 1;
+    /// R16_FLOAT and the byte-addressed 32-bit color formats (byte-addressed image stores).
+    static constexpr u32 FormatTraitByteAddressed = 2 | 4;
+    /// Snorm formats (buffer texel fetches on hosts without snorm render buffers).
+    static constexpr u32 FormatTraitSnorm = 8;
 
 private:
     std::vector<u64> code;
