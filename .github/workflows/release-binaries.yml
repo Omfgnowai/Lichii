@@ -592,7 +592,7 @@ jobs:
   # unticked.
   release:
     name: Publish release
-    needs: build
+    needs: [prepare-release, build]
     if: github.event_name == 'push' || inputs.publish_release
     runs-on: ubuntu-24.04
     permissions:
@@ -606,8 +606,22 @@ jobs:
 
       - name: Package release files
         shell: bash
+        env:
+          MATRIX: ${{ needs.prepare-release.outputs.matrix }}
         run: |
           set -euo pipefail
+          # A pattern that matches a single artifact extracts it straight into artifacts/, without
+          # its own folder; put it back in one so it is packaged as a whole.
+          shopt -s dotglob nullglob
+          wrapped=(artifacts/lichii-*/)
+          if (( ${#wrapped[@]} == 0 )); then
+            name="lichii-$(jq -r '.include[0].platform' <<< "$MATRIX")-${GITHUB_SHA}"
+            staging=$(mktemp -d)
+            mv artifacts/* "$staging"/
+            mkdir -p "artifacts/$name"
+            mv "$staging"/* "artifacts/$name"/
+          fi
+          shopt -u dotglob nullglob
           mkdir dist
           # Asset names drop the commit sha: the release tag already identifies the build, and
           # stable names let the notes table link to them.
