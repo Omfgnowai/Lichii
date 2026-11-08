@@ -7,6 +7,8 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <optional>
@@ -1571,6 +1573,46 @@ bool Maxwell3D::FrontSkipsLoopWrite(FrontState& fs, u32 method, u32 value, bool 
     return method != MAXWELL3D_REG_INDEX(draw.end) || fs.instance_loop;
 }
 
+namespace {
+/// EDEN_NX2_DMA_READ_STATS=1 (measurement only, front thread): whether the drain before a
+/// native macro's DMA read could have been skipped. "Front-clear" reads touch no word with a
+/// release or report the front sent that the back may not have run (needs EDEN_NX2_EGLA66_ACQUIRE,
+/// which records them) and no page the buffer cache marked GPU-written; counted against reads of
+/// reports the back held waiting for host query results, and reads the drain changed.
+struct DmaReadStats {
+    bool enabled = std::getenv("EDEN_NX2_DMA_READ_STATS") != nullptr;
+    u64 reads{};
+    u64 words{};
+    u64 front_clear{};
+    u64 queued{};
+    u64 gpu_written{};
+    u64 unmapped{};
+    u64 pending{};
+    u64 pending_clear{};
+    u64 changed{};
+    u64 changed_clear{};
+    std::chrono::steady_clock::time_point window_start = std::chrono::steady_clock::now();
+
+    void Report(bool queued_known) {
+        const auto now = std::chrono::steady_clock::now();
+        const double seconds = std::chrono::duration<double>(now - window_start).count();
+        if (seconds < 10.0) {
+            return;
+        }
+        LOG_INFO(HW_GPU,
+                 "Macro DMA read stats in {:.1f} s: {} reads ({} words); front-clear {} | queued "
+                 "write {}{} | GPU-written page {} | unmapped {} | pending host queries {} (front-"
+                 "clear {}) | changed by the drain {} (front-clear {})",
+                 seconds, reads, words, front_clear, queued,
+                 queued_known ? "" : " (not tracked: EDEN_NX2_EGLA66_ACQUIRE off)", gpu_written,
+                 unmapped, pending, pending_clear, changed, changed_clear);
+        *this = DmaReadStats{};
+        window_start = now;
+    }
+};
+DmaReadStats g_dma_read_stats;
+} // Anonymous namespace
+
 void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 macro,
                              u32 method, u32 count) {
     // The words may be written by methods still queued for the back (indirect draw arguments
@@ -1579,10 +1621,26 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
     const u32 ram = fs.regs[0x156];
     const u32 words = std::min<u32>(count, 0x1000);
     const size_t read_bytes = size_t{words} * sizeof(u32);
+    auto& stats = g_dma_read_stats;
     std::vector<u32> diag_before;
-    if (Tegra::Nx2CmdPageDiag::g_enabled) {
+    bool stat_queued = false;
+    bool stat_gpu_written = false;
+    bool stat_unmapped = false;
+    bool stat_pending = false;
+    if (Tegra::Nx2CmdPageDiag::g_enabled || stats.enabled) {
         diag_before.resize(words);
         memory_manager.ReadBlockUnsafe(source, diag_before.data(), read_bytes);
+    }
+    if (stats.enabled) {
+        for (u32 i = 0; i < words; ++i) {
+            const auto device = memory_manager.GpuToCpuAddress(source + u64{i} * sizeof(u32));
+            if (!device) {
+                stat_unmapped = true;
+                continue;
+            }
+            stat_queued |= split.QueuedSemaphoreWriteAt(*device).has_value();
+            stat_gpu_written |= Tegra::Nx2MayBeGpuWritten(*device, sizeof(u32));
+        }
     }
     VideoCommon::Nx2Profile::CountDmaRead(macro);
     split.Drain(VideoCommon::DrainSite::MacroDmaRead);
@@ -1609,7 +1667,11 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
     }
     // Write out the reports held in the query cache, or the read returns stale occlusion counts.
     split.Run(
-        [this, source, read_bytes] {
+        [this, source, read_bytes, pending = stats.enabled ? &stat_pending : nullptr] {
+            if (pending != nullptr) {
+                *pending = VideoCommon::QueryDma::HasPendingQueries(memory_manager, *rasterizer,
+                                                                    source, read_bytes);
+            }
             VideoCommon::QueryDma::FlushPending(memory_manager, *rasterizer, source, read_bytes);
         },
         VideoCommon::DrainSite::MacroDmaFlush);
@@ -1624,6 +1686,21 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
         if (!diag_before.empty() && diag_before[i] != word) {
             ++changed;
         }
+    }
+    if (stats.enabled) {
+        const bool front_clear = split.AcquireSkip() && !stat_queued && !stat_gpu_written &&
+                                 !stat_unmapped;
+        ++stats.reads;
+        stats.words += words;
+        stats.front_clear += front_clear ? 1 : 0;
+        stats.queued += stat_queued ? 1 : 0;
+        stats.gpu_written += stat_gpu_written ? 1 : 0;
+        stats.unmapped += stat_unmapped ? 1 : 0;
+        stats.pending += stat_pending ? 1 : 0;
+        stats.pending_clear += stat_pending && front_clear ? 1 : 0;
+        stats.changed += changed != 0 ? 1 : 0;
+        stats.changed_clear += changed != 0 && front_clear ? 1 : 0;
+        stats.Report(split.AcquireSkip());
     }
     if (Tegra::Nx2CmdPageDiag::g_enabled) {
         bool gpu_written = false;
