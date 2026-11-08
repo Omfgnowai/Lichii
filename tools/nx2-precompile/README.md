@@ -184,7 +184,7 @@ u64 offset and u64 size; per record u8 kind (0 graphics, 1 compute), u8 environm
 reserved, u32 environment indices in stage order, then the 1056-byte graphics or 24-byte compute key.
 Environments are stored once and shared by the records that use them.
 
-`precompiled_infos.fork-v<N>.bin`, written by the preparation step next to it: `NX2INFO2`, u32 stamp
+`precompiled_infos.fork-v<N>.bin`, written by the preparation step next to it: `NX2INFO3`, u32 stamp
 size and the stamp (`precompiled_prepared`'s line: the file, driver and build it was written for),
 u64 index offset, the blobs (a `Shader::SerializeInfo` info, or one zstd frame of a stage's SPIR-V
 words), then the index: u32 record count, u32 blob count, per record u64 key hash, u8 environment

@@ -13,8 +13,16 @@ namespace {
 // Every field of Info is listed in VisitInfo below. An info that grows a field has to be listed
 // there too: this size check fails the build until it is (update the size with it).
 #if defined(_MSC_VER) && defined(_WIN64)
-static_assert(sizeof(Info) == 3096,
+static_assert(sizeof(Info) == 6936,
               "Shader::Info changed: list the new fields in VisitInfo, then update this size");
+// The descriptors are held in vectors, so a field they grow does not change sizeof(Info).
+static_assert(sizeof(ConstantBufferDescriptor) == 8 && sizeof(StorageBufferDescriptor) == 80 &&
+                  sizeof(TextureBufferDescriptor) == 40 && sizeof(ImageBufferDescriptor) == 28 &&
+                  sizeof(TextureDescriptor) == 44 && sizeof(ImageDescriptor) == 36,
+              "A Shader::Info descriptor changed: list the new fields in its Visit function below, "
+              "then update these sizes and PrecompiledInfosMagic (vk_pipeline_cache.cpp)");
+static_assert(sizeof(StorageWriteExtent) == 60,
+              "StorageWriteExtent changed: list the new fields in VisitWriteExtent below");
 #endif
 
 struct Writer {
@@ -160,6 +168,17 @@ void VisitConstantBuffer(Io& io, D& d) {
     io(d.index);
     io(d.count);
 }
+template <typename Io, typename E>
+void VisitWriteExtent(Io& io, E& e) {
+    io(e.bounded);
+    io(e.guarded);
+    io(e.const_end);
+    io(e.local_stride);
+    io(e.group_stride);
+    io(e.guard_const);
+    io(e.guard_local_stride);
+    io(e.guard_group_stride);
+}
 template <typename Io, typename D>
 void VisitStorageBuffer(Io& io, D& d) {
     io(d.cbuf_index);
@@ -167,6 +186,7 @@ void VisitStorageBuffer(Io& io, D& d) {
     io(d.count);
     io(d.is_written);
     io(d.indirect_offset);
+    VisitWriteExtent(io, d.write_extent);
 }
 template <typename Io, typename D>
 void VisitTextureBuffer(Io& io, D& d) {

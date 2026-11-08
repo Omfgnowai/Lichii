@@ -389,7 +389,9 @@ void CountPrecompiledReason(const char* reason) {
     ++precompiled_reasons[reason];
 }
 
-constexpr std::string_view PrecompiledInfosMagic{"NX2INFO2"};
+// NX2INFO3: storage buffer descriptors keep their write extent. A file of another version is
+// prepared again.
+constexpr std::string_view PrecompiledInfosMagic{"NX2INFO3"};
 
 /// EDEN_NX2_PRECOMPILED_FAST=0: precompiled pipelines are translated on the GPU thread like the
 /// others (their kept infos and SPIR-V unused), to compare.
@@ -1781,7 +1783,7 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
     // The shader infos and SPIR-V of each graphics pipeline built, kept once each (most
     // pipelines share their programs' infos with others, and stages their SPIR-V), written to
     // the file as they come.
-    // NX2INFO2: magic, u32 stamp size, the stamp, u64 index offset, the blobs (an info:
+    // NX2INFO3: magic, u32 stamp size, the stamp, u64 index offset, the blobs (an info:
     // Shader::SerializeInfo; SPIR-V: one zstd frame of its words); at the index: u32 record
     // count, u32 blob count, per record u64 key hash, u8 environment count, u8 kind (0
     // graphics, 1 compute: its info and SPIR-V are stage 0's), 2 bytes 0, u32
@@ -2145,9 +2147,10 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreatePrecompiledGraphicsPipeli
         }
         for (size_t i = 0; i < record.env_count; ++i) {
             precompiled_file.clear();
-            precompiled_file.seekg(
-                static_cast<std::streamoff>(precompiled_env_index.at(record.envs[i]).first));
-            (*recorded)[i].Deserialize(precompiled_file);
+            const auto [offset, size] = precompiled_env_index.at(record.envs[i]);
+            precompiled_file.seekg(static_cast<std::streamoff>(offset));
+            (*recorded)[i].Deserialize(precompiled_file,
+                                       static_cast<std::streamoff>(offset + size));
         }
         if (!precompiled_infos_file.is_open()) {
             precompiled_infos_file.open(precompiled_infos_path, std::ios::binary);
@@ -2312,9 +2315,9 @@ ComputePipelineCacheEntry PipelineCache::CreatePrecompiledComputePipeline(
             precompiled_file.exceptions(std::ifstream::failbit | std::ifstream::badbit);
         }
         precompiled_file.clear();
-        precompiled_file.seekg(
-            static_cast<std::streamoff>(precompiled_env_index.at(record.envs[0]).first));
-        recorded.Deserialize(precompiled_file);
+        const auto [env_offset, env_size] = precompiled_env_index.at(record.envs[0]);
+        precompiled_file.seekg(static_cast<std::streamoff>(env_offset));
+        recorded.Deserialize(precompiled_file, static_cast<std::streamoff>(env_offset + env_size));
         if (!precompiled_infos_file.is_open()) {
             precompiled_infos_file.open(precompiled_infos_path, std::ios::binary);
             precompiled_infos_file.exceptions(std::ifstream::failbit | std::ifstream::badbit);
