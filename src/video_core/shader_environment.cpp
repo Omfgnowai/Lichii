@@ -1325,17 +1325,16 @@ bool FileEnvironment::AnswersHoldFor(Shader::Environment& live, const char** why
         const auto type = texture_types.find(value);
         const auto format = texture_pixel_formats.find(value);
         if (type != texture_types.end() || format != texture_pixel_formats.end()) {
-            // A texture handle (perhaps also something else, then it must be the same).
-            if (live_value != value) {
-                if (type != texture_types.end() && live.ReadTextureType(live_value) != type->second) {
-                    return fail("texture type");
-                }
-                if (format != texture_pixel_formats.end() &&
-                    ((PixelFormatTraits(live.ReadTexturePixelFormat(live_value)) ^
-                      PixelFormatTraits(format->second)) &
-                     format_traits) != 0) {
-                    return fail("texture pixel format");
-                }
+            // A texture handle. Asked of `live` even when it is the same value, so `live` holds
+            // the answers its translation would have asked for (it is what the disk cache keeps).
+            if (type != texture_types.end() && live.ReadTextureType(live_value) != type->second) {
+                return fail("texture type");
+            }
+            if (format != texture_pixel_formats.end() &&
+                ((PixelFormatTraits(live.ReadTexturePixelFormat(live_value)) ^
+                  PixelFormatTraits(format->second)) &
+                 format_traits) != 0) {
+                return fail("texture pixel format");
             }
             handles_read.push_back(value);
             continue;

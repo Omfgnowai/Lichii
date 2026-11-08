@@ -391,6 +391,21 @@ void CountPrecompiledReason(const char* reason) {
 
 constexpr std::string_view PrecompiledInfosMagic{"NX2INFO2"};
 
+/// EDEN_NX2_PRECOMPILED_FAST=0: precompiled pipelines are translated on the GPU thread like the
+/// others (their kept infos and SPIR-V unused), to compare.
+bool PrecompiledFastPath() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_PRECOMPILED_FAST");
+        const bool on = !(value && value[0] == '0');
+        if (!on) {
+            LOG_INFO(Render_Vulkan, "EDEN_NX2_PRECOMPILED_FAST=0: precompiled pipelines are "
+                                    "translated at runtime");
+        }
+        return on;
+    }();
+    return enabled;
+}
+
 /// A shader stage from the SPIR-V the preparation step kept (precompiled_infos), on a worker.
 vk::ShaderModule BuildKeptSpirv(const Device& device, const std::filesystem::path& path,
                                 std::pair<u64, u32> blob, u64 pipeline_hash) {
@@ -2084,7 +2099,7 @@ bool PipelineCache::LoadPrecompiledInfos(const std::filesystem::path& precompile
 
 std::unique_ptr<GraphicsPipeline> PipelineCache::CreatePrecompiledGraphicsPipeline(
     GraphicsEnvironments& environments) {
-    if (precompiled_records.empty()) {
+    if (precompiled_records.empty() || !PrecompiledFastPath()) {
         return nullptr;
     }
     const u64 hash = graphics_key.Hash();
@@ -2254,7 +2269,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreatePrecompiledGraphicsPipeli
 
 ComputePipelineCacheEntry PipelineCache::CreatePrecompiledComputePipeline(
     const ComputePipelineCacheKey& key, ComputeEnvironment& env) {
-    if (precompiled_compute_records.empty()) {
+    if (precompiled_compute_records.empty() || !PrecompiledFastPath()) {
         return {};
     }
     const u64 hash = key.Hash();
