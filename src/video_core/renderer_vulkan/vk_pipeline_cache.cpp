@@ -51,6 +51,7 @@
 #include "video_core/renderer_vulkan/vk_cooperative_hmma_test.h"
 #include "video_core/renderer_vulkan/vk_descriptor_pool.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
+#include "shader_recompiler/phase_timer.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache_records.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
@@ -1889,7 +1890,12 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         }
 
         const u32 cfg_offset{static_cast<u32>(env.StartAddress() + sizeof(Shader::ProgramHeader))};
-        Shader::Maxwell::Flow::CFG cfg(env, pools.flow_block, cfg_offset, index == 0);
+        std::optional<Shader::Maxwell::Flow::CFG> cfg_storage;
+        {
+            const Shader::PhaseTimer::Scope scope{Shader::PhaseTimer::Phase::Cfg};
+            cfg_storage.emplace(env, pools.flow_block, cfg_offset, index == 0);
+        }
+        Shader::Maxwell::Flow::CFG& cfg{*cfg_storage};
         if (!uses_vertex_a || index != 1) {
             // Normal path
             programs[index] = TranslateProgram(pools.inst, pools.block, env, cfg, host_info);
@@ -1897,6 +1903,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
             // VertexB path when VertexA is present.
             auto& program_va{programs[0]};
             auto program_vb{TranslateProgram(pools.inst, pools.block, env, cfg, host_info)};
+            const Shader::PhaseTimer::Scope scope{Shader::PhaseTimer::Phase::MergeVertex};
             programs[index] = MergeDualVertexPrograms(program_va, program_vb, env, host_info);
         }
 
@@ -2251,6 +2258,18 @@ void ReportRuntimePipeline(const char* kind, std::chrono::steady_clock::time_poi
                  "{:.1f} ms of draws held for unbuilt pipelines",
                  count, ms(total), ms(take(runtime_spirv_ns[0])), ms(take(runtime_spirv_ns[1])),
                  ms(GraphicsPipeline::TakeHoldTime()));
+        if (Shader::PhaseTimer::Enabled()) {
+            std::string phases;
+            auto& phase_ns = Shader::PhaseTimer::t_ns;
+            for (size_t phase = 0; phase < phase_ns.size(); ++phase) {
+                phases += fmt::format("{}{} {:.1f} ms", phase == 0 ? "" : ", ",
+                                      Shader::PhaseTimer::Names[phase],
+                                      static_cast<double>(phase_ns[phase]) / 1e6);
+                phase_ns[phase] = 0;
+            }
+            LOG_INFO(Render_Vulkan,
+                     "Runtime pipeline phases on the GPU thread in the last 10 s: {}", phases);
+        }
         total = {};
         count = 0;
         window = now;
@@ -2270,7 +2289,10 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() {
         ReportRuntimePipeline("Graphics", begin, shaders);
     };
     GraphicsEnvironments environments;
-    GetGraphicsEnvironments(environments, graphics_key.unique_hashes);
+    {
+        const Shader::PhaseTimer::Scope scope{Shader::PhaseTimer::Phase::Environments};
+        GetGraphicsEnvironments(environments, graphics_key.unique_hashes);
+    }
 
     std::shared_ptr<ShaderPools> emit_pools;
     auto reservation = emission_budget.TryAcquire(maxwell3d->GetNativeMacroEngine().native_turing);
