@@ -249,6 +249,22 @@ public:
         return used;
     }
 
+    /// Translated while a texture handle indexed past the descriptor pool: that texture was
+    /// compiled as a null 2D texture, whatever the game binds there once the handle is written
+    /// (PipelineCache::RebuildPastPoolPipeline).
+    void MarkPastPoolTexture(u64 frame) noexcept {
+        past_pool_frame = frame;
+        past_pool_texture = true;
+    }
+
+    [[nodiscard]] bool ReadPastPoolTexture() const noexcept {
+        return past_pool_texture;
+    }
+
+    [[nodiscard]] u64 PastPoolFrame() const noexcept {
+        return past_pool_frame;
+    }
+
     /// Forgets the transitions, which may point to pipelines the cache evicted.
     void ClearTransitions() noexcept {
         transition_keys.clear();
@@ -378,6 +394,8 @@ private:
     std::vector<GraphicsPipeline*> transitions;
     u64 last_use_frame{};
     bool used{};
+    u64 past_pool_frame{};
+    bool past_pool_texture{};
 
     std::array<vk::ShaderModule, NUM_STAGES> spv_modules;
 

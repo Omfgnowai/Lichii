@@ -257,6 +257,13 @@ private:
     /// the infos it was drawn with): replaced by one translated from the game's state.
     GraphicsPipeline* ReplaceFailedPrecompiled();
 
+    /// Whether the current pipeline was translated with a texture handle past the descriptor
+    /// pool and is due to be translated again (EDEN_NX2_PAST_POOL_REBUILD=0: never).
+    [[nodiscard]] bool PastPoolRebuildDue(const GraphicsPipeline& pipeline);
+
+    /// Evicts the current pipeline and looks it up again, translating it from live state.
+    GraphicsPipeline* RebuildPastPoolPipeline();
+
     struct PrecompiledRecord {
         std::array<u32, 5> envs{};  ///< The precompiled file's environments, in stage order
         u8 env_count{};
@@ -320,6 +327,8 @@ private:
     s64 native_wait_budget_us{8000};
     s64 native_wait_used_us{}; ///< Budget spent since the last 10 s log line.
     std::deque<std::pair<u64, std::unique_ptr<GraphicsPipeline>>> evicted_pipelines; ///< (tick, pipeline)
+    /// Key hash -> times translated again for a texture handle past the descriptor pool.
+    std::unordered_map<u64, u32> past_pool_rebuilds;
     std::unordered_set<u64> used_and_evicted; ///< Key hashes of pipelines used this session, evicted since
 
     ::Common::unordered_map<ComputePipelineCacheKey, ComputePipelineCacheEntry> compute_cache;

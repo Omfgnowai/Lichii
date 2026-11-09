@@ -114,6 +114,12 @@ public:
     }
     bool HasNativeInstructions() const override;
 
+    /// Whether a texture handle read for this program indexed past the descriptor pool, so the
+    /// translation assumed a null 2D texture for it (ReadTextureInfo).
+    [[nodiscard]] bool ReadPastPoolTexture() const noexcept {
+        return past_pool_texture;
+    }
+
 protected:
     std::optional<u64> TryFindSize();
     virtual std::optional<u32> ReadTrapGuardConstant(u32, u32) { return std::nullopt; }
@@ -131,6 +137,7 @@ protected:
 
     Tegra::MemoryManager* gpu_memory{};
     GPUVAddr program_base{};
+    bool past_pool_texture{};
 
     std::vector<u64> code;
     ::Common::unordered_map<u32, Shader::TextureType> texture_types;

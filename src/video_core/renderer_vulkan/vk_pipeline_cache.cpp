@@ -936,6 +936,10 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipeline() {
             if (current_pipeline->IsPrecompiled() && current_pipeline->Failed()) {
                 return ReplaceFailedPrecompiled();
             }
+            if (current_pipeline->ReadPastPoolTexture() &&
+                PastPoolRebuildDue(*current_pipeline)) [[unlikely]] {
+                return RebuildPastPoolPipeline();
+            }
             current_pipeline->MarkUsed(frame_count);
             return BuiltPipeline(current_pipeline);
         }
@@ -2524,6 +2528,45 @@ GraphicsPipeline* PipelineCache::ReplaceFailedPrecompiled() {
     return CurrentGraphicsPipelineSlowPath();
 }
 
+bool PipelineCache::PastPoolRebuildDue(const GraphicsPipeline& pipeline) {
+    // White glowing light shafts in Ocarina of Time's Lost Woods (2026-11-09) that a restart
+    // cleared came with two of these translations: a handle read before the game wrote it makes
+    // the shader sample a 2D texture where the game later binds another type, and that slot then
+    // gets the null view. Translate it again a few frames later from the handles then written,
+    // at most twice per pipeline (some handles stay past the pool, e.g. in unused branches).
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_PAST_POOL_REBUILD");
+        return value == nullptr || value[0] != '0';
+    }();
+    constexpr u64 DelayFrames = 4;
+    constexpr u32 MaxRebuilds = 2;
+    if (!enabled || !pipeline.ReadPastPoolTexture() || !pipeline.IsBuilt() ||
+        frame_count < pipeline.PastPoolFrame() + DelayFrames) {
+        return false;
+    }
+    u32& rebuilds = past_pool_rebuilds[graphics_key.Hash()];
+    return rebuilds++ < MaxRebuilds;
+}
+
+GraphicsPipeline* PipelineCache::RebuildPastPoolPipeline() {
+    LOG_INFO(Render_Vulkan,
+             "Translating pipeline {:016x} again: it read a texture handle past the descriptor "
+             "pool (rebuild {})",
+             graphics_key.Hash(), past_pool_rebuilds[graphics_key.Hash()]);
+    if (const auto it = graphics_cache.find(graphics_key); it != graphics_cache.end()) {
+        used_this_session.erase(it->second.get());
+        evicted_pipelines.emplace_back(scheduler.CurrentTick(), std::move(it->second));
+        graphics_cache.erase(it);
+    }
+    for (auto& [key, pipeline] : graphics_cache) {
+        if (pipeline) {
+            pipeline->ClearTransitions();
+        }
+    }
+    current_pipeline = nullptr;
+    return CurrentGraphicsPipelineSlowPath();
+}
+
 void PipelineCache::QueueVulkanPipelineCacheFlush() {
     if (!use_vulkan_pipeline_cache || vulkan_pipeline_cache_filename.empty()) {
         return;
@@ -2726,6 +2769,10 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineSlowPath() {
     current_pipeline = pipeline.get();
     if (current_pipeline->IsPrecompiled() && current_pipeline->Failed()) {
         return ReplaceFailedPrecompiled();
+    }
+    if (current_pipeline->ReadPastPoolTexture() && PastPoolRebuildDue(*current_pipeline))
+        [[unlikely]] {
+        return RebuildPastPoolPipeline();
     }
     current_pipeline->MarkUsed(frame_count);
     return BuiltPipeline(current_pipeline);
@@ -3318,11 +3365,25 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         }
     }
     Common::ThreadWorker* const thread_worker{build_in_parallel ? &workers : nullptr};
-    return std::make_unique<GraphicsPipeline>(
+    auto pipeline = std::make_unique<GraphicsPipeline>(
         scheduler, buffer_cache, texture_cache, vulkan_pipeline_cache, &shader_notify, device,
         descriptor_pool, guest_descriptor_queue, descriptor_buffer_ring, thread_worker, statistics,
         render_pass_cache, key, std::move(modules), infos, std::move(emit_stages),
         std::move(stages.mesh_emulation));
+    for (Shader::Environment* const env : envs) {
+        const auto* const generic = dynamic_cast<const GenericEnvironment*>(env);
+        if (generic != nullptr && generic->ReadPastPoolTexture()) {
+            pipeline->MarkPastPoolTexture(frame_count);
+            LOG_WARNING(Render_Vulkan,
+                        "Pipeline {:016x} translated with a texture handle past the descriptor "
+                        "pool (shaders {:016x} {:016x} {:016x} {:016x} {:016x} {:016x})",
+                        key.Hash(), key.unique_hashes[0], key.unique_hashes[1],
+                        key.unique_hashes[2], key.unique_hashes[3], key.unique_hashes[4],
+                        key.unique_hashes[5]);
+            break;
+        }
+    }
+    return pipeline;
 
 } catch (const Shader::Exception& exception) {
     auto hash = key.Hash();
@@ -3482,6 +3543,11 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() {
                                           std::move(emit_pools), std::move(reservation));
     }
     if (!pipeline || pipeline_cache_filename.empty()) {
+        return pipeline;
+    }
+    if (pipeline->ReadPastPoolTexture()) {
+        // Not recorded: the cache would replay the null texture's type at every boot. The
+        // translation made again from written handles (RebuildPastPoolPipeline) is recorded.
         return pipeline;
     }
     if (disk_pipelines.contains(graphics_key.Hash())) {

@@ -476,6 +476,7 @@ Tegra::Texture::TICEntry GenericEnvironment::ReadTextureInfo(GPUVAddr tic_addr, 
                                                        gpu_memory->UsesNativeTiling())};
     Tegra::Texture::TICEntry entry;
     if (index > tic_limit) {
+        past_pool_texture = true;
         // Past the pool, the bytes are not a descriptor: reading them gave the shader a random
         // texture type and format (garbage-format asserts, then crashes and device losses on AMD
         // in Ocarina of Time). At draw time the texture cache binds the null view for such an
