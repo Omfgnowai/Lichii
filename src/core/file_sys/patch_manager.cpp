@@ -104,6 +104,16 @@ constexpr std::array FPS_UNLOCK_RECORDS{
     BuiltinPatchRecord{0x3C46200, FPS_UNLOCK_ROUTINE, {}, true},
 };
 
+// The item pickup popup counts its shown number toward the new total by (int)(step * rate),
+// rate = max(|difference| / 50, 1) (PickUpWindow update, module offset 0xA67E50). With FPS Unlock
+// the step is below 1 above 60 fps (0.5 at 120), so the truncation gave 0 and the count stood
+// still until a long frame. Rounding up (fcvtps) keeps it moving; at 60 fps it is unchanged.
+constexpr std::array<u8, 4> PICKUP_COUNTER_ORIGINAL{0x0C, 0x00, 0x38, 0x1E}; // fcvtzs w12, s0
+constexpr std::array<u8, 4> PICKUP_COUNTER_ROUND_UP{0x0C, 0x00, 0x28, 0x1E}; // fcvtps w12, s0
+constexpr std::array PICKUP_COUNTER_RECORDS{
+    BuiltinPatchRecord{0xA68300, PICKUP_COUNTER_ROUND_UP, PICKUP_COUNTER_ORIGINAL},
+};
+
 constexpr std::array BUILTIN_PATCHES{
     // Ocarina of Time takes its "dynamic resolution disabled" path, so the 3D renders at full scale
     // instead of following the GPU-time controller down to its 480p floor.
@@ -125,6 +135,13 @@ constexpr std::array BUILTIN_PATCHES{
         .state_offset = 0x4E9FE00,
         .state_size = 16,
         .replaces = "Dynamic FPS by Dark (built-in)",
+    },
+    BuiltinPatch{
+        .name = "Pickup Counter Fix (built-in)",
+        .title_id = 0x0400486024DEC000,
+        .module = "main",
+        .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
+        .records = PICKUP_COUNTER_RECORDS,
     },
     BuiltinPatch{
         .name = "Dynamic FPS by Dark (built-in)",
