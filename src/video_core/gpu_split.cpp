@@ -30,6 +30,7 @@
 #include "video_core/nx2.h"
 #include "video_core/nx2_fast_draw.h"
 #include "video_core/nx2_profile.h"
+#include "video_core/nx2_stage_probe.h"
 
 namespace VideoCommon {
 
@@ -185,6 +186,7 @@ void GpuSplit::WaitForSpace(size_t words) {
         return;
     }
     Publish();
+    Nx2StageProbe::NoteSplitWait(static_cast<u32>(DrainSite::RingFull));
     Nx2Profile::Scope scope{Nx2Profile::Zone::SplitDrain};
     const u64 start = Nx2Profile::Enabled() ? Nx2Profile::Ticks() : 0;
     for (u32 spins = 0;; ++spins) {
@@ -220,6 +222,7 @@ void GpuSplit::Drain(DrainSite site) {
         return;
     }
     Publish();
+    Nx2StageProbe::NoteSplitWait(static_cast<u32>(site));
     Nx2Profile::Scope scope{Nx2Profile::Zone::SplitDrain};
     const u64 start = Nx2Profile::Enabled() ? Nx2Profile::Ticks() : 0;
     // Everything consumed is not enough: the back submits deferred work (Scheduler::DeferFlush)
@@ -352,6 +355,7 @@ bool GpuSplit::WaitFor(u64 target, DrainSite site) {
     if (consumed_cache >= target) {
         return false;
     }
+    Nx2StageProbe::NoteSplitWait(static_cast<u32>(site));
     Nx2Profile::Scope scope{Nx2Profile::Zone::WriterWait};
     wait_target.store(target, std::memory_order_seq_cst);
     Publish();
@@ -560,6 +564,7 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
         u64 available = published.load(std::memory_order_acquire);
         if (available == read_position) {
             Nx2Profile::Scope scope{Nx2Profile::Zone::SplitWait};
+            Nx2StageProbe::CoarseScope stage_probe_wait{Nx2StageProbe::Region::Wait};
             // The front publishes what it holds after a few more words from now on.
             back_idle_at.store(read_position, std::memory_order_relaxed);
             const auto spin_start = g_acquire_counting ? std::chrono::steady_clock::now()
@@ -584,6 +589,7 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
                 // too, so the deferred submit can't overlap whatever the front does next.
                 if (!back_quiet.load(std::memory_order_relaxed)) {
                     if (idle_hook != nullptr) {
+                        Nx2StageProbe::CoarseScope stage_probe_hook{Nx2StageProbe::Region::Outside};
                         idle_hook(idle_argument);
                     }
                     back_quiet.store(true, std::memory_order_release);

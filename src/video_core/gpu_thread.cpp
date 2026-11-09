@@ -26,6 +26,7 @@
 #include "video_core/gpu_thread.h"
 #include "video_core/gpu_split.h"
 #include "video_core/nx2_profile.h"
+#include "video_core/nx2_stage_probe.h"
 #include "video_core/host1x/host1x.h"
 #include "video_core/renderer_base.h"
 
@@ -122,6 +123,8 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                 }
             } else {
                 Profile::Scope scope{Profile::Zone::Idle};
+                VideoCommon::Nx2StageProbe::CoarseScope stage_probe{
+                    VideoCommon::Nx2StageProbe::Region::Wait};
                 state.queue.PopWait(next, stop_token);
             }
             if (stop_token.stop_requested()) {

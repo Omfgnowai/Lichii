@@ -30,6 +30,7 @@
 #include "video_core/nx2_cmdpage_diag.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/nx2_profile.h"
+#include "video_core/nx2_stage_probe.h"
 #include "video_core/texture_cache/util.h"
 
 namespace VideoCommon {
@@ -719,11 +720,26 @@ void BufferCache<P>::BindHostGeometryBuffers(bool is_indexed) {
     if (current_draw_indirect) {
         BindHostDrawIndirectBuffers();
     }
+    if (Nx2StageProbe::Enabled()) {
+        if (is_indexed) {
+            Nx2StageProbe::NoteRead(Nx2StageProbe::IndexSlot, channel_state->index_buffer.device_addr,
+                                    channel_state->index_buffer.size, 0);
+        }
+        ForEachEnabledBit(enabled_vertex_buffers_mask, [&](u32 index) {
+            const Binding& binding = channel_state->vertex_buffers[index];
+            Nx2StageProbe::NoteRead(Nx2StageProbe::VertexSlot(index), binding.device_addr,
+                                    binding.size, 0);
+        });
+    }
 }
 
 template <class P>
 void BufferCache<P>::BindHostStageBuffers(size_t stage) {
-    BindHostGraphicsUniformBuffers(stage);
+    {
+        Nx2StageProbe::Scope stage_probe{Nx2StageProbe::Region::Uniform,
+                                         channel_state->enabled_uniform_buffer_masks[stage] != 0};
+        BindHostGraphicsUniformBuffers(stage);
+    }
     if (channel_state->enabled_storage_buffers[stage] != 0) {
         BindHostGraphicsStorageBuffers(stage);
     }
@@ -897,6 +913,7 @@ template <class P>
 void BufferCache<P>::BindGraphicsTextureBuffer(size_t stage, size_t tbo_index, GPUVAddr gpu_addr,
                                                u32 size, PixelFormat format, bool is_written,
                                                bool is_image) {
+    Nx2StageProbe::Count(Nx2StageProbe::Counter::TextureBufferBinds);
     channel_state->enabled_texture_buffers[stage] |= 1U << tbo_index;
     channel_state->written_texture_buffers[stage] |= (is_written ? 1U : 0U) << tbo_index;
     if constexpr (SEPARATE_IMAGE_BUFFERS_BINDINGS) {
@@ -1533,6 +1550,9 @@ void BufferCache<P>::BindHostDrawIndirectBuffers() {
 
 template <class P>
 void BufferCache<P>::BindHostGraphicsUniformBuffers(size_t stage) {
+    Nx2StageProbe::AddPacketBytes(
+        Nx2StageProbe::PacketUniformBytes *
+        static_cast<u32>(std::popcount(channel_state->enabled_uniform_buffer_masks[stage])));
     u32 dirty = ~0U;
     if constexpr (HAS_PERSISTENT_UNIFORM_BUFFER_BINDINGS) {
         dirty = std::exchange(channel_state->dirty_uniform_buffers[stage], 0);
@@ -1817,6 +1837,8 @@ void BufferCache<P>::BindHostGraphicsStorageBuffers(size_t stage) {
     u32 binding_index = 0;
     ForEachEnabledBit(channel_state->enabled_storage_buffers[stage], [&](u32 index) {
         const Binding& binding = channel_state->storage_buffers[stage][index];
+        Nx2StageProbe::NoteRead(Nx2StageProbe::StorageSlot(stage, index), binding.device_addr,
+                                binding.size, Nx2StageProbe::PacketRangeBytes);
         const bool is_written = ((channel_state->written_storage_buffers[stage] >> index) & 1) != 0;
         if (BindMultiRangeStorage(binding, is_written, graphics_segments)) {
             return;
@@ -1846,6 +1868,8 @@ template <class P>
 void BufferCache<P>::BindHostGraphicsTextureBuffers(size_t stage) {
     ForEachEnabledBit(channel_state->enabled_texture_buffers[stage], [&](u32 index) {
         const TextureBufferBinding& binding = channel_state->texture_buffers[stage][index];
+        Nx2StageProbe::NoteRead(Nx2StageProbe::TexelSlot(stage, index), binding.device_addr,
+                                binding.size, Nx2StageProbe::PacketRangeBytes);
         Buffer& buffer = slot_buffers[binding.buffer_id];
         const u32 size = binding.size;
         SynchronizeBuffer(buffer, binding.device_addr, size);
@@ -2038,7 +2062,15 @@ void BufferCache<P>::DoUpdateGraphicsBuffers(bool is_indexed) {
         UpdateVertexBuffers();
         UpdateTransformFeedbackBuffers();
         for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
-            UpdateUniformBuffers(stage);
+            {
+                Nx2StageProbe::Scope stage_probe{
+                    Nx2StageProbe::Region::Uniform,
+                    channel_state->enabled_uniform_buffer_masks[stage] != 0};
+                UpdateUniformBuffers(stage);
+            }
+            Nx2StageProbe::Scope stage_probe{Nx2StageProbe::Region::Storage,
+                                             (channel_state->enabled_storage_buffers[stage] |
+                                              channel_state->enabled_texture_buffers[stage]) != 0};
             UpdateStorageBuffers(stage);
             UpdateTextureBuffers(stage);
         }
@@ -2071,6 +2103,8 @@ void BufferCache<P>::UpdateIndexBuffer() {
         return;
     }
     flags[Dirty::IndexBuffer] = false;
+    Nx2StageProbe::AddPacketBytes(Nx2StageProbe::PacketRangeBytes +
+                                  static_cast<u32>(draw_state.inline_index_draw_indexes.size()));
     if (!draw_state.inline_index_draw_indexes.empty()) [[unlikely]] {
         auto inline_index_size = static_cast<u32>(draw_state.inline_index_draw_indexes.size());
         u32 buffer_size = Common::AlignUp(inline_index_size, CACHING_PAGESIZE);
@@ -2169,6 +2203,7 @@ void BufferCache<P>::UpdateVertexBuffer(u32 index) {
     if (!maxwell3d->dirty.flags[Dirty::VertexBuffer0 + index]) {
         return;
     }
+    Nx2StageProbe::AddPacketBytes(Nx2StageProbe::PacketRangeBytes);
     const auto& array = maxwell3d->regs.vertex_streams[index];
     const auto& limit = maxwell3d->regs.vertex_stream_limits[index];
     const GPUVAddr gpu_addr_begin = array.Address();
@@ -2804,6 +2839,7 @@ void BufferCache<P>::TouchBuffer(Buffer& buffer, BufferId buffer_id) noexcept {
 
 template <class P>
 bool BufferCache<P>::SynchronizeBuffer(Buffer& buffer, DAddr device_addr, u32 size) {
+    Nx2StageProbe::Scope stage_probe{Nx2StageProbe::Region::Sync};
     // An upload over a clean word of the tracker (word_manager.h) finds and changes nothing:
     // walk only the dirty ones. Verify walks every word and checks the clean words.
     const bool skip_clean = !Nx2Perf::Verify();

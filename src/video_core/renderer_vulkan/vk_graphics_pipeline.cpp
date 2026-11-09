@@ -41,6 +41,7 @@
 #include "shader_recompiler/exception.h"
 #include "video_core/nx2_fast_draw.h"
 #include "video_core/nx2_profile.h"
+#include "video_core/nx2_stage_probe.h"
 
 #if defined(__clang__) && defined(NDEBUG)
 #define LAMBDA_FORCEINLINE __attribute__((always_inline))
@@ -51,6 +52,7 @@
 #endif
 
 namespace Vulkan {
+namespace Nx2StageProbe = VideoCommon::Nx2StageProbe;
 namespace {
 using boost::container::small_vector;
 using boost::container::static_vector;
@@ -992,12 +994,17 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
 
     {
         Profile::Scope scope{Profile::Zone::UpdateBuffers};
-        buffer_cache.UpdateGraphicsBuffers(is_indexed);
+        {
+            Nx2StageProbe::Scope stage_probe{Nx2StageProbe::Region::IndexVertex};
+            buffer_cache.UpdateGraphicsBuffers(is_indexed);
+        }
+        Nx2StageProbe::Scope stage_probe{Nx2StageProbe::Region::GeometryBind};
         buffer_cache.BindHostGeometryBuffers(is_indexed);
     }
 
     {
         Profile::Scope scope{Profile::Zone::DescriptorAcquire};
+        Nx2StageProbe::Scope stage_probe{Nx2StageProbe::Region::Descriptors};
         guest_descriptor_queue.Acquire(scheduler, num_descriptor_entries, uses_descriptor_buffer);
     }
 
@@ -1008,13 +1015,18 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     const auto prepare_stage{[&](size_t stage) LAMBDA_FORCEINLINE {
         {
             Profile::Scope scope{Profile::Zone::BindStageBuffers};
+            Nx2StageProbe::Scope stage_probe{Nx2StageProbe::Region::StageBind};
             buffer_cache.BindHostStageBuffers(stage);
         }
         {
             Profile::Scope scope{Profile::Zone::PushDescriptors};
+            Nx2StageProbe::Scope stage_probe{Nx2StageProbe::Region::Descriptors};
             const size_t first_entry = guest_descriptor_queue.UpdateCount();
             PushImageDescriptors(texture_cache, guest_descriptor_queue, stage_infos[stage],
                                  rescaling, samplers_it, views_it);
+            Nx2StageProbe::AddPacketBytes(Nx2StageProbe::PacketImageBytes *
+                                          static_cast<u32>(guest_descriptor_queue.UpdateCount() -
+                                                           first_entry));
             if (captured_delta) {
                 KeepImageDescriptors(stage, first_entry);
             }
@@ -1066,6 +1078,7 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         }
     }
     if (buffer_cache.any_buffer_uploaded) {
+        Nx2StageProbe::Scope stage_probe{Nx2StageProbe::Region::Sync};
         buffer_cache.runtime.PostCopyBarrier();
         buffer_cache.any_buffer_uploaded = false;
     }
@@ -1083,6 +1096,7 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         return false;
     }
     Profile::Scope scope{Profile::Zone::ConfigureDraw};
+    Nx2StageProbe::Scope stage_probe{Nx2StageProbe::Region::Descriptors};
     return ConfigureDraw(rescaling, render_area);
 }
 
@@ -1114,11 +1128,16 @@ bool GraphicsPipeline::ConfigureDelta(bool is_indexed) {
     }
     {
         Profile::Scope scope{Profile::Zone::UpdateBuffers};
-        buffer_cache.UpdateGraphicsBuffers(is_indexed);
+        {
+            Nx2StageProbe::Scope stage_probe{Nx2StageProbe::Region::IndexVertex};
+            buffer_cache.UpdateGraphicsBuffers(is_indexed);
+        }
+        Nx2StageProbe::Scope stage_probe{Nx2StageProbe::Region::GeometryBind};
         buffer_cache.BindHostGeometryBuffers(is_indexed);
     }
     {
         Profile::Scope scope{Profile::Zone::DescriptorAcquire};
+        Nx2StageProbe::Scope stage_probe{Nx2StageProbe::Region::Descriptors};
         guest_descriptor_queue.Acquire(scheduler, num_descriptor_entries, uses_descriptor_buffer);
     }
     const auto& regs{maxwell3d->regs};
@@ -1148,17 +1167,24 @@ bool GraphicsPipeline::ConfigureDelta(bool is_indexed) {
         }
         {
             Profile::Scope scope{Profile::Zone::BindStageBuffers};
+            Nx2StageProbe::Scope stage_probe{Nx2StageProbe::Region::StageBind};
             buffer_cache.BindHostStageBuffers(stage);
         }
         if (replay_images) {
             Profile::Scope scope{Profile::Zone::PushDescriptors};
+            Nx2StageProbe::Scope stage_probe{Nx2StageProbe::Region::Descriptors};
             const auto [first, count] = kept_image_ranges[stage];
             guest_descriptor_queue.AddEntries({kept_image_entries.data() + first, count});
+            Nx2StageProbe::AddPacketBytes(Nx2StageProbe::PacketImageBytes * count);
         } else {
             Profile::Scope scope{Profile::Zone::PushDescriptors};
+            Nx2StageProbe::Scope stage_probe{Nx2StageProbe::Region::Descriptors};
             const size_t first_entry = guest_descriptor_queue.UpdateCount();
             PushImageDescriptors(texture_cache, guest_descriptor_queue, stage_infos[stage],
                                  rescaling, samplers_it, views_it);
+            Nx2StageProbe::AddPacketBytes(Nx2StageProbe::PacketImageBytes *
+                                          static_cast<u32>(guest_descriptor_queue.UpdateCount() -
+                                                           first_entry));
             KeepImageDescriptors(stage, first_entry);
         }
         if (stage_infos[stage].uses_render_area) {
@@ -1198,6 +1224,7 @@ bool GraphicsPipeline::ConfigureDelta(bool is_indexed) {
     }
     ReportDeltaDescriptors();
     if (buffer_cache.any_buffer_uploaded) {
+        Nx2StageProbe::Scope stage_probe{Nx2StageProbe::Region::Sync};
         buffer_cache.runtime.PostCopyBarrier();
         buffer_cache.any_buffer_uploaded = false;
     }
@@ -1215,6 +1242,7 @@ bool GraphicsPipeline::ConfigureDelta(bool is_indexed) {
         return false;
     }
     Profile::Scope scope{Profile::Zone::ConfigureDraw};
+    Nx2StageProbe::Scope stage_probe{Nx2StageProbe::Region::Descriptors};
     return ConfigureDraw(rescaling, render_area);
 }
 
@@ -1396,9 +1424,12 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
                            VK_PIPELINE_STAGE_VERTEX_SHADER_BIT);
         });
     }
-    scheduler.RequestRenderpass(texture_cache.GetFramebuffer());
-    if (writes_storage) {
-        scheduler.NoteRenderPassStores();
+    {
+        Nx2StageProbe::Scope stage_probe{Nx2StageProbe::Region::RenderPass};
+        scheduler.RequestRenderpass(texture_cache.GetFramebuffer());
+        if (writes_storage) {
+            scheduler.NoteRenderPassStores();
+        }
     }
     if (!IsBuilt()) {
         // Wait for the pipeline to be built
