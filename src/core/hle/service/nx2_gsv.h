@@ -1691,8 +1691,13 @@ inline u32 Nx2VsyncRateHz() {
         const char* text = std::getenv("EDEN_NX2_VSYNC_HZ");
         return text ? (std::max)(std::strtoll(text, nullptr, 10), 1LL) : 0LL;
     }();
-    return forced != 0 ? static_cast<u32>(forced)
-                       : (std::max<u32>)(Settings::values.frame_rate_limit.GetValue(), 1);
+    if (forced != 0) {
+        return static_cast<u32>(forced);
+    }
+    if (Settings::nx2_hold_60fps.load(std::memory_order_relaxed)) {
+        return 60;
+    }
+    return (std::max<u32>)(Settings::values.frame_rate_limit.GetValue(), 1);
 }
 
 class INx2Vi2Session final : public ServiceFramework<INx2Vi2Session> {
@@ -2564,7 +2569,8 @@ private:
                             vsync_state->trace_min_gap.reset();
                         }
                     }
-                    return std::nullopt;
+                    // Re-read the rate so the 60 fps hold hotkey takes effect at once.
+                    return std::chrono::nanoseconds{1'000'000'000LL / Nx2VsyncRateHz()};
                 });
             system.CoreTiming().ScheduleLoopingEvent(VblankInterval, VblankInterval, m_vsync_timer);
         }

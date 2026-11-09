@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <map>
 #include <memory>
 #include <optional>
@@ -1096,6 +1097,11 @@ void SetSpeedMode(const SpeedMode &mode);
 void ToggleStandardMode();
 void ToggleTurboMode();
 void ToggleSlowMode();
+
+// Switch 2: hold the vsync event (the game's frame pacing) at 60 Hz while set, whatever
+// frame_rate_limit says. Not saved; a hotkey toggles it, e.g. for cutscenes that run fast above
+// 60 fps with the Ocarina FPS Unlock.
+inline std::atomic<bool> nx2_hold_60fps{false};
 
 std::string GetTimeZoneString(TimeZone time_zone);
 

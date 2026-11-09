@@ -1392,6 +1392,13 @@ void MainWindow::InitializeHotkeys() {
         SetFPSSuffix();
     });
 
+    connect_shortcut(QStringLiteral("Hold 60 FPS (Switch 2)"), [this] {
+        const bool hold = !Settings::nx2_hold_60fps.load();
+        Settings::nx2_hold_60fps.store(hold);
+        LOG_INFO(Frontend, "Switch 2 frame rate held at 60: {}", hold);
+        SetFPSSuffix();
+    });
+
     connect_shortcut(QStringLiteral("Toggle Turbo Speed"), [this] {
         Settings::ToggleTurboMode();
         SetFPSSuffix();
@@ -5682,6 +5689,9 @@ void MainWindow::SetFPSSuffix() {
         const bool limited = Settings::values.use_speed_limit.GetValue();
         m_fpsSuffix = limited ? QString{} : tr("Unlocked");
         break;
+    }
+    if (Settings::nx2_hold_60fps.load()) {
+        m_fpsSuffix = m_fpsSuffix.isEmpty() ? tr("60 Hold") : m_fpsSuffix + tr(", 60 Hold");
     }
 }
 
