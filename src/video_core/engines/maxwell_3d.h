@@ -3282,6 +3282,9 @@ public:
     /// A vertex stream's address, size or limit (not its stride or enable).
     static bool IsFastDrawVertexBuffer(u32 method);
 
+    /// Occlusion query and render enable methods and registers (EDEN_NX2_FAST_QUERY_METHODS).
+    static bool IsFastDrawQueryMethod(u32 method);
+
     /// Whether an attribute format write keeps what the pipeline key holds of it.
     static bool IsFastDrawAttributeFormat(u32 method, u32 old_value, u32 new_value);
     void NoteFastDrawConstantData(GPUVAddr begin, GPUVAddr end);

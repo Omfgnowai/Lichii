@@ -45,6 +45,20 @@ std::atomic<u64> g_profile_finish_ns{};
 std::atomic<u64> g_profile_window_start{};
 std::mutex g_profile_end_mutex;
 std::map<std::string, u64> g_profile_ends;
+std::map<std::string, u64> g_profile_submit_sites;
+
+/// Counts a submission by the site that asked for it (logged with the render pass ends).
+void CountSubmitSite(const char* file, u32 line) {
+    if (!VideoCommon::Nx2Profile::Enabled()) {
+        return;
+    }
+    std::string_view name{file};
+    if (const auto slash = name.find_last_of("/\\"); slash != std::string_view::npos) {
+        name.remove_prefix(slash + 1);
+    }
+    std::scoped_lock lock{g_profile_end_mutex};
+    ++g_profile_submit_sites[fmt::format("{}:{}", name, line)];
+}
 
 void CountRenderPassEnd(const char* file, u32 line) {
     if (!VideoCommon::Nx2Profile::Enabled()) {
@@ -89,6 +103,23 @@ void ReportSubmitCounts() {
     for (size_t i = 0; i < ends.size() && i < 16; ++i) {
         LOG_INFO(Render_Vulkan, "Render pass ends {:.0f}/s at {}",
                  static_cast<double>(ends[i].first) / seconds, ends[i].second);
+    }
+    std::vector<std::pair<u64, std::string>> submits;
+    {
+        std::scoped_lock lock{g_profile_end_mutex};
+        for (const auto& [site, count] : g_profile_submit_sites) {
+            submits.emplace_back(count, site);
+        }
+        g_profile_submit_sites.clear();
+    }
+    std::sort(submits.rbegin(), submits.rend());
+    std::string line;
+    for (size_t i = 0; i < submits.size() && i < 12; ++i) {
+        line += fmt::format(" | {} {:.0f}/s", submits[i].second,
+                            static_cast<double>(submits[i].first) / seconds);
+    }
+    if (!line.empty()) {
+        LOG_INFO(Render_Vulkan, "Submits by site{}", line);
     }
 }
 }
@@ -168,6 +199,7 @@ u64 Scheduler::Flush(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
     if (state.renderpass) {
         CountRenderPassEnd(location.file_name(), location.line());
     }
+    CountSubmitSite(location.file_name(), location.line());
     if (VideoCommon::GpuSplit::check_owner) [[unlikely]] {
         VideoCommon::GpuSplit::CheckOwner("Scheduler::Flush");
     }
@@ -241,6 +273,7 @@ void Scheduler::Finish(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
     if (state.renderpass) {
         CountRenderPassEnd(location.file_name(), location.line());
     }
+    CountSubmitSite(location.file_name(), location.line());
     if (VideoCommon::GpuSplit::check_owner) [[unlikely]] {
         VideoCommon::GpuSplit::CheckOwner("Scheduler::Finish");
     }

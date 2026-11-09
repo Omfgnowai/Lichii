@@ -394,8 +394,35 @@ bool Maxwell3D::IsFastDrawParameter(u32 method) {
     }
     default:
         return DrawManager::IsInstanceLoopMethod(method) || IsFastDrawDeltaMethod(method) ||
-               IsFastDrawVertexBuffer(method);
+               IsFastDrawVertexBuffer(method) || IsFastDrawQueryMethod(method);
     }
+}
+
+bool Maxwell3D::IsFastDrawQueryMethod(u32 method) {
+    // Ocarina of Time tests objects for visibility with occlusion queries: counter reset, draw,
+    // report, and render enable from the result, for thousands of draws a frame (in its forest
+    // areas the counter reset was the last break of up to 18k full draws a second, and the
+    // report after it would have been next). None of these reaches what a delta draw keeps
+    // (pipeline, image views, samplers, texture buffer bindings): the query work happens in the
+    // query cache; a report written over a texture invalidates it in the texture cache (a break
+    // of its own); a submit or a render pass end is checked again before the delta draw
+    // (DeltaStillHolds); render enable is read at the draw (Maxwell3D::ShouldExecute, or Vulkan
+    // conditional rendering, recorded outside the draw's state). The counter enable and the
+    // query segment are set on both paths (RasterizerVulkan::PrepareDraw).
+    // EDEN_NX2_FAST_QUERY_METHODS=0 breaks on them again.
+    static const bool neutral = [] {
+        const char* const value = std::getenv("EDEN_NX2_FAST_QUERY_METHODS");
+        return value == nullptr || value[0] != '0';
+    }();
+    if (!neutral) {
+        return false;
+    }
+    constexpr u32 report = MAXWELL3D_REG_INDEX(report_semaphore.address_high);
+    constexpr u32 render_enable = MAXWELL3D_REG_INDEX(render_enable.address_high);
+    return method == MAXWELL3D_REG_INDEX(clear_report_value) ||
+           (method >= report && method <= MAXWELL3D_REG_INDEX(report_semaphore.query)) ||
+           (method >= render_enable && method <= MAXWELL3D_REG_INDEX(render_enable.mode)) ||
+           method == MAXWELL3D_REG_INDEX(render_enable_override);
 }
 
 bool Maxwell3D::IsFastDrawVertexBuffer(u32 method) {
@@ -452,7 +479,8 @@ bool Maxwell3D::IsFastDrawDeltaMethod(u32 method) {
 }
 
 void Maxwell3D::ProcessMethodCall(u32 method, u32 argument, u32 nonshadow_argument, bool is_last_call) {
-    if (!DrawManager::IsInstanceLoopMethod(method) && !IsFastDrawDeltaMethod(method)) {
+    if (!DrawManager::IsInstanceLoopMethod(method) && !IsFastDrawDeltaMethod(method) &&
+        !IsFastDrawQueryMethod(method)) {
         VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Method, method);
     }
     if (GetNativeMacroEngine().native_turing && method == MAXWELL3D_REG_INDEX(clear_surface)) {
