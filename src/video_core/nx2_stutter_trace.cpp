@@ -20,6 +20,8 @@
 #include <fstream>
 #endif
 
+#include <cstdlib>
+
 #include "common/logging.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/nx2_stutter_trace.h"
@@ -28,7 +30,16 @@ namespace VideoCommon::StutterTrace {
 namespace {
 
 constexpr double StutterMs = 33.0;
-constexpr u64 SummaryNs = 10'000'000'000ULL;
+/// Nx2StutterSummary window: EDEN_NX2_STUTTER_SUMMARY_MS (default 10000, at least 100), e.g. 1000
+/// to cut a benchmark log into stops. Read lazily (nx2_switches.txt loads after static init).
+u64 SummaryNs() {
+    static const u64 ns = [] {
+        const char* text = std::getenv("EDEN_NX2_STUTTER_SUMMARY_MS");
+        const long long ms = text ? std::strtoll(text, nullptr, 10) : 0;
+        return static_cast<u64>(ms >= 100 ? ms : 10'000) * 1'000'000ULL;
+    }();
+    return ns;
+}
 /// 1 ms bins; the last one holds every longer frame.
 constexpr size_t HistogramBins = 300;
 constexpr auto GraphicsMissIndex = static_cast<size_t>(Category::GraphicsMiss);
@@ -434,7 +445,7 @@ void OnPresent() {
                                  ms_per_tick),
                  sites.empty() ? "none" : sites, longest.empty() ? "none" : longest);
     }
-    if (now - state.window_start_ns >= SummaryNs) {
+    if (now - state.window_start_ns >= SummaryNs()) {
         Summarize(state, now);
     }
 }

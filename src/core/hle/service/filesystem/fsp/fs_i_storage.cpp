@@ -8,7 +8,14 @@
 #include <chrono>
 #include <thread>
 
+#include <cstdlib>
+#include <functional>
+#include <string_view>
+
+#include "common/logging.h"
 #include "common/settings.h"
+#include "core/file_sys/romfs.h"
+#include "core/file_sys/vfs/vfs_offset.h"
 #include "core/file_sys/errors.h"
 #include "core/hle/service/cmif_serialization.h"
 #include "core/hle/service/filesystem/fsp/fs_i_storage.h"
@@ -54,8 +61,91 @@ Result IStorage::Read(
     // Read the data from the Storage backend
     const ReadTraceScope trace{ReadTraceSource::Storage, length};
     backend->Read(out_bytes.data(), length, offset);
+    TraceRomFSRead(offset, length);
 
     R_SUCCEED();
+}
+
+namespace {
+const std::vector<std::string>& RomFSTracePatterns() {
+    static const std::vector<std::string> patterns = [] {
+        std::vector<std::string> out;
+        const char* text = std::getenv("EDEN_NX2_ROMFS_TRACE");
+        if (text == nullptr) {
+            return out;
+        }
+        std::string_view rest{text};
+        while (!rest.empty()) {
+            const auto comma = rest.find(',');
+            const auto part = rest.substr(0, comma);
+            if (!part.empty() && part != "0") {
+                out.emplace_back(part);
+            }
+            if (comma == std::string_view::npos) {
+                break;
+            }
+            rest.remove_prefix(comma + 1);
+        }
+        return out;
+    }();
+    return patterns;
+}
+} // namespace
+
+void IStorage::TraceRomFSRead(s64 offset, s64 length) {
+    const auto& patterns = RomFSTracePatterns();
+    if (patterns.empty() || length <= 0) {
+        return;
+    }
+    std::call_once(trace_index_once, [&] {
+        const auto root = FileSys::ExtractRomFS(backend);
+        if (root == nullptr) {
+            return;
+        }
+        const std::function<void(const FileSys::VirtualDir&, const std::string&)> walk =
+            [&](const FileSys::VirtualDir& dir, const std::string& prefix) {
+                for (const auto& file : dir->GetFiles()) {
+                    const std::string path = prefix + file->GetName();
+                    const auto* view = dynamic_cast<const FileSys::OffsetVfsFile*>(file.get());
+                    if (view == nullptr || file->GetSize() == 0) {
+                        continue;
+                    }
+                    for (const auto& pattern : patterns) {
+                        if (path.find(pattern) != std::string::npos) {
+                            traced_files.push_back(
+                                {view->GetOffset(), view->GetOffset() + file->GetSize(), path});
+                            break;
+                        }
+                    }
+                }
+                for (const auto& sub : dir->GetSubdirectories()) {
+                    walk(sub, prefix + sub->GetName() + "/");
+                }
+            };
+        walk(root, "");
+        std::sort(traced_files.begin(), traced_files.end(),
+                  [](const TracedFile& a, const TracedFile& b) { return a.begin < b.begin; });
+        LOG_INFO(Service_FS, "Nx2RomFS trace: {} files match", traced_files.size());
+    });
+    const u64 begin = static_cast<u64>(offset);
+    const u64 end = begin + static_cast<u64>(length);
+    auto it = std::upper_bound(traced_files.begin(), traced_files.end(), begin,
+                               [](u64 value, const TracedFile& f) { return value < f.begin; });
+    if (it != traced_files.begin()) {
+        --it;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    for (; it != traced_files.end() && it->begin < end; ++it) {
+        if (it->end <= begin) {
+            continue;
+        }
+        std::scoped_lock lock{trace_mutex};
+        auto& last = trace_last_logged[it->path];
+        if (last.time_since_epoch().count() == 0 || now - last > std::chrono::seconds{5}) {
+            last = now;
+            LOG_INFO(Service_FS, "Nx2RomFS read {}", it->path);
+        }
+    }
 }
 
 Result IStorage::GetSize(Out<u64> out_size) {
