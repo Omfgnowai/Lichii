@@ -231,6 +231,7 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
             auto& image = slot_images[entry.image_id];
             SwizzleImage(*gpu_memory, image.gpu_addr, image.info, entry.copies,
                          entry.map.mapped_span, swizzle_data_buffer);
+            runtime.FreeDeferredStagingBuffer(entry.map);
             ++gc_download_deletes;
             ClearStaleImage(image);
         }
@@ -264,7 +265,9 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
                 pending_download_bytes + image.unswizzled_size_bytes > MaxDownloadBatchBytes) {
                 FinishDownloads();
             }
-            auto map = runtime.DownloadStagingBuffer(image.unswizzled_size_bytes);
+            // Deferred: held until its batch is swizzled, so no other download of the batch
+            // reuses it (OpenGL's pool hands out free-looking buffers without a fence).
+            auto map = runtime.DownloadStagingBuffer(image.unswizzled_size_bytes, true);
             auto copies = FullDownloadCopies(image.info);
             image.DownloadMemory(map, copies);
             pending_download_bytes += image.unswizzled_size_bytes;
