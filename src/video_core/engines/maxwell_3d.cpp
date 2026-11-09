@@ -1579,8 +1579,13 @@ namespace {
 /// release or report the front sent that the back may not have run (needs EDEN_NX2_EGLA66_ACQUIRE,
 /// which records them) and no page the buffer cache marked GPU-written; counted against reads of
 /// reports the back held waiting for host query results, and reads the drain changed.
+/// Read on first use: nx2_switches.txt sets the variable after static initialization.
+bool DmaReadStatsEnabled() {
+    static const bool enabled = std::getenv("EDEN_NX2_DMA_READ_STATS") != nullptr;
+    return enabled;
+}
+
 struct DmaReadStats {
-    bool enabled = std::getenv("EDEN_NX2_DMA_READ_STATS") != nullptr;
     u64 reads{};
     u64 words{};
     u64 front_clear{};
@@ -1622,16 +1627,17 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
     const u32 words = std::min<u32>(count, 0x1000);
     const size_t read_bytes = size_t{words} * sizeof(u32);
     auto& stats = g_dma_read_stats;
+    const bool stats_enabled = DmaReadStatsEnabled();
     std::vector<u32> diag_before;
     bool stat_queued = false;
     bool stat_gpu_written = false;
     bool stat_unmapped = false;
     bool stat_pending = false;
-    if (Tegra::Nx2CmdPageDiag::g_enabled || stats.enabled) {
+    if (Tegra::Nx2CmdPageDiag::g_enabled || stats_enabled) {
         diag_before.resize(words);
         memory_manager.ReadBlockUnsafe(source, diag_before.data(), read_bytes);
     }
-    if (stats.enabled) {
+    if (stats_enabled) {
         for (u32 i = 0; i < words; ++i) {
             const auto device = memory_manager.GpuToCpuAddress(source + u64{i} * sizeof(u32));
             if (!device) {
@@ -1667,7 +1673,7 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
     }
     // Write out the reports held in the query cache, or the read returns stale occlusion counts.
     split.Run(
-        [this, source, read_bytes, pending = stats.enabled ? &stat_pending : nullptr] {
+        [this, source, read_bytes, pending = stats_enabled ? &stat_pending : nullptr] {
             if (pending != nullptr) {
                 *pending = VideoCommon::QueryDma::HasPendingQueries(memory_manager, *rasterizer,
                                                                     source, read_bytes);
@@ -1687,7 +1693,7 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
             ++changed;
         }
     }
-    if (stats.enabled) {
+    if (stats_enabled) {
         const bool front_clear = split.AcquireSkip() && !stat_queued && !stat_gpu_written &&
                                  !stat_unmapped;
         ++stats.reads;
