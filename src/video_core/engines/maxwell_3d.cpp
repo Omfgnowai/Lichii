@@ -381,6 +381,16 @@ bool Maxwell3D::IsFastDrawParameter(u32 method) {
     case MAXWELL3D_REG_INDEX(index_buffer.limit_addr_low):
     case MAXWELL3D_REG_INDEX(index_buffer.format):
         return true;
+    case MAXWELL3D_REG_INDEX(vertex_id_base): {
+        // Draw macros set it before every draw (Ocarina of Time: ~45k/s, the last break of about
+        // half the draws that resolve in full). No host state reads it: the base vertex comes
+        // from the draw state. EDEN_NX2_FAST_VERTEX_ID_BASE=0 breaks on it again.
+        static const bool parameter = [] {
+            const char* const value = std::getenv("EDEN_NX2_FAST_VERTEX_ID_BASE");
+            return value == nullptr || value[0] != '0';
+        }();
+        return parameter;
+    }
     default:
         return DrawManager::IsInstanceLoopMethod(method) || IsFastDrawDeltaMethod(method) ||
                IsFastDrawVertexBuffer(method);

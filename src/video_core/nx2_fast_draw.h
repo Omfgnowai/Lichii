@@ -119,7 +119,9 @@ private:
 /// Light changes since the last draw that can reach texture handles. Written and read on the
 /// thread that runs the 3D engine and the rasterizer (the split's back).
 struct Delta {
-    static constexpr size_t MaxWrites = 16;
+    /// 16 overflowed for ~7k draws/s in Ocarina of Time's Castle Town. Only the used entries are
+    /// copied (CopyFrom), so a larger list costs nothing per draw.
+    static constexpr size_t MaxWrites = 32;
 
     std::array<u32, 5> binds{}; ///< Constant buffer slots bound per stage
     /// Constant buffer data written, by GPU address (unmapped addresses included)...
@@ -130,6 +132,28 @@ struct Delta {
     std::array<DAddr, MaxWrites> device_begin{};
     std::array<DAddr, MaxWrites> device_end{};
     u32 num_device_writes{};
+
+    /// Clears the delta without touching the range lists past their counts.
+    void Reset() {
+        binds = {};
+        num_writes = 0;
+        num_device_writes = 0;
+    }
+
+    /// Copies another delta's binds and used ranges.
+    void CopyFrom(const Delta& other) {
+        binds = other.binds;
+        num_writes = other.num_writes;
+        num_device_writes = other.num_device_writes;
+        for (u32 i = 0; i < num_writes; ++i) {
+            write_begin[i] = other.write_begin[i];
+            write_end[i] = other.write_end[i];
+        }
+        for (u32 i = 0; i < num_device_writes; ++i) {
+            device_begin[i] = other.device_begin[i];
+            device_end[i] = other.device_end[i];
+        }
+    }
 
     [[nodiscard]] bool Empty() const {
         return num_writes == 0 && (binds[0] | binds[1] | binds[2] | binds[3] | binds[4]) == 0;
