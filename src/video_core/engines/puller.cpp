@@ -72,11 +72,13 @@ void DrainBack() {
     VideoCommon::GpuSplit::Get().Drain(VideoCommon::DrainSite::Acquire);
 }
 
-/// EDEN_NX2_REPORT_ACQUIRE=0 turns it off (on by default).
+/// EDEN_NX2_REPORT_ACQUIRE=1 turns it on. Off by default since build-19: in Ocarina of Time it
+/// never applied (run 12: 0 of ~1.3 M acquires) and its writer wait cost the front time; the
+/// acquire line then counts why it bails out.
 bool ReportAcquireEnabled() {
     static const bool enabled = [] {
         const char* value = std::getenv("EDEN_NX2_REPORT_ACQUIRE");
-        return value == nullptr || value[0] != '0';
+        return value != nullptr && value[0] == '1';
     }();
     return enabled;
 }
@@ -95,19 +97,26 @@ bool AcquireMetQueued(DmaPusher& dma_pusher, GPUVAddr address, const Met& met) {
     if (!ReportAcquireEnabled() || !split.Active() || !split.FrontMacros()) {
         return false;
     }
+    auto& bails = VideoCommon::g_acquire_stats.report_bails;
     const auto device = dma_pusher.memory_manager.GpuToCpuAddress(address);
     if (!device || Nx2MirrorShadow::Get().Diverts(*device) ||
         Nx2SemaphoreWaiters::Get().HasDelayedRelease(*device)) {
+        VideoCommon::Count(bails[6]);
         return false;
     }
     u32 word{};
-    if (!ReadReportWordsQueued(dma_pusher.memory_manager, split, address, &word, 1,
-                               VideoCommon::DrainSite::Acquire) ||
-        !met(word)) {
+    if (u32 bail = 0; !ReadReportWordsQueued(dma_pusher.memory_manager, split, address, &word, 1,
+                                             VideoCommon::DrainSite::Acquire, &bail)) {
+        VideoCommon::Count(bails[(std::min)(bail, 5U)]);
+        return false;
+    }
+    if (!met(word)) {
+        VideoCommon::Count(bails[7]);
         return false;
     }
     if (const auto shadowed = Nx2MirrorShadow::Get().Read(*device, word);
         shadowed && !met(*shadowed)) {
+        VideoCommon::Count(bails[8]);
         return false;
     }
     if (VideoCommon::Nx2Perf::Verify()) {
@@ -176,20 +185,21 @@ enum class AcquireCheck {
 // advance (NVN2 even releases QMD completions as maxima, KeplerCompute::ProcessNativeMethod), so
 // a value that meets one now still does once the back ran the queued work. Only the last release
 // the front sent to the word decides instead, when the back may not have run it yet.
-// EDEN_NX2_EQUAL_ACQUIRE=1 (experiment, off by default): equal and mask acquires take the same
+// EDEN_NX2_EQUAL_ACQUIRE (on by default since build-19; =0 turns it off): equal and mask acquires
+// take the same
 // check. The front's queued-release tracking says what the word holds once the back ran the work
 // sent before the acquire, whatever the operation; only the ">= stays met" argument is specific to
 // greater-or-equal. In Ocarina of Time over 99% of the acquires that still drain are equal or mask
-// (Castle Town: ~300 ms of every second of the split's front). Check with EDEN_NX2_ACQUIRE_VERIFY=1.
+// (Castle Town: ~300 ms of every second of the split's front). Check with EDEN_NX2_ACQUIRE_VERIFY=1
+// (run 12c, build-18 in Castle Town: 0 of ~500k acquires passed that a drain doesn't meet).
 // Read on first use: nx2_switches.txt sets the variable after static initialisation.
 bool EqualAcquireFast() {
     static const bool enabled = [] {
         const char* value = std::getenv("EDEN_NX2_EQUAL_ACQUIRE");
-        const bool on = value != nullptr && value[0] == '1';
-        if (on) {
-            LOG_INFO(HW_GPU, "EDEN_NX2_EQUAL_ACQUIRE=1: equal and mask acquires are checked "
-                             "without draining the split when they can be");
-        }
+        const bool on = value == nullptr || value[0] != '0';
+        LOG_INFO(HW_GPU, "EDEN_NX2_EQUAL_ACQUIRE={}: equal and mask acquires {}", on ? 1 : 0,
+                 on ? "are checked without draining the split when they can be"
+                    : "drain the split");
         return on;
     }();
     return enabled;

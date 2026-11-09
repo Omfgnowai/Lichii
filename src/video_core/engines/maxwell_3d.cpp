@@ -1672,7 +1672,14 @@ bool Maxwell3D::FrontContiguous(GPUVAddr address, u64 size, u64 device) const {
 }
 
 bool ReadReportWordsQueued(MemoryManager& memory_manager, VideoCommon::GpuSplit& split,
-                           GPUVAddr source, u32* out, u32 words, VideoCommon::DrainSite site) {
+                           GPUVAddr source, u32* out, u32 words, VideoCommon::DrainSite site,
+                           u32* bail) {
+    const auto fail = [bail](u32 reason) {
+        if (bail != nullptr) {
+            *bail = reason;
+        }
+        return false;
+    };
     // Without draining the back, for reads of report memory only (pages 3D reports and
     // semaphore releases write, such as occlusion results): the words in guest memory, with the
     // queued writes the front knows the words of on top (fence releases, inline uploads), once
@@ -1681,11 +1688,11 @@ bool ReadReportWordsQueued(MemoryManager& memory_manager, VideoCommon::GpuSplit&
     // wrote, and counter reports whose host query hasn't completed, take the drained path too.
     const size_t read_bytes = size_t{words} * sizeof(u32);
     if (words == 0) {
-        return false;
+        return fail(0);
     }
     const auto device = memory_manager.GpuToCpuAddress(source);
     if (!device || !split.IsReportMemory(*device, read_bytes)) {
-        return false;
+        return fail(1);
     }
     // Queued compute and copy work can write any page, and the back marks the pages GPU-written
     // only once it runs it.
@@ -1697,13 +1704,13 @@ bool ReadReportWordsQueued(MemoryManager& memory_manager, VideoCommon::GpuSplit&
         const auto page_device = memory_manager.GpuToCpuAddress(at);
         if (!page_device || *page_device != *device + (at - source) ||
             Tegra::Nx2IsGpuWritten(*page_device)) {
-            return false;
+            return fail(2);
         }
     }
     if (const u64 async_position = split.HasAsyncWrite(*device, read_bytes);
         async_position != 0 && (async_position > split.ConsumedNow() ||
                                 !Tegra::Nx2AsyncReportsSettled(*device, read_bytes))) {
-        return false;
+        return fail(3);
     }
     const u64 since = split.ConsumedNow();
     // A fence release the back already ran lands when its host fence signals; one still queued
@@ -1711,12 +1718,12 @@ bool ReadReportWordsQueued(MemoryManager& memory_manager, VideoCommon::GpuSplit&
     if (const u64 fence_position = split.HasFenceWrite(*device, read_bytes);
         fence_position != 0 && fence_position <= since &&
         !Tegra::Nx2AsyncReportsSettled(*device, read_bytes)) {
-        return false;
+        return fail(4);
     }
     memory_manager.ReadBlockUnsafe(source, out, read_bytes);
     if (!split.OverlayQueuedWrites(since, *device, out, words)) {
         if (!split.WaitForWritesTo(*device, read_bytes)) {
-            return false;
+            return fail(5);
         }
         memory_manager.ReadBlockUnsafe(source, out, read_bytes);
     }

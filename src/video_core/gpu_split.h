@@ -52,6 +52,10 @@ struct AcquireStats {
     std::atomic<u64> passed{};    ///< Acquires and polls met without a drain
     std::atomic<u64> by_queued{}; ///< Of passed: met by a release the back had not run yet
     std::atomic<u64> by_report_read{}; ///< Of passed: met by the queued report-memory read (#956)
+    /// Why the report-memory read (#956) didn't pass an acquire: 0 nothing read, 1 not report
+    /// memory, 2 GPU-written page, 3 counter report unsettled, 4 fence release unsettled, 5 too
+    /// many queued writes, 6 mirrored or fence-delayed word, 7 read but not met, 8 mirror not met.
+    std::array<std::atomic<u64>, 9> report_bails{};
     std::atomic<u64> latched{};   ///< Polls resumed by a release the back ran (no drain)
     std::atomic<u64> drained{};   ///< Acquires and polls that drained the split
     std::atomic<u64> drain_operation{}; ///< Of drained: an equal or mask acquire

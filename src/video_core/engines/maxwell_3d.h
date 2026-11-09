@@ -3804,8 +3804,11 @@ ASSERT_REG_POSITION(shadow_scratch, 0x3400);
 
 /// With the GPU thread split: reads `words` words of report memory (semaphores, reports) at
 /// `source` as the back will see them once it ran what is queued, without draining it: guest
-/// memory with the queued writes the front knows on top. False when they can't be known that way.
+/// memory with the queued writes the front knows on top. False when they can't be known that way
+/// (`bail` gets why: 0 none read, 1 not report memory, 2 GPU-written page, 3 counter report
+/// unsettled, 4 fence release unsettled, 5 too many queued writes).
 bool ReadReportWordsQueued(MemoryManager& memory_manager, VideoCommon::GpuSplit& split,
-                           GPUVAddr source, u32* out, u32 words, VideoCommon::DrainSite site);
+                           GPUVAddr source, u32* out, u32 words, VideoCommon::DrainSite site,
+                           u32* bail = nullptr);
 
 } // namespace Tegra::Engines

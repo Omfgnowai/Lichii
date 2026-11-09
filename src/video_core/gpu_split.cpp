@@ -675,6 +675,21 @@ void GpuSplit::ReportAcquire() {
              passed, by_queued, by_report_read, latched, drained, valve_drains, drain_operation, drain_settings,
              drain_word, drain_queued, polls, acquire_polls, list_polls, back_waits, back_sleeps,
              spin_ms, early_publishes, settles);
+    std::array<u64, 9> bails{};
+    u64 bail_total = 0;
+    for (size_t i = 0; i < bails.size(); ++i) {
+        bails[i] = take(stats.report_bails[i]);
+        bail_total += bails[i];
+    }
+    if (bail_total != 0) {
+        LOG_INFO(HW_GPU,
+                 "Acquire report reads that didn't pass in 10 s: {} nothing read, {} not report "
+                 "memory, {} GPU-written page, {} counter report unsettled, {} fence release "
+                 "unsettled, {} too many queued writes, {} mirrored or fence-delayed word, {} read "
+                 "but not met, {} mirror not met",
+                 bails[0], bails[1], bails[2], bails[3], bails[4], bails[5], bails[6], bails[7],
+                 bails[8]);
+    }
     const u64 mismatches = take(stats.mismatches);
     const u64 unlanded = take(stats.unlanded);
     const u64 late = take(stats.late);
