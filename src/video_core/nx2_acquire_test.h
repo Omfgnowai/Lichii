@@ -16,10 +16,14 @@
 
 namespace VideoCommon::Nx2AcquireTest {
 
-inline const bool g_stats = [] {
-    const char* value = std::getenv("EDEN_NX2_ACQUIRE_STATS");
-    return value != nullptr && value[0] != '\0' && value[0] != '0';
-}();
+// Read on first use: nx2_switches.txt sets the variable after static initialisation.
+inline bool StatsEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_ACQUIRE_STATS");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }();
+    return enabled;
+}
 
 // Buckets: <1 ms, <10 ms, <100 ms, <500 ms, <2 s, >=2 s.
 class Stats {
@@ -29,7 +33,7 @@ public:
         return instance;
     }
     void Acquire(std::chrono::steady_clock::duration wait) {
-        if (!g_stats) {
+        if (!StatsEnabled()) {
             return;
         }
         const u64 us = static_cast<u64>(
