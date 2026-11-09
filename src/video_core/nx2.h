@@ -388,7 +388,7 @@ public:
     bool Add(const void* owner, u64 device_address, u32 value, u32 operation) {
         std::scoped_lock lk{mutex};
         Slot* free_slot = nullptr;
-        for (Slot& slot : slots) {
+        for (Slot& slot : waiter_slots) {
             const void* const current = slot.owner.load(std::memory_order_relaxed);
             if (current == owner) {
                 slot.owner.store(nullptr, std::memory_order_relaxed);
@@ -419,7 +419,7 @@ public:
             return;
         }
         std::scoped_lock lk{mutex};
-        for (Slot& slot : slots) {
+        for (Slot& slot : waiter_slots) {
             if (slot.owner.load(std::memory_order_relaxed) == owner) {
                 slot.owner.store(nullptr, std::memory_order_relaxed);
                 count.fetch_sub(1, std::memory_order_relaxed);
@@ -431,7 +431,7 @@ public:
         if (count.load(std::memory_order_acquire) == 0) {
             return false;
         }
-        for (const Slot& slot : slots) {
+        for (const Slot& slot : waiter_slots) {
             if (slot.owner.load(std::memory_order_relaxed) == owner) {
                 // Acquire: what the engine wrote before the latch is visible after it.
                 return slot.latched.load(std::memory_order_acquire);
@@ -485,7 +485,7 @@ private:
 
     /// Called with the mutex held.
     void Latch(u64 device_address, u32 value) {
-        for (Slot& slot : slots) {
+        for (Slot& slot : waiter_slots) {
             if (slot.owner.load(std::memory_order_relaxed) != nullptr &&
                 slot.address == device_address && Matches(slot, value)) {
                 slot.latched.store(true, std::memory_order_release);
@@ -506,8 +506,8 @@ private:
         }
     }
 
-    std::mutex mutex; ///< Held to fill, empty and latch slots
-    std::array<Slot, MaxWaiters> slots{};
+    std::mutex mutex; ///< Held to fill, empty and latch the slots
+    std::array<Slot, MaxWaiters> waiter_slots{};
     std::map<u64, u32> delayed; ///< OnDelayedRelease values whose fence hasn't run, by address
     std::atomic<size_t> count{};
 };
