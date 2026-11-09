@@ -66,20 +66,24 @@ public:
         return upload_start ? static_cast<size_t>(payload_cursor - upload_start) : 0;
     }
 
-    void AddSampledImage(VkImageView image_view, VkSampler sampler) {
-        *(payload_cursor++) = VkDescriptorImageInfo{
+    static DescriptorUpdateEntry SampledImageEntry(VkImageView image_view, VkSampler sampler) {
+        return VkDescriptorImageInfo{
             .sampler = sampler,
             .imageView = image_view,
             .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
         };
     }
 
+    static DescriptorUpdateEntry ImageEntry(VkImageView image_view) {
+        return SampledImageEntry(image_view, VK_NULL_HANDLE);
+    }
+
+    void AddSampledImage(VkImageView image_view, VkSampler sampler) {
+        *(payload_cursor++) = SampledImageEntry(image_view, sampler);
+    }
+
     void AddImage(VkImageView image_view) {
-        *(payload_cursor++) = VkDescriptorImageInfo{
-            .sampler = VK_NULL_HANDLE,
-            .imageView = image_view,
-            .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
-        };
+        *(payload_cursor++) = ImageEntry(image_view);
     }
 
     void AddBuffer(VkBuffer buffer, VkDeviceSize offset, VkDeviceSize size) {

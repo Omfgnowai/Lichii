@@ -37,6 +37,7 @@
 #include "common/slot_vector.h"
 #include "shader_recompiler/shader_info.h"
 #include "video_core/buffer_cache/buffer_base.h"
+#include "video_core/buffer_cache/geometry_ranges.h"
 #include "video_core/buffer_cache/read_trap_tracker.h"
 #include "video_core/buffer_cache/virtual_range_cache.h"
 #include "video_core/control/channel_state_cache.h"
@@ -501,6 +502,12 @@ public:
     /// nullptr.
     void BeginGraphicsUniforms(const Nx2FastDraw::Delta* delta);
 
+    /// Index and vertex stream ranges the back split's pool resolved for the current draw, or
+    /// nullptr (EDEN_NX2_BACK_SPLIT): UpdateGraphicsBuffers takes them instead of its own.
+    void UsePreparedGeometry(PreparedGeometry* prepared) noexcept {
+        prepared_geometry = prepared;
+    }
+
     Common::SpinRecursiveMutex mutex;
     Runtime& runtime;
     bool any_buffer_uploaded = false;
@@ -704,6 +711,7 @@ private:
         u64 deletions{};
     };
     std::array<GeometrySync, NUM_VERTEX_BUFFERS + 1> geometry_syncs{};
+    PreparedGeometry* prepared_geometry{};
     /// Counts DeleteBuffer calls: a buffer id older than this count may have been freed or reused.
     u64 buffer_deletions = 0;
 

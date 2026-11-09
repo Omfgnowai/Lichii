@@ -68,6 +68,7 @@ struct hash<Vulkan::GraphicsPipelineCacheKey> {
 
 namespace Vulkan {
 
+class BackSplit;
 class Device;
 class PipelineStatistics;
 class RenderPassCache;
@@ -220,8 +221,9 @@ public:
 
     void AddTransition(GraphicsPipeline* transition);
 
-    bool Configure(bool is_indexed) {
-        return configure_func(this, is_indexed);
+    /// `back_split`: the draw's EDEN_NX2_BACK_SPLIT pool, or nullptr.
+    bool Configure(bool is_indexed, BackSplit* back_split) {
+        return configure_func(this, is_indexed, back_split);
     }
 
     [[nodiscard]] GraphicsPipeline* Next(const GraphicsPipelineCacheKey& current_key) noexcept {
@@ -356,7 +358,9 @@ public:
 
     template <typename Spec>
     static auto MakeConfigureSpecFunc() {
-        return [](GraphicsPipeline* pl, bool is_indexed) { return pl->ConfigureImpl<Spec>(is_indexed); };
+        return [](GraphicsPipeline* pl, bool is_indexed, BackSplit* back_split) {
+            return pl->ConfigureImpl<Spec>(is_indexed, back_split);
+        };
     }
 
     void SetEngine(Tegra::Engines::Maxwell3D* maxwell3d_, Tegra::MemoryManager* gpu_memory_) {
@@ -366,7 +370,7 @@ public:
 
 private:
     template <typename Spec>
-    bool ConfigureImpl(bool is_indexed);
+    bool ConfigureImpl(bool is_indexed, BackSplit* back_split);
 
     void KeepImageDescriptors(size_t stage, size_t first_entry);
 
@@ -388,7 +392,7 @@ private:
     GuestDescriptorQueue& guest_descriptor_queue;
     DescriptorBufferRing& descriptor_buffer_ring;
 
-    bool (*configure_func)(GraphicsPipeline*, bool){};
+    bool (*configure_func)(GraphicsPipeline*, bool, BackSplit*){};
 
     std::vector<GraphicsPipelineCacheKey> transition_keys;
     std::vector<GraphicsPipeline*> transitions;

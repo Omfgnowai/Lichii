@@ -392,11 +392,15 @@ public:
     std::array<f32, 4> words{};
 };
 
-inline void PushImageDescriptors(TextureCache& texture_cache,
-                                 GuestDescriptorQueue& guest_descriptor_queue,
+/// Pushes a stage's sampled and storage image descriptors to `queue` (the guest descriptor queue
+/// or a back split worker's ImageDescriptorSink) and passes `mark_written` each image a storage
+/// image descriptor writes.
+template <typename Queue, typename MarkWritten>
+inline void PushImageDescriptors(TextureCache& texture_cache, Queue& queue,
                                  const Shader::Info& info, RescalingPushConstant& rescaling,
                                  const VideoCommon::SamplerId*& samplers,
-                                 const VideoCommon::ImageViewInOut*& views) {
+                                 const VideoCommon::ImageViewInOut*& views,
+                                 MarkWritten&& mark_written) {
     const u32 num_texture_buffers = Shader::NumDescriptors(info.texture_buffer_descriptors);
     const u32 num_image_buffers = Shader::NumDescriptors(info.image_buffer_descriptors);
     views += num_texture_buffers;
@@ -413,8 +417,7 @@ inline void PushImageDescriptors(TextureCache& texture_cache,
                 if (null_image_view != VK_NULL_HANDLE) vk_image_view = null_image_view;
             }
             Sampler& sampler{texture_cache.GetSampler(sampler_id)};
-            guest_descriptor_queue.AddSampledImage(vk_image_view,
-                                                   sampler.HandleFor(image_view, desc.is_depth));
+            queue.AddSampledImage(vk_image_view, sampler.HandleFor(image_view, desc.is_depth));
             const bool element_rescaled{texture_cache.IsRescaling(image_view)};
             is_rescaled |= element_rescaled;
         }
@@ -427,14 +430,25 @@ inline void PushImageDescriptors(TextureCache& texture_cache,
             const VkImageView vk_image_view{
                 image_view.StorageView(desc.type, desc.format, desc.is_byte_addressed)};
             if (desc.is_written) {
-                texture_cache.MarkModification(image_view.image_id);
+                mark_written(image_view.image_id);
             }
-            guest_descriptor_queue.AddImage(vk_image_view);
+            queue.AddImage(vk_image_view);
             const bool element_rescaled{texture_cache.IsRescaling(image_view)};
             is_rescaled |= element_rescaled;
         }
         rescaling.PushImage(is_rescaled);
     }
+}
+
+inline void PushImageDescriptors(TextureCache& texture_cache,
+                                 GuestDescriptorQueue& guest_descriptor_queue,
+                                 const Shader::Info& info, RescalingPushConstant& rescaling,
+                                 const VideoCommon::SamplerId*& samplers,
+                                 const VideoCommon::ImageViewInOut*& views) {
+    PushImageDescriptors(texture_cache, guest_descriptor_queue, info, rescaling, samplers, views,
+                         [&texture_cache](VideoCommon::ImageId image_id) {
+                             texture_cache.MarkModification(image_id);
+                         });
 }
 
 } // namespace Vulkan
