@@ -3426,6 +3426,13 @@ private:
     void FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split, FrontState& state);
     void FrontTrackInstanceLoop(FrontState& state, u32 method, u32 value);
     bool FrontSkipsLoopWrite(FrontState& state, u32 method, u32 value, bool shadow_kept);
+    void FrontNoteMemoryWrite(VideoCommon::GpuSplit& split, FrontState& state, u32 method,
+                              const u32* words, u32 count);
+    /// Whether [address, address + size) maps to [device, device + size) on every page.
+    [[nodiscard]] bool FrontContiguous(GPUVAddr address, u64 size, u64 device) const;
+    /// FrontDmaRead without draining the back, when the words can be known: false otherwise.
+    bool FrontDmaReadQueued(VideoCommon::GpuSplit& split, FrontState& state, u32 macro, u32 method,
+                            GPUVAddr source, u32 words);
     void FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& state, u32 macro, u32 method,
                       u32 count);
     void FrontNoteReport(VideoCommon::GpuSplit& split, const FrontState& state);

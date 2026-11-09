@@ -295,6 +295,13 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
                                      pointer, pointer_timestamp, cpu_addr, addr,
                                      asid = gpu_memory->GetID(), counter_type, mirrored, delayed_release,
                                      payload] {
+        struct Settle {
+            DAddr address;
+            ~Settle() {
+                Tegra::g_nx2_async_reports_completed[Tegra::Nx2AsyncReportSlot(address)].fetch_add(
+                    1, std::memory_order_release);
+            }
+        } const settle{cpu_addr};
         SCOPE_EXIT {
             if (delayed_release) {
                 Tegra::Nx2SemaphoreWaiters::Get().OnDelayedReleaseDone(cpu_addr, payload);
@@ -358,6 +365,8 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
         if (delayed_release) {
             Tegra::Nx2SemaphoreWaiters::Get().OnDelayedRelease(cpu_addr, payload);
         }
+        Tegra::g_nx2_async_reports_issued[Tegra::Nx2AsyncReportSlot(cpu_addr)].fetch_add(
+            1, std::memory_order_release);
         VideoCore::g_signaling_query_report_fence = true;
         impl->rasterizer.SignalFence(std::move(operation));
         VideoCore::g_signaling_query_report_fence = false;
@@ -391,6 +400,8 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
             streamer->Free(new_query_id);
             return;
         }
+        Tegra::g_nx2_async_reports_issued[Tegra::Nx2AsyncReportSlot(cpu_addr)].fetch_add(
+            1, std::memory_order_release);
         impl->rasterizer.SyncOperation(std::move(operation));
     }
     auto [cont_addr, base] = gen_caching_indexing(cpu_addr);

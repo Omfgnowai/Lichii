@@ -146,6 +146,10 @@ void GpuSplit::Stop() {
     ring.reset();
     write_position = 0;
     last_writer_position = 0;
+    pending_write_count = 0;
+    async_writes.clear();
+    fence_writes.clear();
+    report_pages.clear();
     last_sync_position = 0;
     semaphore_writes.clear();
     semaphore_writes_limit = 1024;
@@ -243,8 +247,71 @@ void GpuSplit::Drain(DrainSite site) {
     }
 }
 
-bool GpuSplit::WaitForWriters() {
-    return WaitFor(std::min(last_writer_position, write_position), DrainSite::ListWriters);
+bool GpuSplit::WaitForWriters(DrainSite site) {
+    return WaitFor(std::min(last_writer_position, write_position), site);
+}
+
+bool GpuSplit::WaitForWritesTo(u64 begin, u64 size) {
+    consumed_cache = consumed.load(std::memory_order_acquire);
+    const u64 end = begin + size;
+    const u64 remembered = (std::min<u64>)(pending_write_count, pending_writes.size());
+    u64 target = 0;
+    u64 scanned = 0;
+    for (; scanned < remembered; ++scanned) {
+        const PendingWrite& write =
+            pending_writes[(pending_write_count - 1 - scanned) % pending_writes.size()];
+        if (write.position <= consumed_cache) {
+            break;
+        }
+        if (write.begin < end && begin < write.end) {
+            target = (std::max)(target, write.position);
+        }
+    }
+    if (scanned == pending_writes.size()) {
+        return false;
+    }
+    if (target != 0) {
+        WaitFor(target, DrainSite::MacroDmaRead);
+    }
+    return true;
+}
+
+bool GpuSplit::OverlayQueuedWrites(u64 since, u64 begin, u32* out, u32 words) {
+    if ((begin & 3) != 0) {
+        return false;
+    }
+    const u64 end = begin + u64{words} * sizeof(u32);
+    const u64 remembered = (std::min<u64>)(pending_write_count, pending_writes.size());
+    // Newest first, back to what the back had consumed before guest memory was read.
+    std::array<u32, 64> overlapping;
+    u32 found = 0;
+    u64 scanned = 0;
+    for (; scanned < remembered; ++scanned) {
+        const u64 index = (pending_write_count - 1 - scanned) % pending_writes.size();
+        const PendingWrite& write = pending_writes[index];
+        if (write.position <= since) {
+            break;
+        }
+        if (write.begin < end && begin < write.end) {
+            if (write.words == 0 || (write.begin & 3) != 0 || found == overlapping.size()) {
+                return false;
+            }
+            overlapping[found++] = static_cast<u32>(index);
+        }
+    }
+    if (scanned == pending_writes.size()) {
+        return false;
+    }
+    for (u32 i = found; i-- > 0;) {
+        const PendingWrite& write = pending_writes[overlapping[i]];
+        for (u32 w = 0; w < write.words; ++w) {
+            const u64 address = write.begin + u64{w} * sizeof(u32);
+            if (address >= begin && address < end) {
+                out[(address - begin) / sizeof(u32)] = write.data[w];
+            }
+        }
+    }
+    return true;
 }
 
 bool GpuSplit::WaitForSync() {
