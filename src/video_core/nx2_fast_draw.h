@@ -82,6 +82,23 @@ inline void SetEnabledForTest(bool on) {
     return verify;
 }
 
+/// Set by the Vulkan pipeline cache: every pipeline takes vertex strides from dynamic state
+/// (VK_EXT_extended_dynamic_state) and its vertex input from vkCmdSetVertexInputEXT, so a vertex
+/// stream's stride or enable bit never selects another pipeline, and an attribute format only
+/// does through its type class (FixedPipelineState::attribute_types).
+inline std::atomic<bool> g_vertex_layout_dynamic{false};
+
+/// Whether vertex stream stride/enable writes and attribute format writes that keep the
+/// pipeline's attribute type class are draw parameters. EDEN_NX2_FAST_VERTEX_LAYOUT=0 breaks on
+/// them again.
+[[nodiscard]] inline bool VertexLayoutParameters() {
+    static const bool allowed = [] {
+        const char* const value = std::getenv("EDEN_NX2_FAST_VERTEX_LAYOUT");
+        return value == nullptr || value[0] != '0';
+    }();
+    return allowed && g_vertex_layout_dynamic.load(std::memory_order_relaxed);
+}
+
 inline std::atomic<u64> g_serial{1};
 /// The last break's reason and, for Register and Method, its 3D method (diagnostics).
 inline std::atomic<u32> g_last_break{};

@@ -359,7 +359,8 @@ void Maxwell3D::ProcessDirtyRegisters(u32 method, u32 argument) {
         draw_manager.DrawDeferred(*this, true);
     }
     if (VideoCommon::Nx2FastDraw::Enabled() && regs.reg_array[method] != argument &&
-        !IsFastDrawParameter(method)) {
+        !IsFastDrawParameter(method) &&
+        !IsFastDrawAttributeFormat(method, regs.reg_array[method], argument)) {
         VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Register, method);
     }
     regs.reg_array[method] = argument;
@@ -402,13 +403,35 @@ bool Maxwell3D::IsFastDrawVertexBuffer(u32 method) {
     constexpr u32 stream_words = sizeof(Regs::VertexStream) / sizeof(u32);
     if (method >= streams && method < streams + Regs::NumVertexArrays * stream_words) {
         const u32 word = (method - streams) % stream_words;
-        return word == 1 || word == 2; // address_high, address_low
+        // Word 0 (stride, enable): Ocarina of Time's draw macros rewrite it often (~30k/s in
+        // Castle Town, then the last break of a third of full draws). Both draw paths bind the
+        // vertex buffers again with their strides (BindHostVertexBuffers).
+        return word == 1 || word == 2 || // address_high, address_low
+               (word == 0 && VideoCommon::Nx2FastDraw::VertexLayoutParameters());
     }
     constexpr u32 sizes = 0x600 / sizeof(u32); // SET_VERTEX_STREAM_SIZE_A/B (NativeVertexStreamSize)
     constexpr u32 limits = MAXWELL3D_REG_INDEX(vertex_stream_limits);
     constexpr u32 limit_words = sizeof(Regs::VertexStreamLimit) / sizeof(u32);
     return (method >= sizes && method < sizes + Regs::NumVertexArrays * 2) ||
            (method >= limits && method < limits + Regs::NumVertexArrays * limit_words);
+}
+
+bool Maxwell3D::IsFastDrawAttributeFormat(u32 method, u32 old_value, u32 new_value) {
+    constexpr u32 formats = MAXWELL3D_REG_INDEX(vertex_attrib_format);
+    if (method < formats || method >= formats + Regs::NumVertexAttributes ||
+        !VideoCommon::Nx2FastDraw::VertexLayoutParameters()) {
+        return false;
+    }
+    // What FixedPipelineState::attribute_types keeps of an attribute: its type class, none when
+    // constant. Format, size, offset and buffer go to vkCmdSetVertexInputEXT on either path.
+    const auto type_class = [](u32 value) {
+        static constexpr std::array<u32, 8> classes{0, 1, 1, 2, 3, 1, 1, 1};
+        Regs::VertexAttribute attribute{};
+        attribute.hex = value;
+        return attribute.constant != 0 ? 0U
+                                       : classes[static_cast<size_t>(attribute.type.Value())];
+    };
+    return type_class(old_value) == type_class(new_value);
 }
 
 bool Maxwell3D::IsFastDrawDeltaMethod(u32 method) {
