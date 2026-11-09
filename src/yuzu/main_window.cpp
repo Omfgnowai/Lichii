@@ -2906,40 +2906,90 @@ void MainWindow::OnGameListDumpRomFS(u64 program_id, const std::string& game_pat
                                 "cancelled the operation."));
     };
 
-    const auto loader = Loader::GetLoader(
-        *QtCommon::system, QtCommon::vfs->OpenFile(game_path, FileSys::OpenMode::Read));
-    if (loader == nullptr) {
-        failed();
-        return;
-    }
-
-    FileSys::VirtualFile packed_update_raw{};
-    loader->ReadUpdateRaw(packed_update_raw);
-
-    const auto& installed = QtCommon::system->GetContentProvider();
-
+    const auto game_file = QtCommon::vfs->OpenFile(game_path, FileSys::OpenMode::Read);
     u64 title_id{};
-    u8 raw_type{};
-    if (!SelectRomFSDumpTarget(installed, program_id, &title_id, &raw_type)) {
-        failed();
-        return;
+    FileSys::VirtualDir extracted;
+    u64 romfs_size{};
+    // A NUP holds loose RomFS trees, not NCAs, so it has no ContentProvider entry to dump from:
+    // dump the tree the game loads instead, its update laid over its base (loader/nup.cpp).
+    // Kept alive until the copy is done; its files read through its decompression cache.
+    std::unique_ptr<FileSys::NupContainer> nup;
+    if (game_file && FileSys::NupContainer::IsNupFile(game_file)) {
+        nup = std::make_unique<FileSys::NupContainer>(game_file);
+        if (nup->GetStatus() != Loader::ResultStatus::Success) {
+            failed();
+            return;
+        }
+        const auto base = nup->FindBasePackage();
+        const auto update = nup->FindBestUpdatePackage();
+        extracted = FileSys::NupContainer::MergeShadowDirs(
+            base ? nup->GetRomFSDir(*base) : FileSys::VirtualDir{},
+            update ? nup->GetRomFSDir(*update) : FileSys::VirtualDir{});
+        if (extracted == nullptr) {
+            failed();
+            return;
+        }
+        title_id = base ? nup->GetPackages()[*base].title_id : program_id;
+        const auto tree_size = [](const auto& self, const FileSys::VirtualDir& dir) -> u64 {
+            u64 total = 0;
+            for (const auto& file : dir->GetFiles()) {
+                total += file->GetSize();
+            }
+            for (const auto& sub : dir->GetSubdirectories()) {
+                total += self(self, sub);
+            }
+            return total;
+        };
+        romfs_size = tree_size(tree_size, extracted);
+    } else {
+        const auto loader = Loader::GetLoader(*QtCommon::system, game_file);
+        if (loader == nullptr) {
+            failed();
+            return;
+        }
+
+        FileSys::VirtualFile packed_update_raw{};
+        loader->ReadUpdateRaw(packed_update_raw);
+
+        const auto& installed = QtCommon::system->GetContentProvider();
+
+        u8 raw_type{};
+        if (!SelectRomFSDumpTarget(installed, program_id, &title_id, &raw_type)) {
+            failed();
+            return;
+        }
+
+        const auto type = static_cast<FileSys::ContentRecordType>(raw_type);
+        const auto base_nca = installed.GetEntry(title_id, type);
+        if (!base_nca) {
+            failed();
+            return;
+        }
+
+        const FileSys::NCA update_nca{packed_update_raw, nullptr};
+        if (type != FileSys::ContentRecordType::Program ||
+            update_nca.GetStatus() != Loader::ResultStatus::ErrorMissingBKTRBaseRomFS ||
+            update_nca.GetTitleId() != FileSys::GetUpdateTitleID(title_id)) {
+            packed_update_raw = {};
+        }
+
+        const auto base_romfs = base_nca->GetRomFS();
+        const FileSys::PatchManager pm{title_id, QtCommon::system->GetFileSystemController(),
+                                       installed};
+        const auto romfs =
+            pm.PatchRomFS(base_nca.get(), base_romfs, type, packed_update_raw, false);
+        if (romfs == nullptr) {
+            failed();
+            return;
+        }
+        extracted = FileSys::ExtractRomFS(romfs);
+        if (extracted == nullptr) {
+            failed();
+            return;
+        }
+        romfs_size = romfs->GetSize();
     }
 
-    const auto type = static_cast<FileSys::ContentRecordType>(raw_type);
-    const auto base_nca = installed.GetEntry(title_id, type);
-    if (!base_nca) {
-        failed();
-        return;
-    }
-
-    const FileSys::NCA update_nca{packed_update_raw, nullptr};
-    if (type != FileSys::ContentRecordType::Program ||
-        update_nca.GetStatus() != Loader::ResultStatus::ErrorMissingBKTRBaseRomFS ||
-        update_nca.GetTitleId() != FileSys::GetUpdateTitleID(title_id)) {
-        packed_update_raw = {};
-    }
-
-    const auto base_romfs = base_nca->GetRomFS();
     const auto dump_dir =
         target == DumpRomFSTarget::Normal
             ? Common::FS::GetEdenPath(Common::FS::EdenPath::DumpDir)
@@ -2947,10 +2997,6 @@ void MainWindow::OnGameListDumpRomFS(u64 program_id, const std::string& game_pat
     const auto romfs_dir = fmt::format("{:016X}/romfs", title_id);
 
     const auto path = Common::FS::PathToUTF8String(dump_dir / romfs_dir);
-
-    const FileSys::PatchManager pm{title_id, QtCommon::system->GetFileSystemController(),
-                                   installed};
-    auto romfs = pm.PatchRomFS(base_nca.get(), base_romfs, type, packed_update_raw, false);
 
     const auto out = VfsFilesystemCreateDirectoryWrapper(path, FileSys::OpenMode::ReadWrite);
 
@@ -2974,16 +3020,10 @@ void MainWindow::OnGameListDumpRomFS(u64 program_id, const std::string& game_pat
         return;
     }
 
-    const auto extracted = FileSys::ExtractRomFS(romfs);
-    if (extracted == nullptr) {
-        failed();
-        return;
-    }
-
     const auto full = res == selections.constFirst();
 
     // The expected required space is the size of the RomFS + 1 GiB
-    const auto minimum_free_space = romfs->GetSize() + 0x40000000;
+    const auto minimum_free_space = romfs_size + 0x40000000;
 
     if (full && Common::FS::GetFreeSpaceSize(path) < minimum_free_space) {
         QMessageBox::warning(this, tr("RomFS Extraction Failed!"),
@@ -3002,7 +3042,7 @@ void MainWindow::OnGameListDumpRomFS(u64 program_id, const std::string& game_pat
 
     size_t read_size = 0;
 
-    if (RomFSRawCopy(romfs->GetSize(), read_size, progress, extracted, out, full)) {
+    if (RomFSRawCopy(romfs_size, read_size, progress, extracted, out, full)) {
         progress.close();
         QMessageBox::information(this, tr("RomFS Extraction Succeeded!"),
                                  tr("The operation completed successfully."));
