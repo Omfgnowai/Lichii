@@ -54,6 +54,9 @@ public:
     /// Returns the last used presentation frame
     Frame* GetRenderFrame();
 
+    /// As GetRenderFrame, or nullptr at once when every frame still waits to be presented.
+    Frame* TryGetRenderFrame();
+
     /// Pushes a frame for presentation
     void Present(Frame* frame);
 

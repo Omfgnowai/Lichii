@@ -188,6 +188,21 @@ Frame* PresentManager::GetRenderFrame() {
     return frame;
 }
 
+Frame* PresentManager::TryGetRenderFrame() {
+    Frame* frame;
+    {
+        std::scoped_lock lock{free_mutex};
+        if (free_queue.empty()) {
+            return nullptr;
+        }
+        frame = free_queue.front();
+        free_queue.pop_front();
+    }
+    frame->present_done.Wait();
+    frame->present_done.Reset();
+    return frame;
+}
+
 void PresentManager::Present(Frame* frame) {
     if (use_present_thread) {
         scheduler.Record([this, frame](vk::CommandBuffer) {

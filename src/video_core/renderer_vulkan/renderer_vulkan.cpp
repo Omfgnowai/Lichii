@@ -6,6 +6,8 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <optional>
@@ -236,10 +238,30 @@ void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebu
     RenderScreenshot(framebuffers);
     const auto acquiring = trace ? std::chrono::steady_clock::now()
                                  : std::chrono::steady_clock::time_point{};
+    // EDEN_NX2_PRESENT_DROP=1: when every presentation frame still waits for the swapchain, drop
+    // this one instead of holding the GPU back thread until one is free (run 15a: 280 ms/s of the
+    // back waited here with the display's picture off). Experiment, off by default.
+    static const bool drop_when_busy = [] {
+        const char* value = std::getenv("EDEN_NX2_PRESENT_DROP");
+        return value != nullptr && value[0] == '1';
+    }();
     Frame* frame = [this] {
         const VideoCommon::Nx2Profile::Scope scope{VideoCommon::Nx2Profile::Zone::Present};
-        return present_manager.GetRenderFrame();
+        return drop_when_busy ? present_manager.TryGetRenderFrame()
+                              : present_manager.GetRenderFrame();
     }();
+    if (frame == nullptr) {
+        static u64 dropped{};
+        static auto next_log = std::chrono::steady_clock::now();
+        ++dropped;
+        if (const auto now = std::chrono::steady_clock::now(); now >= next_log) {
+            next_log = now + std::chrono::seconds{10};
+            LOG_INFO(Render_Vulkan, "EDEN_NX2_PRESENT_DROP: {} frames dropped so far", dropped);
+        }
+        gpu.RendererFrameEndNotify();
+        rasterizer.TickFrame();
+        return;
+    }
     const auto acquired = trace ? std::chrono::steady_clock::now()
                                 : std::chrono::steady_clock::time_point{};
 
