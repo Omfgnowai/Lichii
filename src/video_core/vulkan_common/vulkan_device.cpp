@@ -27,6 +27,7 @@
 #include <ranges>
 #include "common/settings.h"
 #include "common/settings_enums.h"
+#include "video_core/nx2_stutter_trace.h"
 #include "video_core/vulkan_common/nsight_aftermath_tracker.h"
 #include "video_core/vulkan_common/vma.h"
 #include "video_core/vulkan_common/vulkan_device.h"
@@ -428,6 +429,26 @@ u64 AllocatedUsage(VkDeviceSize driver_usage, const VmaBudget& vma_budget) {
     return driver_usage - (std::min)(driver_usage, unused);
 }
 
+// VMA's device memory calls, timed for EDEN_NX2_STUTTER_TRACE.
+PFN_vkAllocateMemory g_vma_allocate_memory{};
+PFN_vkFreeMemory g_vma_free_memory{};
+
+VKAPI_ATTR VkResult VKAPI_CALL TimedAllocateMemory(VkDevice device,
+                                                   const VkMemoryAllocateInfo* allocate_info,
+                                                   const VkAllocationCallbacks* allocator,
+                                                   VkDeviceMemory* memory) {
+    using namespace VideoCommon::StutterTrace;
+    const SiteScope site{Site::MemoryAllocate};
+    return g_vma_allocate_memory(device, allocate_info, allocator, memory);
+}
+
+VKAPI_ATTR void VKAPI_CALL TimedFreeMemory(VkDevice device, VkDeviceMemory memory,
+                                           const VkAllocationCallbacks* allocator) {
+    using namespace VideoCommon::StutterTrace;
+    const SiteScope site{Site::MemoryFree};
+    g_vma_free_memory(device, memory, allocator);
+}
+
 } // Anonymous namespace
 
 void Device::RemoveExtension(bool& extension, const std::string& extension_name) {
@@ -797,6 +818,10 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
     VmaVulkanFunctions functions{};
     functions.vkGetInstanceProcAddr = dld.vkGetInstanceProcAddr;
     functions.vkGetDeviceProcAddr = dld.vkGetDeviceProcAddr;
+    g_vma_allocate_memory = dld.vkAllocateMemory;
+    g_vma_free_memory = dld.vkFreeMemory;
+    functions.vkAllocateMemory = TimedAllocateMemory;
+    functions.vkFreeMemory = TimedFreeMemory;
 
     // Synchronized inside VMA: the image recycler destroys dropped images on a thread of its own
     // while the GPU thread allocates (vulkan_wrapper.cpp).

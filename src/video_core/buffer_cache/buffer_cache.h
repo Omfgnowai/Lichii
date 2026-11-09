@@ -74,6 +74,7 @@ BufferCache<P>::~BufferCache() = default;
 
 template <class P>
 void BufferCache<P>::RunGarbageCollector(bool aggressive_gc) {
+    const StutterTrace::SiteScope site{StutterTrace::Site::BufferCollect};
     const u64 ticks_to_destroy = aggressive_gc ? 60 : 120;
     int num_iterations = aggressive_gc ? 64 : 32;
     // Their GPU-written data is downloaded first, all with one wait for the GPU: one wait per
@@ -2737,6 +2738,7 @@ void BufferCache<P>::JoinOverlap(BufferId new_buffer_id, BufferId overlap_id,
 template <class P>
 BufferId BufferCache<P>::CreateBuffer(DAddr device_addr, u32 wanted_size,
                                       bool sparse_compatible) {
+    const StutterTrace::SiteScope site{StutterTrace::Site::BufferCreate};
     DAddr device_addr_end = Common::AlignUp(device_addr + wanted_size, CACHING_PAGESIZE);
     device_addr = Common::AlignDown(device_addr, CACHING_PAGESIZE);
     wanted_size = static_cast<u32>(device_addr_end - device_addr);
@@ -3050,6 +3052,7 @@ void BufferCache<P>::DownloadBuffersMemory(std::span<const BufferId> buffer_ids)
     if (total_size_bytes == 0) {
         return;
     }
+    const StutterTrace::SiteScope site{StutterTrace::Site::BufferDownload};
     auto download_staging = runtime.DownloadStagingBuffer(total_size_bytes);
     for (Download& download : downloads) {
         download.copy.dst_offset += download_staging.offset;
@@ -3100,6 +3103,7 @@ void BufferCache<P>::DownloadBufferMemory(Buffer& buffer, DAddr device_addr, u64
         return;
     }
     const Common::RangeSet<DAddr> cpu_written = PendingCpuWriteRanges();
+    const StutterTrace::SiteScope site{StutterTrace::Site::BufferDownload};
 
     if constexpr (requires { buffer.Mapped(); }) {
         if (const auto mapped = buffer.Mapped(); !mapped.empty()) {
@@ -3141,6 +3145,7 @@ void BufferCache<P>::DownloadBufferMemory(Buffer& buffer, DAddr device_addr, u64
 
 template <class P>
 void BufferCache<P>::DeleteBuffer(BufferId buffer_id, bool do_not_mark) {
+    const StutterTrace::SiteScope site{StutterTrace::Site::BufferDelete};
     ++buffer_deletions;
     if constexpr (requires { runtime.OnBufferDeleted(slot_buffers[buffer_id]); }) {
         runtime.OnBufferDeleted(slot_buffers[buffer_id]);

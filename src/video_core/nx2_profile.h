@@ -91,6 +91,8 @@ inline constexpr std::array<const char*, static_cast<size_t>(Zone::Count)> zone_
     "present wait", "queue submit",
 };
 
+static_assert(static_cast<size_t>(Zone::Count) <= StutterTrace::ZoneSlots);
+
 /// The EDEN_NX2_STUTTER_TRACE category of each zone's exclusive time (None: counted as other).
 inline constexpr auto stutter_categories = [] {
     using StutterTrace::Category;
@@ -192,7 +194,8 @@ public:
         start = Ticks();
         traced = StutterTrace::Enabled();
         if (traced) {
-            outer = StutterTrace::Open(stutter_categories[static_cast<size_t>(zone)], start);
+            outer = StutterTrace::Open(stutter_categories[static_cast<size_t>(zone)], start,
+                                       static_cast<size_t>(zone));
         }
     }
 
@@ -214,7 +217,10 @@ public:
             ++data.gpu_wait_count[static_cast<size_t>(parent)];
         }
         if (traced) {
-            StutterTrace::Close(outer, end);
+            // Time outside every zone is no zone's: it may be a wait no zone covers.
+            StutterTrace::Close(outer, end,
+                                parent == Zone::Other ? StutterTrace::ZoneSlots
+                                                      : static_cast<size_t>(parent));
         }
     }
 
