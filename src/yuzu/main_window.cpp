@@ -8,6 +8,7 @@
 #undef VMA_IMPLEMENTATION
 #endif
 
+#include <cstdlib>
 #include <QSysInfo>
 #include <atomic>
 #include <future>
@@ -2472,6 +2473,23 @@ void MainWindow::OnEmulationStopTimeout() {
 void MainWindow::TerminateEmulationThread() {
     if (QtCommon::emu_thread && QtCommon::emu_thread->isRunning()) {
         LOG_ERROR(Frontend, "Emulation thread failed to stop, terminating it");
+        // Terminating it and tearing the session down after it can deadlock on locks the stuck
+        // thread held: the window then hangs forever (Ocarina of Time, run 12c). When the whole
+        // app is closing anyway, save the settings and leave the process instead.
+        // EDEN_NX2_HARD_EXIT_ON_STUCK_CLOSE=0 keeps the old behaviour.
+        static const bool hard_exit = [] {
+            const char* value = std::getenv("EDEN_NX2_HARD_EXIT_ON_STUCK_CLOSE");
+            return value == nullptr || value[0] != '0';
+        }();
+        if (close_pending && hard_exit) {
+            LOG_ERROR(Frontend, "Closing: saving the configuration and exiting the process");
+            UpdateUISettings();
+            UISettings::SaveWindowState();
+            hotkey_registry.SaveHotkeys();
+            config->SaveAllValues();
+            Common::Log::Stop();
+            std::_Exit(0);
+        }
         QtCommon::emu_thread->terminate();
         QtCommon::emu_thread->wait();
     }
