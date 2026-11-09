@@ -39,6 +39,14 @@ struct GpuThreadPinning {
 /// interrupts, so the GPU threads get the next two.
 [[nodiscard]] GpuThreadPinning PlanGpuThreadPinning(std::span<const LogicalProcessor> processors);
 
+/// EDEN_NX2_PIN_PLAN: "F,B" or "F,B;G-list" moves the front and back to physical cores F and B
+/// and, with a list, keeps the guest cores on those cores only (e.g. "9,10;8,11-15" for the second
+/// CCD of a 16-core Ryzen). Cores count from 0 in host order, of the fastest class only. Returns
+/// the plan unchanged when `text` is empty or malformed.
+[[nodiscard]] GpuThreadPinning OverrideGpuThreadPinning(GpuThreadPinning plan,
+                                                        std::span<const LogicalProcessor> processors,
+                                                        std::string_view text);
+
 /// The CPUs of a Linux sysfs CPU list such as "0-3,8,10-11", in order. Empty for an empty or
 /// malformed list.
 [[nodiscard]] std::vector<u32> ParseCpuList(std::string_view list);

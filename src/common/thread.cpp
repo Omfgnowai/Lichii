@@ -736,7 +736,13 @@ void PinCurrentThread(PinnedRole role) {
         std::vector<ULONG> guest;
     };
     static const PinnedCpuSets pinned = [] {
-        const GpuThreadPinning plan = PlanGpuThreadPinning(CpuSets().processors);
+        GpuThreadPinning plan = PlanGpuThreadPinning(CpuSets().processors);
+        if (const char* text = std::getenv("EDEN_NX2_PIN_PLAN"); text != nullptr && !plan.front.empty()) {
+            plan = OverrideGpuThreadPinning(std::move(plan), CpuSets().processors, text);
+            LOG_INFO(Common, "EDEN_NX2_PIN_PLAN={}: front on {} logical processors, back on {}, "
+                             "guest cores on {}",
+                     text, plan.front.size(), plan.back.size(), plan.guest.size());
+        }
         if (plan.front.empty()) {
             LOG_WARNING(Common,
                         "GPU thread pinning skipped: {} physical performance cores, needs {}",
@@ -760,6 +766,9 @@ void PinCurrentThread(PinnedRole role) {
 #elif defined(__linux__) && !defined(__ANDROID__)
     static const GpuThreadPinning plan = [] {
         GpuThreadPinning result = PlanGpuThreadPinning(LinuxProcessors());
+        if (const char* text = std::getenv("EDEN_NX2_PIN_PLAN"); text != nullptr && !result.front.empty()) {
+            result = OverrideGpuThreadPinning(std::move(result), LinuxProcessors(), text);
+        }
         if (result.front.empty()) {
             LOG_WARNING(Common,
                         "GPU thread pinning skipped: {} physical performance cores, needs {}",

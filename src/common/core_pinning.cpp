@@ -44,6 +44,68 @@ GpuThreadPinning PlanGpuThreadPinning(std::span<const LogicalProcessor> processo
     return plan;
 }
 
+GpuThreadPinning OverrideGpuThreadPinning(GpuThreadPinning plan,
+                                          std::span<const LogicalProcessor> processors,
+                                          std::string_view text) {
+    if (text.empty() || processors.empty()) {
+        return plan;
+    }
+    const size_t semicolon = text.find(';');
+    const std::vector<u32> pair = ParseCpuList(text.substr(0, semicolon));
+    std::vector<u32> guest_list;
+    if (semicolon != std::string_view::npos) {
+        guest_list = ParseCpuList(text.substr(semicolon + 1));
+        if (guest_list.empty()) {
+            return plan;
+        }
+    }
+    if (pair.size() != 2 || pair[0] == pair[1]) {
+        return plan;
+    }
+    const u8 fastest =
+        std::ranges::max(processors, {}, &LogicalProcessor::efficiency_class).efficiency_class;
+    std::vector<u32> cores;
+    for (const LogicalProcessor& processor : processors) {
+        if (processor.efficiency_class == fastest) {
+            cores.push_back(processor.core);
+        }
+    }
+    std::ranges::sort(cores);
+    cores.erase(std::unique(cores.begin(), cores.end()), cores.end());
+    const auto valid = [&cores](u32 ordinal) { return ordinal < cores.size(); };
+    if (!valid(pair[0]) || !valid(pair[1]) || !std::ranges::all_of(guest_list, valid)) {
+        return plan;
+    }
+    const u32 front_core = cores[pair[0]];
+    const u32 back_core = cores[pair[1]];
+    const auto guest_core = [&](u32 core) {
+        if (core == front_core || core == back_core) {
+            return false;
+        }
+        return guest_list.empty() || std::ranges::any_of(guest_list, [&](u32 ordinal) {
+                   return cores[ordinal] == core;
+               });
+    };
+    GpuThreadPinning result;
+    result.performance_cores = plan.performance_cores;
+    for (const LogicalProcessor& processor : processors) {
+        if (processor.efficiency_class != fastest) {
+            continue;
+        }
+        if (processor.core == front_core) {
+            result.front.push_back(processor.id);
+        } else if (processor.core == back_core) {
+            result.back.push_back(processor.id);
+        } else if (guest_core(processor.core)) {
+            result.guest.push_back(processor.id);
+        }
+    }
+    if (result.front.empty() || result.back.empty() || result.guest.empty()) {
+        return plan;
+    }
+    return result;
+}
+
 std::vector<u32> ParseCpuList(std::string_view list) {
     std::vector<u32> cpus;
     while (!list.empty() && (list.back() == '\n' || list.back() == ' ')) {
