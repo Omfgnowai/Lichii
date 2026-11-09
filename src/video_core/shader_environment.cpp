@@ -483,9 +483,13 @@ Tegra::Texture::TICEntry GenericEnvironment::ReadTextureInfo(GPUVAddr tic_addr, 
         // index (VisitImageView), so compile for what that view is: a plain 2D RGBA8 texture.
         static std::atomic<u32> warnings{};
         if (warnings.fetch_add(1, std::memory_order_relaxed) < 16) {
+            // Which program: stage 5 is compute; the address and stage find it in the
+            // "Compute pipeline built" / pipeline lines and in a capture.
             LOG_WARNING(HW_GPU, "Texture handle {:#x} indexes past the descriptor pool "
-                                "(index {} > limit {}); using a null 2D texture",
-                        raw, index, tic_limit);
+                                "(index {} > limit {}); using a null 2D texture (stage {}, "
+                                "program {:#x}, start {:#x}, native {})",
+                        raw, index, tic_limit, static_cast<u32>(stage), program_base,
+                        start_address, IsNativeProgram());
         }
         entry.raw.fill(0);
         entry.format.Assign(Tegra::Texture::TextureFormat::A8B8G8R8);
