@@ -1697,13 +1697,19 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
         return;
     }
     const auto modified = std::filesystem::last_write_time(path, error).time_since_epoch().count();
-    // The driver keeps what it compiled; the step runs again for another file, driver or build.
+    // The driver keeps what it compiled; the step runs again for another file, driver, GPU or
+    // shader ABI: a hash of the sources that produce the kept infos and SPIR-V (the shader
+    // recompiler, environments, pipeline cache/keys, device profile; video_core/CMakeLists.txt),
+    // so builds that leave those alone reuse the preparation.
+#ifndef NX2_SHADER_ABI
+#define NX2_SHADER_ABI Common::g_scm_rev
+#endif
     const auto stamp_path =
         base_dir / fmt::format("precompiled_prepared.fork-v{}.txt", CACHE_VERSION);
     const auto infos_path =
         base_dir / fmt::format("precompiled_infos.fork-v{}.bin", CACHE_VERSION);
     const std::string stamp = fmt::format("{} {} {:#x} {} {}\n", file_size, modified,
-                                          device.GetDriverVersion(), Common::g_scm_rev,
+                                          device.GetDriverVersion(), NX2_SHADER_ABI,
                                           device.GetModelName());
     const char* force = std::getenv("EDEN_NX2_PRECOMPILED_FORCE");
     if (!(force && force[0] == '1')) {

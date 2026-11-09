@@ -593,3 +593,41 @@ if (ENABLE_NVIDIA_DLSS)
 endif()
 
 create_target_directory_groups(video_core)
+
+# Precompiled shader preparation (vk_pipeline_cache.cpp) is redone only when the code that produces
+# the kept shader infos and SPIR-V changes, not on every build: hash those sources at configure time.
+file(GLOB_RECURSE NX2_SHADER_ABI_FILES
+    "${CMAKE_CURRENT_SOURCE_DIR}/../shader_recompiler/*.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../shader_recompiler/*.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../shader_recompiler/*.inc")
+list(APPEND NX2_SHADER_ABI_FILES
+    "${CMAKE_CURRENT_SOURCE_DIR}/shader_environment.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/shader_environment.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/shader_cache.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/shader_cache.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/vulkan_common/vulkan_device.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/vulkan_common/vulkan_device.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../cpmfile.json")
+file(GLOB NX2_SHADER_ABI_VK
+    "${CMAKE_CURRENT_SOURCE_DIR}/renderer_vulkan/vk_pipeline_cache*"
+    "${CMAKE_CURRENT_SOURCE_DIR}/renderer_vulkan/vk_graphics_pipeline*"
+    "${CMAKE_CURRENT_SOURCE_DIR}/renderer_vulkan/vk_compute_pipeline*"
+    "${CMAKE_CURRENT_SOURCE_DIR}/renderer_vulkan/fixed_pipeline_state*"
+    "${CMAKE_CURRENT_SOURCE_DIR}/renderer_vulkan/pipeline_*"
+    "${CMAKE_CURRENT_SOURCE_DIR}/renderer_vulkan/vk_shader_util*")
+list(APPEND NX2_SHADER_ABI_FILES ${NX2_SHADER_ABI_VK})
+list(SORT NX2_SHADER_ABI_FILES)
+set(NX2_SHADER_ABI_TEXT "")
+foreach(NX2_ABI_FILE IN LISTS NX2_SHADER_ABI_FILES)
+    if(EXISTS "${NX2_ABI_FILE}")
+        file(SHA256 "${NX2_ABI_FILE}" NX2_ABI_FILE_HASH)
+        file(RELATIVE_PATH NX2_ABI_REL "${CMAKE_CURRENT_SOURCE_DIR}" "${NX2_ABI_FILE}")
+        string(APPEND NX2_SHADER_ABI_TEXT "${NX2_ABI_REL}=${NX2_ABI_FILE_HASH};")
+    endif()
+endforeach()
+string(SHA256 NX2_SHADER_ABI "${NX2_SHADER_ABI_TEXT}")
+string(SUBSTRING "${NX2_SHADER_ABI}" 0 16 NX2_SHADER_ABI)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${NX2_SHADER_ABI_FILES})
+set_property(SOURCE renderer_vulkan/vk_pipeline_cache.cpp APPEND PROPERTY
+    COMPILE_DEFINITIONS "NX2_SHADER_ABI=\"${NX2_SHADER_ABI}\"")
+message(STATUS "NX2 shader ABI (precompiled preparation key): ${NX2_SHADER_ABI}")
