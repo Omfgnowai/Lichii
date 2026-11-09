@@ -184,8 +184,63 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
         ticks_to_destroy = (std::max)(ticks_to_destroy, min_age);
         num_iterations = aggressive_mode ? 40 : (high_priority_mode ? 20 : 10);
     };
-    const auto Cleanup = [this, &num_iterations, &high_priority_mode, &aggressive_mode,
-                          &evict_old_costly, &over_budget, out_of_memory](ImageId image_id) {
+    const auto Evict = [&](ImageId image_id) {
+        auto& image = slot_images[image_id];
+        if (True(image.flags & ImageFlagBits::Tracked)) {
+            UntrackImage(image, image_id);
+        }
+        ++(True(image.flags & ImageFlagBits::CostlyLoad) ? gc_costly_deletes : gc_deletes);
+        UnregisterImage(image_id);
+        DeleteImage(image_id, image.scale_tick > frame_tick + 5);
+        if (out_of_memory) {
+            return;
+        }
+        if (aggressive_mode && total_used_memory < critical_memory) {
+            num_iterations >>= 2;
+            aggressive_mode = false;
+        } else if (high_priority_mode && total_used_memory < expected_memory) {
+            num_iterations >>= 1;
+            high_priority_mode = false;
+        }
+    };
+    // Images whose GPU data must reach guest memory first are downloaded together, with one wait
+    // for the GPU: a wait per image made each collection in Mario Kart World's Free Roam wait
+    // 36-43 ms (6-17 waits). A batch is capped so the staging memory held at once stays bounded.
+    constexpr size_t MaxDownloadBatchBytes = 64_MiB;
+    using DownloadMap = decltype(runtime.DownloadStagingBuffer(size_t{}));
+    using DownloadCopies = decltype(FullDownloadCopies(std::declval<const ImageInfo&>()));
+    struct PendingDownload {
+        ImageId image_id;
+        DownloadMap map;
+        DownloadCopies copies;
+    };
+    boost::container::small_vector<PendingDownload, 16> pending_downloads;
+    size_t pending_download_bytes = 0;
+    const auto FinishDownloads = [&] {
+        if (pending_downloads.empty()) {
+            return;
+        }
+        runtime.Finish();
+        // Overlapping images land in modification order, newest last.
+        std::ranges::sort(pending_downloads, [this](const PendingDownload& lhs,
+                                                    const PendingDownload& rhs) {
+            return slot_images[lhs.image_id].modification_tick <
+                   slot_images[rhs.image_id].modification_tick;
+        });
+        for (PendingDownload& entry : pending_downloads) {
+            auto& image = slot_images[entry.image_id];
+            SwizzleImage(*gpu_memory, image.gpu_addr, image.info, entry.copies,
+                         entry.map.mapped_span, swizzle_data_buffer);
+            ++gc_download_deletes;
+            ClearStaleImage(image);
+        }
+        for (const PendingDownload& entry : pending_downloads) {
+            Evict(entry.image_id);
+        }
+        pending_downloads.clear();
+        pending_download_bytes = 0;
+    };
+    const auto Cleanup = [&](ImageId image_id) {
         if (num_iterations == 0) {
             return true;
         }
@@ -205,32 +260,19 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
             return false;
         }
         if (must_download) {
+            if (!pending_downloads.empty() &&
+                pending_download_bytes + image.unswizzled_size_bytes > MaxDownloadBatchBytes) {
+                FinishDownloads();
+            }
             auto map = runtime.DownloadStagingBuffer(image.unswizzled_size_bytes);
-            const auto copies = FullDownloadCopies(image.info);
+            auto copies = FullDownloadCopies(image.info);
             image.DownloadMemory(map, copies);
-            runtime.Finish();
-            SwizzleImage(*gpu_memory, image.gpu_addr, image.info, copies, map.mapped_span, swizzle_data_buffer);
-            ++gc_download_deletes;
-            ClearStaleImage(image);
-        } else {
-            MarkStale(image); // before UntrackImage (see MarkStale)
-        }
-        if (True(image.flags & ImageFlagBits::Tracked)) {
-            UntrackImage(image, image_id);
-        }
-        ++(True(image.flags & ImageFlagBits::CostlyLoad) ? gc_costly_deletes : gc_deletes);
-        UnregisterImage(image_id);
-        DeleteImage(image_id, image.scale_tick > frame_tick + 5);
-        if (out_of_memory) {
+            pending_download_bytes += image.unswizzled_size_bytes;
+            pending_downloads.push_back(PendingDownload{image_id, map, std::move(copies)});
             return false;
         }
-        if (aggressive_mode && total_used_memory < critical_memory) {
-            num_iterations >>= 2;
-            aggressive_mode = false;
-        } else if (high_priority_mode && total_used_memory < expected_memory) {
-            num_iterations >>= 1;
-            high_priority_mode = false;
-        }
+        MarkStale(image); // before UntrackImage (see MarkStale)
+        Evict(image_id);
         return false;
     };
     // Deleting by age alone left every device memory block partly used: the collector deletes
@@ -301,12 +343,15 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
     if (high_priority_mode && old_age != 0 && frame_tick > old_age) {
         evict_old_costly = true;
         lru_cache.ForEachItemBelow(frame_tick - old_age, Cleanup);
+        FinishDownloads();
         evict_old_costly = false;
     }
     Collect();
+    FinishDownloads();
     if (out_of_memory || total_used_memory >= critical_memory) {
         Configure(true);
         Collect();
+        FinishDownloads();
     }
 }
 
