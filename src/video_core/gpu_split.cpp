@@ -652,6 +652,7 @@ void GpuSplit::ReportAcquire() {
     const u64 by_queued = take(stats.by_queued);
     const u64 by_report_read = take(stats.by_report_read);
     const u64 latched = take(stats.latched);
+    const u64 suspended = take(stats.suspended);
     const u64 drained = take(stats.drained);
     const u64 drain_operation = take(stats.drain_operation);
     const u64 drain_settings = take(stats.drain_settings);
@@ -673,10 +674,10 @@ void GpuSplit::ReportAcquire() {
              "unmapped or GPU-written word, {} queued release unknown or short), {} polls waited "
              "without a drain in 10 s; polls: {} of acquires, {} of GPU-written list copies; "
              "back: {} waits for work, {} slept, {:.1f} ms spinning; {} early publishes, {} idle "
-             "hooks asked by polls",
+             "hooks asked by polls; {} new acquires suspended without a drain",
              passed, by_queued, by_report_read, latched, drained, valve_drains, drain_operation, drain_settings,
              drain_word, drain_queued, polls, acquire_polls, list_polls, back_waits, back_sleeps,
-             spin_ms, early_publishes, settles);
+             spin_ms, early_publishes, settles, suspended);
     std::array<u64, 9> bails{};
     u64 bail_total = 0;
     for (size_t i = 0; i < bails.size(); ++i) {

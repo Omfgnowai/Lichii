@@ -205,6 +205,14 @@ bool EqualAcquireFast() {
     return enabled;
 }
 
+bool SuspendNotMet() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_SUSPEND_NOT_MET");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+}
+
 AcquireCheck CheckWithoutDrain(DmaPusher& dma_pusher, const Puller::PendingAcquire& acquire) {
     auto& split = VideoCommon::GpuSplit::Get();
     auto& stats = VideoCommon::g_acquire_stats;
@@ -536,8 +544,8 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
         }
         VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::AcquireChecks, 1);
         auto& stats = VideoCommon::g_acquire_stats;
-        if (const AcquireCheck without_drain = CheckWithoutDrain(dma_pusher, acquire);
-            without_drain == AcquireCheck::Met || without_drain == AcquireCheck::MetByQueued) {
+        const AcquireCheck without_drain = CheckWithoutDrain(dma_pusher, acquire);
+        if (without_drain == AcquireCheck::Met || without_drain == AcquireCheck::MetByQueued) {
             if (without_drain == AcquireCheck::MetByQueued) {
                 // What the front reads after the acquire waits for the work sent before the
                 // release (GpuSplit::NoteSync).
@@ -552,6 +560,34 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
                                     [&](u32 word) { return acquire.Matches(word); })) {
             VideoCommon::Count(stats.passed);
             VerifyWithoutDrain(dma_pusher, acquire, AcquireCheck::Met);
+            return;
+        }
+        // Not met by what the front knows of the word: suspend the channel at once, as a poll of
+        // a pending acquire does (CanResumeAcquire: latched by the release, polled without a
+        // drain, drained by the 1 ms valve), instead of draining the back first. With the
+        // command-list writer wait narrowed (#805) the front runs further ahead, and these first
+        // checks drained ~2,700 times a second in Castle Town (run 13b, ~430 ms/s of the front).
+        // EDEN_NX2_SUSPEND_NOT_MET=0 drains first as before.
+        if (without_drain == AcquireCheck::NotMet && SuspendNotMet()) {
+            auto& waiters = Nx2SemaphoreWaiters::Get();
+            if (const auto device = dma_pusher.memory_manager.GpuToCpuAddress(acquire.address);
+                device && !waiters.Add(this, *device, acquire.value, acquire.operation)) {
+                if (static std::atomic<u32> full{}; full.fetch_add(1) < 8) {
+                    LOG_ERROR(HW_GPU, "Channel {} waits on semaphore {:#x} unlatched: {} channels wait",
+                              dma_pusher.channel_state.bind_id, acquire.address,
+                              Nx2SemaphoreWaiters::MaxWaiters);
+                }
+            }
+            if (waiters.Latched(this)) {
+                waiters.Remove(this);
+                VideoCommon::Count(stats.latched);
+                return;
+            }
+            VerifyWithoutDrain(dma_pusher, acquire, without_drain);
+            VideoCommon::Count(stats.suspended);
+            pending_acquire = acquire;
+            dma_pusher.suspensions.fetch_add(1, std::memory_order_release);
+            VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::AcquireWaits, 1);
             return;
         }
         VideoCommon::Count(stats.drained);

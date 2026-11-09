@@ -58,6 +58,7 @@ struct AcquireStats {
     /// many queued writes, 6 mirrored or fence-delayed word, 7 read but not met, 8 mirror not met.
     std::array<std::atomic<u64>, 9> report_bails{};
     std::atomic<u64> latched{};   ///< Polls resumed by a release the back ran (no drain)
+    std::atomic<u64> suspended{}; ///< New acquires not met, suspended without a drain
     std::atomic<u64> drained{};   ///< Acquires and polls that drained the split
     std::atomic<u64> drain_operation{}; ///< Of drained: an equal or mask acquire
     std::atomic<u64> drain_settings{};  ///< ...the split or the accuracy settings ask for it
