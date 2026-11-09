@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <chrono>
 #include <algorithm>
 #include <numeric>
 #include <cstdlib>
@@ -2048,6 +2049,26 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
         return;
     }
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::TextureUpload};
+    // Uploads over 15 ms (area loads spent 260-390 ms a frame here): what they were.
+    const auto upload_start = std::chrono::steady_clock::now();
+    SCOPE_EXIT {
+        const auto elapsed = std::chrono::steady_clock::now() - upload_start;
+        if (elapsed < std::chrono::milliseconds{15}) {
+            return;
+        }
+        static std::atomic<u32> slow_uploads{};
+        if (slow_uploads.fetch_add(1, std::memory_order_relaxed) >= 64) {
+            return;
+        }
+        LOG_INFO(HW_GPU,
+                 "Slow texture upload: {:.1f} ms at {:#x}: type {} {}x{}x{} levels {} layers {} "
+                 "format {}, {} KiB guest, flags {:#x}",
+                 std::chrono::duration<double, std::milli>(elapsed).count(), image.gpu_addr,
+                 static_cast<u32>(image.info.type), image.info.size.width, image.info.size.height,
+                 image.info.size.depth, image.info.resources.levels, image.info.resources.layers,
+                 static_cast<u32>(image.info.format), image.guest_size_bytes / 1024,
+                 static_cast<u32>(image.flags));
+    };
 
     image.flags &= ~ImageFlagBits::CpuModified;
 
@@ -2892,6 +2913,32 @@ template <class P>
 ImageId TextureCache<P>::InsertImage(const ImageInfo& info, GPUVAddr gpu_addr,
                                      RelaxedOptions options) {
     const StutterTrace::SiteScope site{StutterTrace::Site::ImageCreate};
+    // Image creations over 15 ms (Ocarina of Time area loads: one of 185-200 ms in each of three
+    // loads, 2026-11-09): what they were, to find why.
+    const auto create_start = std::chrono::steady_clock::now();
+    ImageId created_id{};
+    SCOPE_EXIT {
+        const auto elapsed = std::chrono::steady_clock::now() - create_start;
+        if (elapsed < std::chrono::milliseconds{15} || !created_id) {
+            return;
+        }
+        static std::atomic<u32> slow_creates{};
+        if (slow_creates.fetch_add(1, std::memory_order_relaxed) >= 64) {
+            return;
+        }
+        const Image& created = slot_images[created_id];
+        LOG_INFO(HW_GPU,
+                 "Slow image create: {:.1f} ms at {:#x}: type {} {}x{}x{} levels {} layers {} "
+                 "format {} samples {}, {} KiB guest, joined to {:#x} {}x{}x{} levels {} layers {}, "
+                 "flags {:#x}",
+                 std::chrono::duration<double, std::milli>(elapsed).count(), gpu_addr,
+                 static_cast<u32>(info.type), info.size.width, info.size.height, info.size.depth,
+                 info.resources.levels, info.resources.layers, static_cast<u32>(info.format),
+                 info.num_samples, CalculateGuestSizeInBytes(info) / 1024, created.gpu_addr,
+                 created.info.size.width, created.info.size.height, created.info.size.depth,
+                 created.info.resources.levels, created.info.resources.layers,
+                 static_cast<u32>(created.flags));
+    };
     std::optional<DAddr> cpu_addr = ImageCpuAddress(gpu_addr, CalculateGuestSizeInBytes(info));
     if (!cpu_addr) {
         const DAddr fake_addr = ~(1ULL << 40ULL) + virtual_invalid_space;
@@ -2911,6 +2958,7 @@ ImageId TextureCache<P>::InsertImage(const ImageInfo& info, GPUVAddr gpu_addr,
     if (!image_id) {
         return image_id;
     }
+    created_id = image_id;
     const Image& image = slot_images[image_id];
     // Using "image.gpu_addr" instead of "gpu_addr" is important because it might be different
     const auto [it, is_new] = image_allocs_table.try_emplace(image.gpu_addr);
@@ -3211,6 +3259,25 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
             copied_whole = true;
             break;
         }
+    }
+    // The copies from overlaps the GPU wrote can each write a part of it, together all of it:
+    // Mario Kart World renders each layer of its shadow map and colour arrays as a target of its
+    // own, then samples the array, and the upload under those copies took 13-31 ms an array.
+    if (!can_rescale && !copied_whole && new_info.num_samples == 1) {
+        std::vector<u8> written(
+            static_cast<size_t>(new_info.resources.levels * new_info.resources.layers));
+        for (const JoinCopy& copy : join_copies_to_do) {
+            const Image& overlap = slot_images[copy.id];
+            if (copy.is_alias || False(overlap.flags & ImageFlagBits::GpuModified) ||
+                overlap.info.num_samples != 1) {
+                continue;
+            }
+            const SubresourceBase base = new_image.TryFindBase(overlap.gpu_addr).value();
+            MarkSubresourcesWrittenWhole(new_image, overlap,
+                                         MakeShrinkImageCopies(new_info, overlap.info, base, 1, 0),
+                                         written);
+        }
+        copied_whole = std::ranges::all_of(written, [](u8 whole) { return whole != 0; });
     }
     if (overwritten_by_clear()) {
         // Stays CpuModified: UpdateRenderTargets' PrepareImage drops the upload only when

@@ -2534,9 +2534,12 @@ bool PipelineCache::PastPoolRebuildDue(const GraphicsPipeline& pipeline) {
     // the shader sample a 2D texture where the game later binds another type, and that slot then
     // gets the null view. Translate it again a few frames later from the handles then written,
     // at most twice per pipeline (some handles stay past the pool, e.g. in unused branches).
+    // Off by default (EDEN_NX2_PAST_POOL_REBUILD=1 turns it on): in Ocarina of Time the handle
+    // is always 0x3a83126f (the float 0.001) from several native fragment programs, so the
+    // translation made again reads it too and only costs another ~60 ms on the GPU thread.
     static const bool enabled = [] {
         const char* const value = std::getenv("EDEN_NX2_PAST_POOL_REBUILD");
-        return value == nullptr || value[0] != '0';
+        return value != nullptr && value[0] == '1';
     }();
     constexpr u64 DelayFrames = 4;
     constexpr u32 MaxRebuilds = 2;
