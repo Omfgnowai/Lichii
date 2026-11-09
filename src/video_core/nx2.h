@@ -581,6 +581,12 @@ public:
         }
     }
 
+    /// Whether a delayed release to the u32 at device_address hasn't reached memory yet.
+    [[nodiscard]] bool HasDelayedRelease(u64 device_address) {
+        std::scoped_lock lk{mutex};
+        return delayed.contains(device_address);
+    }
+
     /// A new emulation session starts: the last one's fences may never have run.
     void ClearDelayedReleases() {
         std::scoped_lock lk{mutex};

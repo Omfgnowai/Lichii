@@ -115,10 +115,29 @@ enum class AcquireCheck {
 // advance (NVN2 even releases QMD completions as maxima, KeplerCompute::ProcessNativeMethod), so
 // a value that meets one now still does once the back ran the queued work. Only the last release
 // the front sent to the word decides instead, when the back may not have run it yet.
+// EDEN_NX2_EQUAL_ACQUIRE=1 (experiment, off by default): equal and mask acquires take the same
+// check. The front's queued-release tracking says what the word holds once the back ran the work
+// sent before the acquire, whatever the operation; only the ">= stays met" argument is specific to
+// greater-or-equal. In Ocarina of Time over 99% of the acquires that still drain are equal or mask
+// (Castle Town: ~300 ms of every second of the split's front). Check with EDEN_NX2_ACQUIRE_VERIFY=1.
+// Read on first use: nx2_switches.txt sets the variable after static initialisation.
+bool EqualAcquireFast() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_EQUAL_ACQUIRE");
+        const bool on = value != nullptr && value[0] == '1';
+        if (on) {
+            LOG_INFO(HW_GPU, "EDEN_NX2_EQUAL_ACQUIRE=1: equal and mask acquires are checked "
+                             "without draining the split when they can be");
+        }
+        return on;
+    }();
+    return enabled;
+}
+
 AcquireCheck CheckWithoutDrain(DmaPusher& dma_pusher, const Puller::PendingAcquire& acquire) {
     auto& split = VideoCommon::GpuSplit::Get();
     auto& stats = VideoCommon::g_acquire_stats;
-    if (!acquire.WaitsToReach()) {
+    if (!acquire.WaitsToReach() && !EqualAcquireFast()) {
         VideoCommon::Count(stats.drain_operation);
         return AcquireCheck::Drain;
     }
@@ -130,6 +149,12 @@ AcquireCheck CheckWithoutDrain(DmaPusher& dma_pusher, const Puller::PendingAcqui
     // A word the buffer cache may hold newer than memory is read through the back.
     if (!device || Nx2MayBeGpuWritten(*device, sizeof(u32))) {
         VideoCommon::Count(stats.drain_word);
+        return AcquireCheck::Drain;
+    }
+    // A fence-flagged release the back ran but whose write waits for its fence: memory still
+    // holds the old value, which an equal or mask acquire could take as met.
+    if (!acquire.WaitsToReach() && Nx2SemaphoreWaiters::Get().HasDelayedRelease(*device)) {
+        VideoCommon::Count(stats.drain_queued);
         return AcquireCheck::Drain;
     }
     if (const auto queued = split.QueuedSemaphoreWriteAt(*device)) {
@@ -171,9 +196,10 @@ void VerifyWithoutDrain(DmaPusher& dma_pusher, const Puller::PendingAcquire& acq
     VideoCommon::Count(stats.mismatches);
     if (static std::atomic<u32> logged{}; logged.fetch_add(1) < 16) {
         LOG_WARNING(HW_GPU,
-                    "Acquire verify: channel {} passed semaphore {:#x} (>= {:#x}) without a "
+                    "Acquire verify: channel {} passed semaphore {:#x} (op {}, {:#x}) without a "
                     "drain, the word is {:#x} after it",
-                    dma_pusher.channel_state.bind_id, acquire.address, acquire.value, word);
+                    dma_pusher.channel_state.bind_id, acquire.address, acquire.operation,
+                    acquire.value, word);
     }
 }
 
