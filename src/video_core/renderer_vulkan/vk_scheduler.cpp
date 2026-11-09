@@ -567,6 +567,7 @@ void Scheduler::WorkerThread(std::stop_token stop_token) {
             // Recycle the chunk back to the reserve.
             chunk_reserve.emplace_back(std::move(work));
         }
+        VideoCommon::Nx2Profile::Report("Vulkan worker");
     }
 }
 
