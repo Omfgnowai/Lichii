@@ -20,6 +20,7 @@
 #include "shader_recompiler/frontend/maxwell/structured_control_flow.h"
 #include "shader_recompiler/frontend/maxwell/translate/translate.h"
 #include "shader_recompiler/frontend/maxwell/translate_program.h"
+#include "shader_recompiler/phase_timer.h"
 #include "shader_recompiler/host_translate_info.h"
 #include "shader_recompiler/ir_opt/passes.h"
 
@@ -369,9 +370,13 @@ IR::Program TranslateProgram(ObjectPool<IR::Inst>& inst_pool, ObjectPool<IR::Blo
                              Environment& env, Flow::CFG& cfg, const HostTranslateInfo& host_info) {
     HostTranslateInfo normalized_host_info{host_info};
     normalized_host_info.ApplyDescriptorLimitPolicy();
+    const PhaseTimer::Scope translate_scope{PhaseTimer::Phase::Translate};
 
     IR::Program program;
-    program.syntax_list = BuildASL(inst_pool, block_pool, env, cfg, normalized_host_info);
+    {
+        const PhaseTimer::Scope scope{PhaseTimer::Phase::Decode};
+        program.syntax_list = BuildASL(inst_pool, block_pool, env, cfg, normalized_host_info);
+    }
     program.blocks = GenerateBlocks(program.syntax_list);
     program.post_order_blocks = PostOrder(program.syntax_list.front());
     program.stage = env.ShaderStage();
@@ -448,26 +453,44 @@ IR::Program TranslateProgram(ObjectPool<IR::Inst>& inst_pool, ObjectPool<IR::Blo
     if (!normalized_host_info.support_conditional_barrier) {
         Optimization::ConditionalBarrierPass(program);
     }
-    Optimization::SsaRewritePass(program);
+    {
+        const PhaseTimer::Scope scope{PhaseTimer::Phase::Ssa};
+        Optimization::SsaRewritePass(program);
+    }
 
-    Optimization::ConstantPropagationPass(env, program);
+    {
+        const PhaseTimer::Scope scope{PhaseTimer::Phase::ConstantPropagation};
+        Optimization::ConstantPropagationPass(env, program);
+    }
 
     Optimization::PositionPass(env, program);
     Optimization::BlitConstantsPass(env, program);
 
-    Optimization::GlobalMemoryToStorageBufferPass(env, program, normalized_host_info);
+    {
+        const PhaseTimer::Scope scope{PhaseTimer::Phase::GlobalMemory};
+        Optimization::GlobalMemoryToStorageBufferPass(env, program, normalized_host_info);
+    }
     Optimization::GeometryCompactionPass(program, normalized_host_info);
-    Optimization::TexturePass(env, program, normalized_host_info);
+    {
+        const PhaseTimer::Scope scope{PhaseTimer::Phase::Texture};
+        Optimization::TexturePass(env, program, normalized_host_info);
+    }
 
     if (Settings::values.resolution_info.active) {
         Optimization::RescalingPass(program);
     }
-    Optimization::DeadCodeEliminationPass(program);
+    {
+        const PhaseTimer::Scope scope{PhaseTimer::Phase::DeadCode};
+        Optimization::DeadCodeEliminationPass(program);
+    }
     TightenOutputVertices(program);
     if (Settings::values.renderer_debug) {
         Optimization::VerificationPass(program);
     }
-    Optimization::CollectShaderInfoPass(env, program);
+    {
+        const PhaseTimer::Scope scope{PhaseTimer::Phase::ShaderInfo};
+        Optimization::CollectShaderInfoPass(env, program);
+    }
     program.info.is_task = program.stage == Stage::Task;
     program.info.is_mesh = program.stage == Stage::Mesh;
     if (program.stage == Stage::Mesh) {
