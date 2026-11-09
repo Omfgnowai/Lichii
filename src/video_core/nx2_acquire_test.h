@@ -35,7 +35,7 @@ NX2_LAZY_SWITCH(T337Off, "EDEN_NX2_T337_OFF")
 NX2_LAZY_SWITCH(T752Off, "EDEN_NX2_T752_OFF")
 NX2_LAZY_SWITCH(T687Off, "EDEN_NX2_T687_OFF")
 NX2_LAZY_SWITCH(FixLatch, "EDEN_NX2_FIX_LATCH")
-NX2_LAZY_SWITCH(Stats, "EDEN_NX2_ACQUIRE_STATS")
+NX2_LAZY_SWITCH(StatsEnabled, "EDEN_NX2_ACQUIRE_STATS")
 #undef NX2_LAZY_SWITCH
 inline long long WarnMs() {
     static const long long value = [] {
@@ -108,7 +108,7 @@ private:
     using Buckets = std::array<std::atomic<u64>, 6>;
     void Add(Buckets& buckets, std::atomic<u64>& total, std::atomic<u64>& max,
              std::chrono::steady_clock::duration duration) {
-        if (!Stats()) {
+        if (!StatsEnabled()) {
             return;
         }
         const u64 us = static_cast<u64>(
