@@ -14,6 +14,9 @@ struct RasterizerDownloadArea {
     VAddr end_address;
     bool preemtive;
     DownloadAreaSource source{DownloadAreaSource::Other};
+    /// GPU data for the area is downloading with a fence that has not been released: the read
+    /// waits for it (RasterizerInterface::WaitForPendingDownloads) and asks again.
+    bool wait_downloads{};
 };
 
 } // namespace VideoCore

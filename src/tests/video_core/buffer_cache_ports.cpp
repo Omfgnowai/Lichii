@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <barrier>
+#include <chrono>
 #include <cstring>
 #include <functional>
 #include <memory>
@@ -135,6 +136,11 @@ struct Runtime {
     void FinishForHostRead() {
         ++host_read_barriers;
         Finish();
+    }
+    void PreCopyBarrier() {}
+    void PostCopyBarrier() {}
+    u64 CurrentTick() const {
+        return 1;
     }
     void BindUniformBuffer(Buffer&, u32, u32) {}
     std::span<u8> BindMappedUniformBuffer(size_t, u32, u32 size) {
@@ -293,6 +299,18 @@ struct BufferCacheTestAccess {
     }
     static void GpuWrite(KeepCache& cache, BufferId id, DAddr address, u32 size) {
         cache.MarkWrittenBuffer(id, address, size);
+    }
+    static void Preflushable(Cache& cache, DAddr address, u64 size) {
+        cache.memory_tracker.MarkRegionAsPreflushable(address, size);
+    }
+    static void GpuWrite(Cache& cache, BufferId id, DAddr address, u32 size) {
+        cache.MarkWrittenBuffer(id, address, size);
+    }
+    static bool TrapArmed(Cache& cache, DAddr address, u64 size) {
+        return cache.read_trapped_ranges.IsArmed(address, size);
+    }
+    static void ArmTrap(Cache& cache, DAddr address, u64 size) {
+        cache.ArmReadTraps(address, size);
     }
 };
 
@@ -845,4 +863,159 @@ TEST_CASE("Uniform keep verify counts guest writes the delta did not report",
     REQUIRE(f.Counts().verified == 2);
     REQUIRE(f.Counts().mismatches == 1);
     REQUIRE(f.Counts().kept == 0);
+namespace {
+
+// Native titles read GPU-written pages that downloads keep in guest memory (Preflushable).
+struct NativeTitle {
+    NativeTitle() : was_native{Tegra::g_nx2_ampere.exchange(true)} {}
+    ~NativeTitle() {
+        Tegra::g_nx2_ampere.store(was_native);
+    }
+    bool was_native;
+};
+
+} // namespace
+
+TEST_CASE("Native reads of a preflushable page never see GPU data before its download lands",
+          "[buffer_ports]") {
+    Fixture f;
+    NativeTitle native;
+    const auto id = Access::Add(*f.cache, 0x20000, 0x10000);
+    Access::Preflushable(*f.cache, 0x20000, 0x1000);
+    REQUIRE(f.cache->GetFlushArea(0x20010, 4)->preemtive);
+
+    // Queued for the next fence: the read flushes it.
+    std::ranges::fill(Access::Get(*f.cache, id).bytes, 0x56);
+    Access::GpuWrite(*f.cache, id, 0x20000, 0x100);
+    auto area = f.cache->GetFlushArea(0x20010, 4);
+    REQUIRE_FALSE(area->preemtive);
+    REQUIRE_FALSE(area->wait_downloads);
+
+    // Downloading with a fence: the read waits for it.
+    f.cache->CommitAsyncFlushes();
+    area = f.cache->GetFlushArea(0x20010, 4);
+    REQUIRE(area->preemtive);
+    REQUIRE(area->wait_downloads);
+    REQUIRE(f.cache->IsDownloadInFlight(0x20000, 0x1000));
+    REQUIRE(f.bytes[0x10010] == 0);
+
+    // The fence passes: the data is in guest memory and the read goes ahead.
+    const u64 landed = f.cache->LandedDownloads();
+    f.runtime.Finish();
+    f.cache->PopAsyncFlushes();
+    REQUIRE(f.cache->LandedDownloads() == landed + 1);
+    REQUIRE_FALSE(f.cache->IsDownloadInFlight(0x20000, 0x1000));
+    area = f.cache->GetFlushArea(0x20010, 4);
+    REQUIRE(area->preemtive);
+    REQUIRE_FALSE(area->wait_downloads);
+    REQUIRE(f.bytes[0x10010] == 0x56);
+    REQUIRE(f.bytes[0x100ff] == 0x56);
+    REQUIRE(f.bytes[0x10100] == 0);
+}
+
+TEST_CASE("A GPU write over a download in flight makes native reads flush instead of wait",
+          "[buffer_ports]") {
+    Fixture f;
+    NativeTitle native;
+    const auto id = Access::Add(*f.cache, 0x20000, 0x10000);
+    Access::Preflushable(*f.cache, 0x20000, 0x1000);
+    Access::GpuWrite(*f.cache, id, 0x20000, 0x100);
+    f.cache->CommitAsyncFlushes();
+    REQUIRE(f.cache->GetFlushArea(0x20010, 4)->wait_downloads);
+    // The download taken holds older bytes than this write: waiting for it is not enough.
+    Access::GpuWrite(*f.cache, id, 0x20000, 0x100);
+    REQUIRE_FALSE(f.cache->IsDownloadInFlight(0x20000, 0x1000));
+    const auto area = f.cache->GetFlushArea(0x20010, 4);
+    REQUIRE_FALSE(area->preemtive);
+    REQUIRE_FALSE(area->wait_downloads);
+}
+
+TEST_CASE("Other titles read preflushable pages as guest memory holds them", "[buffer_ports]") {
+    Fixture f;
+    const bool was_native = Tegra::g_nx2_ampere.exchange(false);
+    const auto id = Access::Add(*f.cache, 0x20000, 0x10000);
+    Access::Preflushable(*f.cache, 0x20000, 0x1000);
+    Access::GpuWrite(*f.cache, id, 0x20000, 0x100);
+    auto area = f.cache->GetFlushArea(0x20010, 4);
+    REQUIRE(area->preemtive);
+    REQUIRE_FALSE(area->wait_downloads);
+    f.cache->CommitAsyncFlushes();
+    area = f.cache->GetFlushArea(0x20010, 4);
+    REQUIRE(area->preemtive);
+    REQUIRE_FALSE(area->wait_downloads);
+    Tegra::g_nx2_ampere.store(was_native);
+}
+
+TEST_CASE("Readers waiting for downloads wake when a fence's downloads land", "[buffer_ports]") {
+    Fixture f;
+    NativeTitle native;
+    const auto id = Access::Add(*f.cache, 0x20000, 0x10000);
+    Access::Preflushable(*f.cache, 0x20000, 0x1000);
+    Access::GpuWrite(*f.cache, id, 0x20000, 0x100);
+    f.cache->CommitAsyncFlushes();
+    const u64 seen = f.cache->LandedDownloads();
+    std::thread fencing([&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds{20});
+        f.runtime.Finish();
+        f.cache->PopAsyncFlushes();
+    });
+    const auto start = std::chrono::steady_clock::now();
+    f.cache->WaitForLandedDownloads(seen, std::chrono::seconds{10});
+    const auto waited = std::chrono::steady_clock::now() - start;
+    fencing.join();
+    REQUIRE(waited < std::chrono::seconds{5});
+    REQUIRE(f.cache->LandedDownloads() == seen + 1);
+
+    // Nothing lands: the wait ends at its timeout.
+    const auto idle_start = std::chrono::steady_clock::now();
+    f.cache->WaitForLandedDownloads(f.cache->LandedDownloads(), std::chrono::milliseconds{20});
+    const auto idle = std::chrono::steady_clock::now() - idle_start;
+    REQUIRE(idle >= std::chrono::milliseconds{15});
+    REQUIRE(idle < std::chrono::seconds{5});
+}
+
+TEST_CASE("Native GPU writes to a preflushable page arm its read trap until a read consumes it",
+          "[buffer_ports]") {
+    Fixture f;
+    NativeTitle native;
+    const auto id = Access::Add(*f.cache, 0x20000, 0x10000);
+    Access::Preflushable(*f.cache, 0x20000, 0x1000);
+    REQUIRE_FALSE(Access::TrapArmed(*f.cache, 0x20000, 0x1000));
+    // A read before the download lands must reach GetFlushArea.
+    Access::GpuWrite(*f.cache, id, 0x20000, 0x100);
+    REQUIRE(Access::TrapArmed(*f.cache, 0x20000, 0x1000));
+    // The read consumed the core's trap: the next write arms it again.
+    (void)f.cache->GetFlushArea(0x20010, 4);
+    REQUIRE_FALSE(Access::TrapArmed(*f.cache, 0x20000, 0x1000));
+    Access::GpuWrite(*f.cache, id, 0x20000, 0x100);
+    REQUIRE(Access::TrapArmed(*f.cache, 0x20000, 0x1000));
+    // Pages that are not Preflushable keep their own handling.
+    REQUIRE_FALSE(Access::TrapArmed(*f.cache, 0x21000, 0x1000));
+}
+
+TEST_CASE("Other titles' GPU writes to preflushable pages arm no read traps", "[buffer_ports]") {
+    Fixture f;
+    const bool was_native = Tegra::g_nx2_ampere.exchange(false);
+    const auto id = Access::Add(*f.cache, 0x20000, 0x10000);
+    Access::Preflushable(*f.cache, 0x20000, 0x1000);
+    Access::GpuWrite(*f.cache, id, 0x20000, 0x100);
+    REQUIRE_FALSE(Access::TrapArmed(*f.cache, 0x20000, 0x1000));
+    Tegra::g_nx2_ampere.store(was_native);
+}
+
+TEST_CASE("A native page's first read forgets its trap so the next write arms it again",
+          "[buffer_ports]") {
+    Fixture f;
+    NativeTitle native;
+    const auto id = Access::Add(*f.cache, 0x20000, 0x10000);
+    // A GPU write to a page that is not Preflushable yet arms its trap.
+    Access::GpuWrite(*f.cache, id, 0x20000, 0x100);
+    Access::ArmTrap(*f.cache, 0x20000, 0x100);
+    REQUIRE(Access::TrapArmed(*f.cache, 0x20000, 0x1000));
+    // The first read flushes, marks the page Preflushable and consumed the trap.
+    REQUIRE_FALSE(f.cache->GetFlushArea(0x20010, 4)->preemtive);
+    REQUIRE_FALSE(Access::TrapArmed(*f.cache, 0x20000, 0x1000));
+    // The next write must reach the core again, not be skipped as still armed.
+    Access::GpuWrite(*f.cache, id, 0x20000, 0x100);
+    REQUIRE(Access::TrapArmed(*f.cache, 0x20000, 0x1000));
 }
