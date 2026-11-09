@@ -10,12 +10,14 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <source_location>
 #include <thread>
 #include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
 
 #include "common/common_types.h"
+#include "video_core/nx2_back_cost.h"
 
 namespace Core {
 class System;
@@ -190,8 +192,16 @@ public:
     /// Runs `func` on the back after everything sent before it. Must be trivially copyable.
     /// `flags`: FastDrawNeutral when `func` can't change what a draw resolves to.
     template <typename Func>
-    void Defer(const Func& func, u64 flags = 0) {
+    void Defer(const Func& func, u64 flags = 0,
+               const std::source_location location = std::source_location::current()) {
         static_assert(std::is_trivially_copyable_v<Func> && alignof(Func) <= alignof(u64));
+        if (BackCost::Enabled()) [[unlikely]] {
+            static const bool named = (BackCost::RegisterThunk(
+                                           reinterpret_cast<const void*>(&CallThunk<Func>),
+                                           location.file_name(), location.line()),
+                                       true);
+            (void)named;
+        }
         constexpr size_t payload = (sizeof(Func) + sizeof(u64) - 1) / sizeof(u64);
         u64* const entry = Reserve(2 + payload);
         entry[0] = static_cast<u64>(Kind::Call) | flags | (u64{payload} << 8);
@@ -204,12 +214,13 @@ public:
     /// cache download that records into the Vulkan scheduler. A drained back still submits from
     /// its idle hook, so the front never touches that state itself.
     template <typename Func>
-    void Run(const Func& func, DrainSite site = DrainSite::Other) {
+    void Run(const Func& func, DrainSite site = DrainSite::Other,
+             const std::source_location location = std::source_location::current()) {
         if (on_back_thread || !active) {
             func();
             return;
         }
-        Defer(func);
+        Defer(func, 0, location);
         Drain(site);
     }
 

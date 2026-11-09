@@ -551,8 +551,12 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
     g_back_thread_id.store(GetCurrentThreadId(), std::memory_order_relaxed);
 #endif
     u64 read_position = 0;
+    u32 cost_tick = 0;
     while (!stop_token.stop_requested()) {
         Nx2Profile::Report("GPU back thread", true);
+        if (BackCost::Enabled()) [[unlikely]] {
+            BackCost::Report();
+        }
         u64 available = published.load(std::memory_order_acquire);
         if (available == read_position) {
             Nx2Profile::Scope scope{Nx2Profile::Zone::SplitWait};
@@ -607,8 +611,27 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
         back_quiet.store(false, std::memory_order_seq_cst);
         while (read_position != available) {
             const size_t index = read_position & RingMask;
-            const size_t size =
-                Execute(&ring[index], std::min<u64>(available - read_position, RingWords - index));
+            const size_t left = std::min<u64>(available - read_position, RingWords - index);
+            size_t size;
+            if (BackCost::Enabled() && (++cost_tick & 7) == 0) [[unlikely]] {
+                const u64 head = ring[index];
+                const auto kind = static_cast<Kind>(head & 0xf);
+                const void* const engine = back_engine;
+                const auto start = std::chrono::steady_clock::now();
+                size = Execute(&ring[index], left);
+                const u64 ns = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                    std::chrono::steady_clock::now() - start)
+                                                    .count());
+                if (kind == Kind::Method || kind == Kind::Multi) {
+                    BackCost::Record(kind == Kind::Method ? BackCost::EntryKind::Method
+                                                          : BackCost::EntryKind::Multi,
+                                     engine, (head >> 8) & 0xffff, ns, size);
+                } else if (kind == Kind::Call) {
+                    BackCost::Record(BackCost::EntryKind::Call, nullptr, ring[index + 1], ns, size);
+                }
+            } else {
+                size = Execute(&ring[index], left);
+            }
             read_position += size != 0 ? size : RingWords - index;
             if (hook_requested.load(std::memory_order_relaxed) &&
                 idle_hook != nullptr) [[unlikely]] {
