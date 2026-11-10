@@ -5,6 +5,7 @@
 
 #include <chrono>
 #include <memory>
+#include <thread>
 #include <optional>
 #include <span>
 #include <string>
@@ -44,6 +45,10 @@ public:
 private:
     std::shared_ptr<ToolState> state;
     std::unique_ptr<Server> server;
+    /// EDEN_NX2_DEBUG_FILE_DIR: the same requests as files (for clients that cannot reach the
+    /// loopback socket, such as a VM): <dir>/<name>.req (one JSON request line) is answered with
+    /// <dir>/<name>.resp, written whole (via .tmp + rename); the .req is removed.
+    std::jthread file_relay;
 };
 
 /// A reject_shaders hash: exactly 16 hex digits, optionally after 0x. Throws std::runtime_error.

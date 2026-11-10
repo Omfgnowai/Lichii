@@ -966,10 +966,68 @@ Service::Service(System& system, std::string title, u64 program_id, const Endpoi
     g_nx2_present_time_services.fetch_add(1, std::memory_order_relaxed);
     LOG_INFO(Debug, "Debug server listening on {}:{}, dump dir {}", endpoint.host, server->Port(),
              state->dump_directory.generic_string());
+    if (const char* const relay = std::getenv("EDEN_NX2_DEBUG_FILE_DIR");
+        relay != nullptr && *relay != '\0') {
+        std::filesystem::path dir{relay};
+        std::error_code ec;
+        std::filesystem::create_directories(dir, ec);
+        LOG_INFO(Debug, "Debug server file relay in {}", dir.generic_string());
+        file_relay = std::jthread([dir, handlers = MakeHandlers(state),
+                                   state = state](std::stop_token stop) {
+            const auto gone = [&stop, &state] {
+                return stop.stop_requested() || state->stopping.load(std::memory_order_relaxed);
+            };
+            while (!gone()) {
+                std::vector<std::filesystem::path> requests;
+                std::error_code list_error;
+                for (const auto& entry : std::filesystem::directory_iterator(dir, list_error)) {
+                    if (entry.path().extension() == ".req") {
+                        requests.push_back(entry.path());
+                    }
+                }
+                std::sort(requests.begin(), requests.end());
+                for (const auto& request : requests) {
+                    std::string line;
+                    {
+                        std::ifstream in(request, std::ios::binary);
+                        if (!in) {
+                            continue;
+                        }
+                        std::getline(in, line);
+                    }
+                    if (line.empty()) {
+                        continue; // still being written
+                    }
+                    std::error_code remove_error;
+                    std::filesystem::remove(request, remove_error);
+                    const std::string reply = HandleRequest(handlers, line, gone);
+                    auto out_path = request;
+                    out_path.replace_extension(".resp");
+                    auto tmp_path = request;
+                    tmp_path.replace_extension(".tmp");
+                    {
+                        std::ofstream out(tmp_path, std::ios::binary | std::ios::trunc);
+                        out << reply << '\n';
+                    }
+                    std::error_code rename_error;
+                    std::filesystem::rename(tmp_path, out_path, rename_error);
+                    if (rename_error) {
+                        LOG_WARNING(Debug, "File relay: cannot write {}: {}",
+                                    out_path.generic_string(), rename_error.message());
+                    }
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds{50});
+            }
+        });
+    }
 }
 
 Service::~Service() {
     state->stopping.store(true, std::memory_order_relaxed);
+    if (file_relay.joinable()) {
+        file_relay.request_stop();
+        file_relay.join();
+    }
     g_nx2_present_time_services.fetch_sub(1, std::memory_order_relaxed);
     VideoCore::Nx2Debug::EndSession();
     server.reset();
