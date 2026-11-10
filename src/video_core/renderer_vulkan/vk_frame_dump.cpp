@@ -887,6 +887,156 @@ void FrameDump::WriteFile(const std::string& name, std::span<const u8> data) {
     written_bytes += data.size();
 }
 
+namespace {
+struct NanWatchConfig {
+    u32 interval{};
+    u64 threshold{};
+};
+
+const NanWatchConfig& NanWatch() {
+    static const NanWatchConfig config = [] {
+        NanWatchConfig result;
+        const char* value = std::getenv("EDEN_NX2_NAN_WATCH");
+        if (value == nullptr || value[0] == '\0' || value[0] == '0') {
+            return result;
+        }
+        char* end = nullptr;
+        const unsigned long interval = std::strtoul(value, &end, 10);
+        result.interval = interval == 0 ? 10U : static_cast<u32>(std::min(interval, 600UL));
+        result.threshold = 64;
+        if (end != nullptr && *end == ',') {
+            result.threshold = std::max<u64>(1, std::strtoull(end + 1, nullptr, 10));
+        }
+        LOG_INFO(Render_Vulkan, "NaN watch: every {} frames, threshold {} texels",
+                 result.interval, result.threshold);
+        return result;
+    }();
+    return config;
+}
+
+/// B10G11R11 unsigned floats: 11-bit R and G (6-bit mantissa), 10-bit B (5-bit mantissa), each
+/// with a 5-bit exponent; all-ones exponent with a nonzero mantissa is NaN.
+std::pair<u64, u64> CountB10G11R11NanInf(std::span<const u8> data) {
+    u64 nan = 0, inf = 0;
+    const size_t count = data.size() / 4;
+    for (size_t i = 0; i < count; ++i) {
+        u32 word;
+        std::memcpy(&word, data.data() + i * 4, 4);
+        const u32 r = word & 0x7ff, g = (word >> 11) & 0x7ff, b = word >> 22;
+        const bool r_special = (r >> 6) == 0x1f, g_special = (g >> 6) == 0x1f,
+                   b_special = (b >> 5) == 0x1f;
+        if ((r_special && (r & 0x3f)) || (g_special && (g & 0x3f)) || (b_special && (b & 0x1f))) {
+            ++nan;
+        } else if (r_special || g_special || b_special) {
+            ++inf;
+        }
+    }
+    return {nan, inf};
+}
+} // Anonymous namespace
+
+bool FrameDump::NanWatchEnabled() {
+    return NanWatch().interval != 0;
+}
+
+void FrameDump::NanWatchTarget(ImageView& view) {
+    if (view.format != VideoCore::Surface::PixelFormat::B10G11R11_FLOAT) {
+        return;
+    }
+    auto target = MakeTarget(view, 0);
+    if (target && !target->msaa && target->width >= 1280 && target->height >= 720 &&
+        target->depth == 1) {
+        watch_target = target;
+    }
+}
+
+void FrameDump::NanWatchTick() {
+    const NanWatchConfig& config = NanWatch();
+    ++watch_frame;
+    if (watch_pending && scheduler.IsFree(watch_tick)) {
+        watch_pending = false;
+        watch_buffer.Invalidate();
+        const Target& target = *watch_pending_target;
+        const auto [nan, inf] = CountB10G11R11NanInf(
+            watch_buffer.Mapped().first(size_t{target.width} * target.height * 4));
+        ++watch_checks;
+        watch_max_nan = std::max(watch_max_nan, nan);
+        if (nan >= config.threshold) {
+            ++watch_hits;
+            LOG_WARNING(Render_Vulkan,
+                        "NaN watch: {} NaN and {} Inf texels in the {}x{} scene target {:#x} "
+                        "(frame {})",
+                        nan, inf, target.width, target.height, target.gpu_addr, watch_frame);
+            if (watch_last_hit == 0 || watch_frame - watch_last_hit >= 600) {
+                if (schedule.RequestFileCapture()) {
+                    watch_last_hit = watch_frame;
+                    LOG_WARNING(Render_Vulkan, "NaN watch: capture requested");
+                }
+            }
+        }
+        if (watch_checks % 600 == 0) {
+            LOG_INFO(Render_Vulkan, "NaN watch: {} checks, {} with NaN, most NaN texels {}",
+                     watch_checks, watch_hits, watch_max_nan);
+            watch_max_nan = 0;
+        }
+    }
+    if (!watch_pending && watch_target && watch_frame % config.interval == 0 &&
+        !schedule.Capturing()) {
+        const Target target = *watch_target;
+        const size_t size = size_t{target.width} * target.height * 4;
+        if (size > watch_buffer_size) {
+            watch_buffer = memory_allocator.CreateBuffer(
+                VkBufferCreateInfo{
+                    .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+                    .size = size,
+                    .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                    .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+                },
+                MemoryUsage::Download);
+            watch_buffer_size = size;
+        }
+        const VkBufferImageCopy copy{
+            .bufferOffset = 0,
+            .bufferRowLength = 0,
+            .bufferImageHeight = 0,
+            .imageSubresource{
+                .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                .mipLevel = static_cast<u32>(target.level),
+                .baseArrayLayer = static_cast<u32>(target.layer),
+                .layerCount = 1,
+            },
+            .imageOffset{0, 0, 0},
+            .imageExtent{target.width, target.height, 1},
+        };
+        scheduler.RequestOutsideRenderPassOperationContext();
+        scheduler.Record([image = target.image, destination = *watch_buffer,
+                          copy](vk::CommandBuffer cmdbuf) {
+            const VkMemoryBarrier before{
+                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
+                .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+            };
+            cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                   VK_PIPELINE_STAGE_TRANSFER_BIT, 0, before);
+            cmdbuf.CopyImageToBuffer(image, VK_IMAGE_LAYOUT_GENERAL, destination, copy);
+            const VkMemoryBarrier after{
+                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                .dstAccessMask = VK_ACCESS_HOST_READ_BIT | VK_ACCESS_MEMORY_READ_BIT |
+                                 VK_ACCESS_MEMORY_WRITE_BIT,
+            };
+            cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                   VK_PIPELINE_STAGE_ALL_COMMANDS_BIT |
+                                       VK_PIPELINE_STAGE_HOST_BIT,
+                                   0, after);
+        });
+        watch_tick = scheduler.CurrentTick();
+        watch_pending = true;
+        watch_pending_target = target;
+    }
+    watch_target.reset();
+}
+
 void FrameDump::TickFrame() {
     const double elapsed =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
@@ -980,6 +1130,14 @@ FrameDumpSchedule::Step FrameDumpSchedule::Tick(double elapsed_seconds) {
     }
     SetCapturing(true);
     return Step::Start;
+}
+
+bool FrameDumpSchedule::RequestFileCapture() const {
+    if (!enabled || trigger_file.empty() || capturing) {
+        return false;
+    }
+    std::ofstream{trigger_file}.put('\n');
+    return true;
 }
 
 void FrameDumpSchedule::Abort() {

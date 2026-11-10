@@ -48,6 +48,9 @@ public:
     Step Tick(double elapsed_seconds);
     /// The capture Tick started could not begin.
     void Abort();
+    /// Creates the trigger file (EDEN_NX2_FRAME_DUMP_AT=file) so the next check captures.
+    /// False when not file-triggered or a capture is running.
+    bool RequestFileCapture() const;
     /// EDEN_NX2_FRAME_DUMP_BUFFERS=1: record the bound buffers without the sampled textures.
     void RecordBuffers() noexcept {
         buffers = true;
@@ -183,6 +186,15 @@ public:
     /// Waits for pending readbacks and writes them once they pass the staging budget.
     void DrainIfFull();
     void TickFrame();
+    /// EDEN_NX2_NAN_WATCH=<frames>[,<threshold>]: every <frames> frames (default 10) the last
+    /// full-size B10G11R11_FLOAT color target drawn in the frame (the HDR scene) is read back and
+    /// its NaN texels counted; at <threshold> (default 64) or more a line is logged and, with
+    /// EDEN_NX2_FRAME_DUMP_AT=file, a capture is requested (at most once per 600 frames).
+    [[nodiscard]] static bool NanWatchEnabled();
+    /// Notes a color target being drawn (only while NanWatchEnabled).
+    void NanWatchTarget(ImageView& view);
+    /// Once per frame, before TickFrame.
+    void NanWatchTick();
     /// Captures the next frame into `directory` for the debug server, which is told `id` once
     /// the manifest is complete. Works without EDEN_NX2_FRAME_DUMP.
     void Arm(std::filesystem::path directory, bool sampled, bool buffers, u64 id);
@@ -279,6 +291,19 @@ private:
     u32 pass_first_draw{};
     u32 draws{};
     u32 dispatches{};
+
+    // NaN watch
+    std::optional<Target> watch_target;
+    std::optional<Target> watch_pending_target;
+    vk::Buffer watch_buffer;
+    size_t watch_buffer_size{};
+    u64 watch_tick{};
+    bool watch_pending{};
+    u64 watch_frame{};
+    u64 watch_last_hit{};
+    u64 watch_checks{};
+    u64 watch_max_nan{};
+    u64 watch_hits{};
 
     std::thread writer;
     std::mutex queue_mutex;

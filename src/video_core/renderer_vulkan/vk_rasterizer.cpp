@@ -1082,6 +1082,15 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
 #endif
     TracePendingCpuWrites(false, pipeline->ShaderHashes());
     TraceRenderState(is_indexed, "configured", texture_cache.GetFramebuffer());
+    if (nan_watch_on) {
+        const Framebuffer* const framebuffer = texture_cache.GetFramebuffer();
+        if (framebuffer != nan_watch_framebuffer) {
+            nan_watch_framebuffer = framebuffer;
+            if (const auto id = texture_cache.GetRenderTargets().color_buffer_ids[0]) {
+                frame_dump.NanWatchTarget(texture_cache.GetImageView(id));
+            }
+        }
+    }
     if (frame_dump.Capturing()) {
         FrameDumpPass(texture_cache.GetFramebuffer());
         frame_dump.NoteDraw(pipeline->ShaderHashes());
@@ -3232,6 +3241,10 @@ void RasterizerVulkan::TickFrame() {
     if (fast_draw_on) {
         ReportFastDraws();
         VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Frame);
+    }
+    if (nan_watch_on) {
+        frame_dump.NanWatchTick();
+        nan_watch_framebuffer = nullptr;
     }
     frame_dump.TickFrame();
     ++render_trace_frame;

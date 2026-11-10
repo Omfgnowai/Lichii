@@ -283,6 +283,10 @@ private:
     AccelerateDMA accelerate_dma;
     FenceManager fence_manager;
     FrameDump frame_dump;
+    /// EDEN_NX2_NAN_WATCH (FrameDump::NanWatchTick): the framebuffer whose first color target
+    /// was last handed to the watch this frame.
+    bool nan_watch_on{FrameDump::NanWatchEnabled()};
+    const Framebuffer* nan_watch_framebuffer{};
 
     boost::container::static_vector<u32, MAX_IMAGE_VIEWS> image_view_indices;
     std::array<VideoCommon::ImageViewId, MAX_IMAGE_VIEWS> image_view_ids;
