@@ -5,6 +5,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <cstdlib>
 #include <compare>
 #include <functional>
 #include <map>
@@ -31,6 +33,63 @@ inline NvResult Nx2UnknownIoctl(const char* device, Ioctl command, std::span<con
     std::copy_n(input.begin(), std::min(input.size(), output.size()), output.begin());
     return NvResult::Success;
 }
+
+// Device (SMMU) space taken by Switch 2 GPU mappings: 64 GiB in all. Logs every 10 s while it
+// changes with EDEN_NX2_SMMU_STATS=1, and always each time the live total passes another 8 GiB.
+struct Nx2SmmuStats {
+    static void Allocated(u64 bytes, bool sparse = false) {
+        Note(static_cast<s64>(bytes), sparse, true);
+    }
+    static void Freed(u64 bytes, bool sparse = false) {
+        Note(-static_cast<s64>(bytes), sparse, false);
+    }
+
+private:
+    static void Note(s64 delta, bool sparse, bool allocated) {
+        static std::atomic<s64> live{}, live_sparse{}, peak{};
+        static std::atomic<u64> allocs{}, frees{};
+        static std::atomic<s64> next_report_ns{}, warned_step{};
+        const s64 now_live = live.fetch_add(delta, std::memory_order_relaxed) + delta;
+        if (sparse) {
+            live_sparse.fetch_add(delta, std::memory_order_relaxed);
+        }
+        (allocated ? allocs : frees).fetch_add(1, std::memory_order_relaxed);
+        s64 old_peak = peak.load(std::memory_order_relaxed);
+        while (now_live > old_peak &&
+               !peak.compare_exchange_weak(old_peak, now_live, std::memory_order_relaxed)) {
+        }
+        constexpr s64 step = s64{8} << 30;
+        const s64 crossed = now_live / step;
+        s64 warned = warned_step.load(std::memory_order_relaxed);
+        if (crossed > warned &&
+            warned_step.compare_exchange_strong(warned, crossed, std::memory_order_relaxed)) {
+            LOG_WARNING(Service_NVDRV, "Switch 2 device (SMMU) space in use: {} MiB of 65536",
+                        now_live >> 20);
+        }
+        static const bool stats = [] {
+            const char* value = std::getenv("EDEN_NX2_SMMU_STATS");
+            return value != nullptr && value[0] == '1';
+        }();
+        if (!stats) {
+            return;
+        }
+        const s64 now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                               std::chrono::steady_clock::now().time_since_epoch())
+                               .count();
+        s64 due = next_report_ns.load(std::memory_order_relaxed);
+        if (now_ns < due ||
+            !next_report_ns.compare_exchange_strong(due, now_ns + 10'000'000'000LL,
+                                                    std::memory_order_relaxed)) {
+            return;
+        }
+        LOG_INFO(Service_NVDRV,
+                 "Switch 2 SMMU: {} MiB in use ({} MiB sparse regions), peak {} MiB; {} "
+                 "allocations, {} frees",
+                 now_live >> 20, live_sparse.load(std::memory_order_relaxed) >> 20,
+                 peak.load(std::memory_order_relaxed) >> 20,
+                 allocs.load(std::memory_order_relaxed), frees.load(std::memory_order_relaxed));
+    }
+};
 
 // GPU mappings a Switch 2 process made through nx2:gpu: CreateGpuAccessibleMemory (sub 101) maps
 // the memory at GPU address == CPU address, and NormalMapGpuMemory4K (211) maps a memory handle at
@@ -219,6 +278,16 @@ public:
     void RecordDeviceRange(u64 cpu_address, u64 size, u64 device_address) {
         std::scoped_lock lk{device_mutex};
         device_ranges[cpu_address] = {size, device_address};
+    }
+
+    // The device range recorded for cpu_address was freed: stop presenting from it (a later
+    // mapping of the same memory records its new range).
+    void ForgetDeviceRange(u64 cpu_address, u64 device_address) {
+        std::scoped_lock lk{device_mutex};
+        if (const auto it = device_ranges.find(cpu_address);
+            it != device_ranges.end() && it->second.second == device_address) {
+            device_ranges.erase(it);
+        }
     }
 
     std::optional<u64> DeviceAddressOf(u64 cpu_address) {

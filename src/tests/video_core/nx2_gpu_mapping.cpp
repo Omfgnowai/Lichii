@@ -40,3 +40,13 @@ TEST_CASE("NX2 remaps and resets discard stale parent handles", "[video_core][nx
     REQUIRE_FALSE(registry.GpuAddressOf(8, 0x1000));
     REQUIRE_FALSE(registry.DeviceAddressOfGpu(0x8000));
 }
+
+TEST_CASE("NX2 freed device ranges stop resolving", "[video_core][nx2_mapping]") {
+    Service::Nvidia::Devices::Nx2GpuMemoryRegistry registry;
+    registry.MapAt(7, 0, 0x8000, 0x4000, 0x1000);
+    registry.RecordDeviceRange(0x4000, 0x1000, 0x20000);
+    registry.ForgetDeviceRange(0x4000, 0x30000); // another range's address: kept
+    REQUIRE(registry.DeviceAddressOfGpu(0x8000) == 0x20000U);
+    registry.ForgetDeviceRange(0x4000, 0x20000);
+    REQUIRE_FALSE(registry.DeviceAddressOfGpu(0x8000));
+}
