@@ -260,6 +260,15 @@ public:
             if (first_accumulation_checkpoint <= num_slots_used) {
                 scheduler.RequestOutsideRenderPassOperationContext();
                 scheduler.Record([buffer = *accumulation_buffer](vk::CommandBuffer cmdbuf) {
+                    // After the last prefix scan's write to it.
+                    static constexpr VkMemoryBarrier scan_barrier{
+                        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                        .pNext = nullptr,
+                        .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+                        .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                    };
+                    cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                           VK_PIPELINE_STAGE_TRANSFER_BIT, 0, scan_barrier);
                     cmdbuf.FillBuffer(buffer, 0, 8, 0);
                 });
             }
