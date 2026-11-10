@@ -2,6 +2,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <condition_variable>
@@ -47,6 +48,10 @@ public:
     Step Tick(double elapsed_seconds);
     /// The capture Tick started could not begin.
     void Abort();
+    /// EDEN_NX2_FRAME_DUMP_BUFFERS=1: record the bound buffers without the sampled textures.
+    void RecordBuffers() noexcept {
+        buffers = true;
+    }
 
     [[nodiscard]] bool Capturing() const noexcept {
         return capturing;
@@ -64,6 +69,11 @@ public:
     /// The debug server request being captured, 0 for EDEN_NX2_FRAME_DUMP's own capture.
     [[nodiscard]] u64 CaptureId() const noexcept {
         return capture_id;
+    }
+    /// EDEN_NX2_FRAME_DUMP_AT=file: every time the trigger file appears a frame is captured and
+    /// the file removed, so captures can be taken as often as needed in one session.
+    [[nodiscard]] bool FileTriggered() const noexcept {
+        return !trigger_file.empty() && capture_id == 0;
     }
 
 private:
@@ -118,6 +128,12 @@ public:
         VkBuffer host;
         u32 host_offset;
         std::vector<u8> guest;
+        /// EDEN_NX2_FRAME_DUMP_BOTH: record the host copy and the guest copy (in `guest`), with
+        /// one bit per 4 KiB page: written by the GPU, and holding guest CPU writes not yet
+        /// applied to the host buffer.
+        bool both{};
+        std::string gpu_pages;
+        std::string pending_pages;
     };
 
     explicit FrameDump(const Device& device, MemoryAllocator& memory_allocator,
@@ -126,6 +142,12 @@ public:
 
     [[nodiscard]] bool Capturing() const noexcept {
         return schedule.Capturing();
+    }
+
+    /// Whether this capture already recorded the storage range (device address, size) twice.
+    [[nodiscard]] bool RecordedBoth(u64 device_addr, u32 size) const noexcept {
+        return std::ranges::find(seen_both, std::pair<u64, u32>{device_addr, size}) !=
+               seen_both.end();
     }
 
     [[nodiscard]] bool CapturingSampled() const noexcept {
@@ -218,6 +240,8 @@ private:
     void WriteBuffer(const Job& job);
     void WriteFile(const std::string& name, std::span<const u8> data);
     void StopWriter();
+    /// Clears the per-capture counters before a capture starts.
+    void ResetCapture();
 
     const Device& device;
     MemoryAllocator& memory_allocator;
@@ -226,6 +250,9 @@ private:
     FrameDumpSchedule schedule;
     bool truncated{};
     std::filesystem::path directory;
+    /// EDEN_NX2_FRAME_DUMP's directory; file-triggered captures go to capture-NNN under it.
+    std::filesystem::path base_directory;
+    u32 file_captures{};
     std::chrono::steady_clock::time_point start;
 
     std::ofstream manifest;
@@ -244,6 +271,8 @@ private:
     std::vector<std::tuple<u64, GPUVAddr, u32>> dispatch_sampled;
     /// (shader hash, storage, binding index, device address, size) already recorded this frame.
     std::vector<std::tuple<u64, bool, u32, u64, u32>> seen_buffers;
+    /// (device address, size) of storage ranges recorded twice (host and guest) this frame.
+    std::vector<std::pair<u64, u32>> seen_both;
     /// Content hashes of the buffer files written; writer thread only.
     std::vector<u64> written_buffers;
     u32 pass_index{};

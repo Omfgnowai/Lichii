@@ -3118,7 +3118,37 @@ bool RasterizerVulkan::TryOcarinaDlss(const ComputePipeline& pipeline, bool repl
 #endif
 
 bool RasterizerVulkan::FrameDumpBuffers(bool compute, std::span<const u64> shader_hashes) {
-    static constexpr u32 BUFFER_CAP = 4U << 20;
+    // EDEN_NX2_FRAME_DUMP_BUFFER_MIB: bytes kept per binding (default 4 MiB).
+    static const u32 BUFFER_CAP = [] {
+        const char* value = std::getenv("EDEN_NX2_FRAME_DUMP_BUFFER_MIB");
+        const u64 mib = value ? std::strtoull(value, nullptr, 10) : 0;
+        return static_cast<u32>(std::clamp<u64>(mib == 0 ? 4 : mib, 1, 256) << 20);
+    }();
+    // EDEN_NX2_FRAME_DUMP_BOTH=1: storage buffers are recorded from the host buffer and from guest
+    // memory, once per range, with per-page GPU-written and pending-CPU-write masks, so the two
+    // can be compared where the guest is the source.
+    static const bool both = [] {
+        const char* value = std::getenv("EDEN_NX2_FRAME_DUMP_BOTH");
+        return value && value[0] == '1';
+    }();
+    const auto page_mask = [](u64 addr, u32 size, auto&& test) {
+        constexpr u64 page = 4096;
+        std::string hex;
+        u32 nibble = 0, bits = 0;
+        for (u64 offset = 0; offset < size; offset += page) {
+            const u64 length = std::min<u64>(page, size - offset);
+            nibble |= (test(addr + offset, length) ? 1U : 0U) << bits;
+            if (++bits == 4) {
+                hex += "0123456789abcdef"[nibble];
+                nibble = 0;
+                bits = 0;
+            }
+        }
+        if (bits != 0) {
+            hex += "0123456789abcdef"[nibble];
+        }
+        return hex;
+    };
     std::vector<FrameDump::BoundBuffer> buffers;
     buffer_cache.ForEachBoundBuffer(compute, [&](u32 stage, bool storage, u32 index, bool written,
                                                  const auto& binding, u32 bound_size,
@@ -3139,7 +3169,19 @@ bool RasterizerVulkan::FrameDumpBuffers(bool compute, std::span<const u64> shade
             .host_offset = host_offset,
             .guest = {},
         });
-        if (!gpu_modified || !host) {
+        if (both && storage) {
+            buffer.both = true;
+            if (frame_dump.RecordedBoth(binding.device_addr, size)) {
+                return; // NoteBuffers only writes a bind line for it
+            }
+            buffer.gpu_pages = page_mask(binding.device_addr, size, [&](u64 addr, u64 length) {
+                return buffer_cache.IsRegionGpuModified(addr, length);
+            });
+            buffer.pending_pages = page_mask(binding.device_addr, size, [&](u64 addr, u64 length) {
+                return gpu.HasPendingCPUWrites(addr, length);
+            });
+        }
+        if (!gpu_modified || !host || buffer.both) {
             buffer.guest.resize(size);
             device_memory.ReadBlockUnsafe(binding.device_addr, buffer.guest.data(), size);
         }

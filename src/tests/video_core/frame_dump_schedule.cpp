@@ -106,5 +106,17 @@ TEST_CASE("Frame dump schedule follows EDEN_NX2_FRAME_DUMP_AT", "[frame_dump_sch
     }
     REQUIRE(by_file.Tick(1000.0) == Step::Start);
     REQUIRE(by_file.Frame() == 90);
+    // The trigger file is used up when the capture ends; a new one captures again.
+    REQUIRE(by_file.Tick(1000.0) == Step::Finish);
+    REQUIRE(!std::filesystem::exists(trigger));
+    for (int frame = 92; frame <= 150; ++frame) {
+        REQUIRE(by_file.Tick(1000.0) == Step::None);
+    }
+    std::ofstream{trigger}.put('\n');
+    for (int frame = 151; frame < 180; ++frame) {
+        REQUIRE(by_file.Tick(1000.0) == Step::None);
+    }
+    REQUIRE(by_file.Tick(1000.0) == Step::Start);
+    REQUIRE(by_file.Frame() == 180);
     std::filesystem::remove_all(directory);
 }

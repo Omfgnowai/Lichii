@@ -239,12 +239,17 @@ FrameDump::FrameDump(const Device& device_, MemoryAllocator& memory_allocator_,
     }
     const char* const sampled_value = std::getenv("EDEN_NX2_FRAME_DUMP_SAMPLED");
     directory = dir;
+    base_directory = directory;
     start = std::chrono::steady_clock::now();
     const char* const at = std::getenv("EDEN_NX2_FRAME_DUMP_AT");
     const std::string_view value = at ? at : "60";
     // "file" captures once <dir>/capture.now exists, so a frame can be picked while playing.
     schedule.Configure(value, directory / "capture.now",
                        sampled_value && *sampled_value != '\0' && *sampled_value != '0');
+    if (const char* buffers_value = std::getenv("EDEN_NX2_FRAME_DUMP_BUFFERS");
+        buffers_value && buffers_value[0] == '1') {
+        schedule.RecordBuffers();
+    }
     LOG_INFO(Render_Vulkan, "Frame dump armed: dir={} at={}", directory.string(), value);
 }
 
@@ -272,21 +277,30 @@ void FrameDump::Arm(std::filesystem::path directory_, bool sampled, bool buffers
     }
     StopWriter();
     directory = std::move(directory_);
+    ResetCapture();
+    if (start == std::chrono::steady_clock::time_point{}) {
+        start = std::chrono::steady_clock::now();
+    }
+}
+
+void FrameDump::ResetCapture() {
     truncated = false;
     recorded_bytes = 0;
     written_bytes = 0;
     sequence = 0;
     images = 0;
     pass_framebuffer = nullptr;
+    pass_targets.clear();
+    pass_hashes.clear();
+    pass_sampled.clear();
     dispatch_sampled.clear();
     seen_buffers.clear();
+    seen_both.clear();
     written_buffers.clear();
     pass_index = 0;
+    pass_first_draw = 0;
     draws = 0;
     dispatches = 0;
-    if (start == std::chrono::steady_clock::time_point{}) {
-        start = std::chrono::steady_clock::now();
-    }
 }
 
 std::optional<FrameDump::Target> FrameDump::MakeTarget(ImageView& view, u32 slot) const {
@@ -469,6 +483,33 @@ bool FrameDump::NoteBuffers(bool compute, std::span<const u64> shader_hashes,
     for (BoundBuffer& buffer : buffers) {
         const size_t program = compute ? 0 : buffer.stage + 1;
         const u64 shader = program < shader_hashes.size() ? shader_hashes[program] : 0;
+        if (buffer.both) {
+            const std::string owner_tags =
+                compute ? fmt::format(R"("dispatch":{},"after_draws":{})", dispatches, draws)
+                        : fmt::format(R"("pass":{},"draw":{})", pass_index, draws - 1);
+            const std::string binding = fmt::format(
+                R"({},"stage":{},"shader":"{:016x}","type":"storage","index":{},"written":{},"gpu_addr":"{:#x}","device_addr":"{:#x}","bound_size":{},"size":{})",
+                owner_tags, buffer.stage, shader, buffer.index, buffer.written, buffer.gpu_addr,
+                buffer.device_addr, buffer.bound_size, buffer.size);
+            const std::pair<u64, u32> range{buffer.device_addr, buffer.size};
+            if (std::ranges::find(seen_both, range) != seen_both.end()) {
+                Enqueue({.tags = fmt::format(R"({{"kind":"bind",{}}})", binding)});
+                continue;
+            }
+            seen_both.push_back(range);
+            const std::string pages = fmt::format(R"("gpu_pages":"{}","pending_pages":"{}")",
+                                                  buffer.gpu_pages, buffer.pending_pages);
+            Enqueue({.tags = fmt::format(R"("kind":"buffer",{},{},"source":"guest")", binding,
+                                         pages),
+                     .data = std::move(buffer.guest),
+                     .raw = true});
+            if (buffer.host != VK_NULL_HANDLE) {
+                recorded |= RecordBuffer(
+                    buffer.host, buffer.host_offset, buffer.size,
+                    fmt::format(R"("kind":"buffer",{},{},"source":"host")", binding, pages));
+            }
+            continue;
+        }
         const std::tuple<u64, bool, u32, u64, u32> key{shader, buffer.storage, buffer.index,
                                                        buffer.device_addr, buffer.size};
         if (std::ranges::find(seen_buffers, key) != seen_buffers.end()) {
@@ -863,6 +904,11 @@ void FrameDump::TickFrame() {
     case FrameDumpSchedule::Step::Start:
         break;
     }
+    if (schedule.FileTriggered()) {
+        StopWriter();
+        ResetCapture();
+        directory = base_directory / fmt::format("capture-{:03}", ++file_captures);
+    }
     std::error_code error;
     std::filesystem::create_directories(directory, error);
     manifest.open(directory / "manifest.jsonl", std::ios::trunc);
@@ -918,6 +964,12 @@ FrameDumpSchedule::Step FrameDumpSchedule::Tick(double elapsed_seconds) {
     if (capturing) {
         SetCapturing(false);
         done = true;
+        if (FileTriggered()) {
+            // Ready for the next trigger file.
+            std::error_code remove_error;
+            std::filesystem::remove(trigger_file, remove_error);
+            done = false;
+        }
         return Step::Finish;
     }
     std::error_code error;
