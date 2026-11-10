@@ -627,7 +627,11 @@ foreach(NX2_ABI_FILE IN LISTS NX2_SHADER_ABI_FILES)
 endforeach()
 string(SHA256 NX2_SHADER_ABI "${NX2_SHADER_ABI_TEXT}")
 string(SUBSTRING "${NX2_SHADER_ABI}" 0 16 NX2_SHADER_ABI)
-set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${NX2_SHADER_ABI_FILES})
+# Re-hash when one of the sources changes (cpmfile.json is a configure input already: listing it
+# again makes ninja see build.ninja's dependency twice).
+set(NX2_SHADER_ABI_DEPENDS ${NX2_SHADER_ABI_FILES})
+list(FILTER NX2_SHADER_ABI_DEPENDS EXCLUDE REGEX "cpmfile\\.json$")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${NX2_SHADER_ABI_DEPENDS})
 set_property(SOURCE renderer_vulkan/vk_pipeline_cache.cpp APPEND PROPERTY
     COMPILE_DEFINITIONS "NX2_SHADER_ABI=\"${NX2_SHADER_ABI}\"")
 message(STATUS "NX2 shader ABI (precompiled preparation key): ${NX2_SHADER_ABI}")
