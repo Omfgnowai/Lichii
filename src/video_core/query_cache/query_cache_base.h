@@ -90,6 +90,34 @@ public:
         return mask;
     }
 
+    /// Any thread: whether the cache holds a report that can still land in [addr, addr + size),
+    /// written out by SemiFlushRegion or once its host result comes in: one whose value and
+    /// timestamp (16 bytes from its address) reach into the range.
+    [[nodiscard]] bool HoldsQueries(VAddr addr, size_t size) {
+        if (size == 0) {
+            return false;
+        }
+        constexpr u64 report_size = 16;
+        const u64 begin = addr >= report_size - 1 ? addr - (report_size - 1) : 0;
+        const u64 end = addr + size;
+        std::scoped_lock lock(cache_mutex);
+        for (u64 page = begin >> Core::DEVICE_PAGEBITS; page <= (end - 1) >> Core::DEVICE_PAGEBITS;
+             ++page) {
+            const auto it = cached_queries.find(page);
+            if (it == cached_queries.end()) {
+                continue;
+            }
+            const u64 page_start = page << Core::DEVICE_PAGEBITS;
+            for (const auto& entry : it->second) {
+                const u64 query = page_start + entry.first;
+                if (query >= begin && query < end) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
     /// Return true when a CPU region is modified from the GPU
     [[nodiscard]] bool IsRegionGpuModified(VAddr addr, size_t size) {
         bool result = false;

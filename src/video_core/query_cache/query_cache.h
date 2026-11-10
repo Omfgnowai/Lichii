@@ -295,8 +295,11 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
                                 ? !Settings::IsGPULevelHigh()
                                 : !Settings::IsGPUFenceBehaviorBalanced() &&
                                       !Settings::IsGPUFenceBehaviorAccurate();
-    const bool is_synced =
-        sync_payload_releases && is_fence && counter_type == QueryType::Payload && low_fences;
+    // A release over a report still pending waits too, so the older report can't land after it
+    // and write its older value over the release (upstream capy/874-payload-sync c0b8b7b5).
+    const bool is_synced = sync_payload_releases && is_fence &&
+                           counter_type == QueryType::Payload && low_fences &&
+                           !HoldsQueries(cpu_addr, has_timestamp ? 16 : 4);
     // Without delayed fence operations only fence-flagged reports wait for the host GPU to write.
     // Four-word releases stay waited for: a CPU copy of one after the acquire would miss the
     // timestamp the fence writes. (None with is_synced: those write at once.)
