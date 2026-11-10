@@ -25,6 +25,7 @@
 #include "common/stb.h"
 #include "core/core.h"
 #include "core/core_timing.h"
+#include "core/debugger/nx2_code_trace.h"
 #include "core/debugger/nx2_debug_server.h"
 #include "core/debugger/nx2_debug_tools.h"
 #include "core/frontend/framebuffer_layout.h"
@@ -547,6 +548,59 @@ json ReadMemory(ToolState& state, const json& params) {
     return result;
 }
 
+json HookJson(const Core::Nx2CodeTrace::Hook& hook) {
+    return {{"address", HexAddress(hook.address)},
+            {"original", fmt::format("{:#010x}", hook.original)},
+            {"hits", hook.hits}};
+}
+
+json CodeHookSet(ToolState& state, const json& params) {
+    Kernel::KProcess& process = Application(state);
+    json set = json::array();
+    const json& addresses = params.at("address");
+    for (const json& value : addresses.is_array() ? addresses : json::array({addresses})) {
+        json one = {{"address", value}};
+        set.push_back(HookJson(Core::Nx2CodeTrace::Set(process, AddressParam(one, "address"))));
+    }
+    return {{"set", std::move(set)}};
+}
+
+json CodeHookClear(ToolState& state, const json& params) {
+    Kernel::KProcess& process = Application(state);
+    if (!params.contains("address")) {
+        return {{"cleared", Core::Nx2CodeTrace::ClearAll(process)}};
+    }
+    Core::Nx2CodeTrace::Clear(process, AddressParam(params, "address"));
+    return {{"cleared", 1}};
+}
+
+json CodeHookRead(ToolState& state, const json& params) {
+    const Kernel::KProcess& process = Application(state);
+    const u64 since = params.value("since", u64{0});
+    const auto max = static_cast<std::size_t>(Param<int>(params, "max", 512, 1, 4096));
+    u64 next = 0;
+    u64 dropped = 0;
+    json hits = json::array();
+    for (const auto& hit : Core::Nx2CodeTrace::Read(since, max, next, dropped)) {
+        json x = json::array();
+        for (const u64 value : hit.x) {
+            x.push_back(HexAddress(value));
+        }
+        hits.push_back({{"seq", hit.seq},
+                        {"present", hit.present},
+                        {"address", HexAddress(hit.address)},
+                        {"thread", hit.thread_id},
+                        {"lr", HexAddress(hit.lr)},
+                        {"sp", HexAddress(hit.sp)},
+                        {"x", std::move(x)}});
+    }
+    json hooks = json::array();
+    for (const auto& hook : Core::Nx2CodeTrace::Hooks(process)) {
+        hooks.push_back(HookJson(hook));
+    }
+    return {{"hits", std::move(hits)}, {"next", next}, {"dropped", dropped}, {"hooks", std::move(hooks)}};
+}
+
 json SearchMemory(ToolState& state, const json& params) {
     const std::vector<u8> pattern = ParseHexBytes(params.at("pattern").get<std::string>());
     if (pattern.size() > 256) {
@@ -731,6 +785,9 @@ Handlers MakeHandlers(const std::shared_ptr<ToolState>& state) {
         {"read_memory", handler(ReadMemory)},
         {"search_memory", handler(SearchMemory)},
         {"read_gpu_memory", handler(ReadGpuMemory)},
+        {"code_hook_set", handler(CodeHookSet)},
+        {"code_hook_clear", handler(CodeHookClear)},
+        {"code_hook_read", handler(CodeHookRead)},
         {"input", waiting(Input)},
         {"input_sequence", waiting(InputSequence)},
     };

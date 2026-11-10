@@ -189,6 +189,38 @@ TOOLS = [
         },
     },
     {
+        "name": "code_hook_set",
+        "description": "Logs every run of guest instructions without stopping the game: each "
+                       "address (one or a list) must hold a HINT-class instruction (NOP, PACIBSP, "
+                       "BTI: a function's first instruction), which is replaced by a trap that "
+                       "records x0-x7, lr, sp and the thread, then continues. Read hits with "
+                       "code_hook_read; code_hook_clear restores the instruction.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"address": {"type": ["string", "integer", "array"]}},
+            "required": ["address"],
+        },
+    },
+    {
+        "name": "code_hook_clear",
+        "description": "Removes the hook at address, or every hook without one.",
+        "inputSchema": {"type": "object", "properties": {"address": {"type": ["string", "integer"]}}},
+    },
+    {
+        "name": "code_hook_read",
+        "description": "Hits recorded by code hooks with seq >= since (oldest first, at most max, "
+                       "default 512), 'next' for the following call, 'dropped' hits overwritten "
+                       "before they were read (the ring holds 8192), and the installed hooks with "
+                       "their hit counts.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "since": {"type": "integer", "minimum": 0},
+                "max": {"type": "integer", "minimum": 1, "maximum": 4096},
+            },
+        },
+    },
+    {
         "name": "read_gpu_memory",
         "description": "Reads up to 64 KiB of GPU virtual memory (e.g. query report and semaphore "
                        "buffers the game reads back) at the next frame end, as the GPU sees it, "
