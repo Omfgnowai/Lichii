@@ -254,6 +254,18 @@ public:
             AbandonCurrentQuery();
             pending_sync.clear();
         } else {
+            // The running query holds every slot since the last reset or sync, so the resolve
+            // covers only its slots. After a reset it starts from zero, not from the accumulation
+            // the last sync left.
+            if (first_accumulation_checkpoint <= num_slots_used) {
+                scheduler.RequestOutsideRenderPassOperationContext();
+                scheduler.Record([buffer = *accumulation_buffer](vk::CommandBuffer cmdbuf) {
+                    cmdbuf.FillBuffer(buffer, 0, 8, 0);
+                });
+            }
+            num_slots_used = current_query->size_slots;
+            first_accumulation_checkpoint = (std::numeric_limits<size_t>::max)();
+            last_accumulation_checkpoint = 0;
             // Resolves the count into the accumulation buffer and amend value; with no report
             // pending, nothing is written to guest memory.
             PresyncWrites();
