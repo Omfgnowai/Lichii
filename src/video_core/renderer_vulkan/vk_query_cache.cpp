@@ -215,23 +215,50 @@ public:
     void CloseCounter() override {
         PauseCounter();
         // A title that counts without resetting or reporting grows the query by a slot at every
-        // submission and render pass, and the query keeps every bank it touches alive. Ocarina of
-        // Time's title screen and file select reached 16,384 slots over 64 banks, while gameplay
-        // windows in Hyrule Field, Kakariko Village, and the Shooting Gallery reach up to 346
-        // slots across two banks. Past 4 banks (1,024 slots), drop the count as a reset would.
+        // submission and render pass, and the query keeps every bank it touches alive (Ocarina of
+        // Time's title screen and file select reached 16,384 slots over 64 banks). Past 4 banks
+        // (1,024 slots) the query is synced as a report would sync it, and its count carries into
+        // the next query. Dropping the count instead made a report in that window read too low,
+        // and Ocarina's gameplay windows pass 1,024 slots.
         static constexpr size_t MaxRunningQuerySlots = 4 * SamplesQueryBank::BANK_SIZE;
-        if (current_query && current_query->size_slots > MaxRunningQuerySlots) {
-            // It drops a real count. Logged on the 1st, 2nd, 4th, 8th... drop, so a window this
-            // long during gameplay doesn't go unnoticed and a title screen doesn't flood the log.
-            ++bank_bound_resets;
-            if ((bank_bound_resets & (bank_bound_resets - 1)) == 0) {
-                LOG_WARNING(Render_Vulkan,
-                            "Samples query ran {} slots with no reset or report, dropped its "
-                            "count (drop {})",
-                            current_query->size_slots, bank_bound_resets);
-            }
-            ResetCounter();
+        // With a report pending, its sync carries the query; its guest writes aren't made here,
+        // in the middle of a submission.
+        if (!current_query || current_query->size_slots <= MaxRunningQuerySlots ||
+            !pending_sync.empty()) {
+            return;
         }
+        // Logged on the 1st, 2nd, 4th, 8th... carry, so a title screen doesn't flood the log.
+        ++carried_queries;
+        if ((carried_queries & (carried_queries - 1)) == 0) {
+            LOG_INFO(Render_Vulkan,
+                     "Samples query ran {} slots with no reset or report, carried its count into "
+                     "a new query (carry {})",
+                     current_query->size_slots, carried_queries);
+        }
+        const size_t carry = BuildQuery();
+        auto* query = GetQuery(carry);
+        query->guest_address = 0;
+        query->value = 0;
+        query->flags &= ~VideoCommon::QueryFlagBits::IsOrphan;
+        query->start_bank_id = current_query->start_bank_id;
+        query->size_banks = current_query->size_banks;
+        query->start_slot = current_query->start_slot;
+        query->size_slots = current_query->size_slots;
+        ApplyBankOp(query, [](SamplesQueryBank* bank, size_t start, size_t amount) {
+            bank->AddReference(amount);
+        });
+        pending_sync.push_back(carry);
+        if (SkipsHostSync()) {
+            ReplicateCurrentQueryIfNeeded();
+            rasterizer->SyncOperation([this] { amend_value = accumulation_value; });
+            AbandonCurrentQuery();
+            pending_sync.clear();
+        } else {
+            // Resolves the count into the accumulation buffer and amend value; with no report
+            // pending, nothing is written to guest memory.
+            PresyncWrites();
+        }
+        Free(carry);
     }
 
     bool HasPendingSync() const override {
@@ -257,8 +284,7 @@ public:
         }
         PauseCounter();
         const auto driver_id = device.GetDriverID();
-        if (driver_id == VK_DRIVER_ID_QUALCOMM_PROPRIETARY ||
-            driver_id == VK_DRIVER_ID_ARM_PROPRIETARY || driver_id == VK_DRIVER_ID_MESA_TURNIP) {
+        if (SkipsHostSync()) {
             pending_sync.clear();
             sync_values_stash.clear();
             return;
@@ -355,6 +381,10 @@ public:
                 sync_value_slot = 1;
             }
             query->flags |= VideoCommon::QueryFlagBits::IsHostSynced;
+            if (query->guest_address == 0) {
+                // A carry (CloseCounter) syncs only the accumulated count.
+                continue;
+            }
             auto loc_data = offsets[query->start_bank_id];
             sync_values_stash[sync_value_slot].emplace_back(HostSyncValues{
                 .address = query->guest_address,
@@ -467,6 +497,13 @@ public:
     }
 
 private:
+    // These drivers don't sync reports on the GPU.
+    bool SkipsHostSync() const {
+        const auto driver_id = device.GetDriverID();
+        return driver_id == VK_DRIVER_ID_QUALCOMM_PROPRIETARY ||
+               driver_id == VK_DRIVER_ID_ARM_PROPRIETARY || driver_id == VK_DRIVER_ID_MESA_TURNIP;
+    }
+
     template <typename Func>
     void ApplyBankOp(VideoCommon::HostQueryBase* query, Func&& func) {
         size_t size_slots = query->size_slots;
@@ -668,7 +705,7 @@ private:
     bool accumulation_since_last_sync{};
     VideoCommon::HostQueryBase* current_query;
     bool has_started{};
-    u64 bank_bound_resets{}; ///< Counts CloseCounter dropped once a query outgrew the bank bound.
+    u64 carried_queries{}; ///< Queries CloseCounter carried once they outgrew the bank bound.
     std::mutex flush_guard;
     std::optional<QueriesPrefixScanPass> queries_prefix_scan_pass;
 };
