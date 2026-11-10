@@ -3472,6 +3472,10 @@ private:
     void FrontWrite(VideoCommon::GpuSplit& split, FrontState& state, u32 method, u32 argument,
                     bool is_last_call, bool from_macro);
     void FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split, FrontState& state);
+    /// Whether the macro at `method` is NVN's conditional render, which DMA-reads six Compare
+    /// words and only sets render_enable.mode from them as IfNotEqual does (dry runs on copies,
+    /// cached per macro and code generation; EDEN_NX2_COND_RENDER_ON_BACK).
+    bool IsPredicateMacro(FrontState& fs, u32 method);
     void FrontTrackInstanceLoop(FrontState& state, u32 method, u32 value);
     bool FrontSkipsLoopWrite(FrontState& state, u32 method, u32 value, bool shadow_kept);
     void FrontNoteMemoryWrite(VideoCommon::GpuSplit& split, FrontState& state, u32 method,
