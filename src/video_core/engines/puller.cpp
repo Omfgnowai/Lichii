@@ -381,6 +381,26 @@ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
             return false;
         }
         pending_acquire->last_drain = now;
+        // EDEN_NX2_ACQUIRE_VALVE_HOOK=1: the valve has the back run its idle hook (submit what
+        // the host GPU writes) without the front waiting for it; it drains only once the acquire
+        // waited EDEN_NX2_ACQUIRE_VALVE_DRAIN_US (8000). In Ocarina of Time ~97% of the valve's
+        // drains found the word still unmet: the release comes from another channel's later work.
+        static const bool valve_hook = [] {
+            const char* value = std::getenv("EDEN_NX2_ACQUIRE_VALVE_HOOK");
+            return value != nullptr && value[0] == '1';
+        }();
+        static const auto valve_drain_after = [] {
+            const char* value = std::getenv("EDEN_NX2_ACQUIRE_VALVE_DRAIN_US");
+            const long long us = value != nullptr ? std::strtoll(value, nullptr, 10) : 8000;
+            return std::chrono::microseconds{std::clamp<long long>(us, 0, 2'000'000)};
+        }();
+        if (auto& split = VideoCommon::GpuSplit::Get();
+            valve_hook && split.Active() && now - pending_acquire->since < valve_drain_after) {
+            split.Publish();
+            split.RequestIdleHook();
+            VideoCommon::Count(stats.polls);
+            return false;
+        }
         VideoCommon::Count(stats.valve_drains);
         valve_drain = true;
         break;
