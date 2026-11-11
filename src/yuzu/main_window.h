@@ -362,6 +362,9 @@ private slots:
     void OnGameListSetPlayTime(u64 program_id);
     void OnGameListDumpRomFS(u64 program_id, const std::string& game_path, DumpRomFSTarget target);
     void OnGameListPrepareShadersFromRecipe(u64 program_id, const std::string& game_path);
+    void MaybePrepareBundledRecipe(u64 program_id, const std::string& game_path);
+    void PrepareShadersFromRecipeFile(u64 program_id, const std::string& game_path,
+                                      const QString& recipe_path);
     void OnGameListVerifyIntegrity(const std::string& game_path);
     void OnGameListConvertToNup(const std::string& game_path);
     void OnGameListPrepareShaderWarm(u64 program_id, const std::string& game_path);

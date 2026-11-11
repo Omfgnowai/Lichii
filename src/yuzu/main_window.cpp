@@ -2649,6 +2649,7 @@ void MainWindow::UpdateRecentFiles() {
 }
 
 void MainWindow::OnGameListLoadFile(QString game_path, u64 program_id) {
+    MaybePrepareBundledRecipe(program_id, game_path.toStdString());
     auto params = ApplicationAppletParameters();
     params.program_id = program_id;
 
@@ -3064,13 +3065,82 @@ void MainWindow::OnGameListDumpRomFS(u64 program_id, const std::string& game_pat
 // A precompile recipe (video_core/nx2_recipe.h) and the game's own shader programs give this
 // build's precompiled pipeline file, prepared at the game's next boot.
 void MainWindow::OnGameListPrepareShadersFromRecipe(u64 program_id, const std::string& game_path) {
-    const QString title = tr("Prepare Precompiled Shaders");
+    // Builds that ship recipes keep them in "recipes" beside the executable.
+    QString start_dir = QCoreApplication::applicationDirPath() + QStringLiteral("/recipes");
+    if (!QDir(start_dir).exists()) {
+        start_dir.clear();
+    }
     const QString recipe_path = QFileDialog::getOpenFileName(
-        this, tr("Select Precompile Recipe"), {},
+        this, tr("Select Precompile Recipe"), start_dir,
         tr("Precompile recipe (*.nx2recipe);;All files (*.*)"));
     if (recipe_path.isEmpty()) {
         return;
     }
+    PrepareShadersFromRecipeFile(program_id, game_path, recipe_path);
+}
+
+// Before a game's first boot without a precompiled pipeline file, offers the recipe for it that
+// ships in "recipes" beside the executable, once (declining leaves a marker in its shader folder).
+void MainWindow::MaybePrepareBundledRecipe(u64 program_id, const std::string& game_path) {
+    if (program_id == 0) {
+        return;
+    }
+    const auto shader_dir = Common::FS::GetEdenPath(Common::FS::EdenPath::ShaderDir) /
+                            fmt::format("{:016x}", program_id);
+    const auto declined = shader_dir / "bundled_recipe_declined";
+    std::error_code error;
+    if (std::filesystem::exists(shader_dir / fmt::format("precompiled.fork-v{}.nx2prep",
+                                                         VideoCommon::VulkanPipelineCacheVersion),
+                                error) ||
+        std::filesystem::exists(declined, error)) {
+        return;
+    }
+    const std::filesystem::path recipe_dir{
+        (QCoreApplication::applicationDirPath() + QStringLiteral("/recipes")).toStdU16String()};
+    if (!std::filesystem::is_directory(recipe_dir, error)) {
+        return;
+    }
+    QString match;
+    for (const auto& entry : std::filesystem::directory_iterator(recipe_dir, error)) {
+        if (entry.path().extension() != ".nx2recipe") {
+            continue;
+        }
+        Common::FS::IOFile file{entry.path(), Common::FS::FileAccessMode::Read,
+                                Common::FS::FileType::BinaryFile};
+        std::vector<u8> recipe(file.IsOpen() ? file.GetSize() : 0);
+        if (recipe.empty() || file.ReadSpan(std::span<u8>{recipe}) != recipe.size()) {
+            continue;
+        }
+        if (const auto header = VideoCommon::Nx2Recipe::ReadHeader(recipe);
+            header && header->title_id == program_id) {
+            match = QString::fromStdU16String(entry.path().u16string());
+            break;
+        }
+    }
+    if (match.isEmpty()) {
+        return;
+    }
+    const auto answer = QMessageBox::question(
+        this, tr("Prepare Precompiled Shaders"),
+        tr("This build includes a shader recipe for this game. Prepare its shaders now?\n\n"
+           "This reads the game's shaders (about a minute); then the game starts and compiles them "
+           "once during its loading screen (a few minutes). Later starts skip this, and most "
+           "first-visit shader stutter is gone.\n\n"
+           "If you choose No, you can still do it later from the game's right-click menu "
+           "(Prepare Precompiled Shaders from Recipe...)."));
+    if (answer != QMessageBox::Yes) {
+        if (Common::FS::CreateDirs(shader_dir)) {
+            Common::FS::IOFile marker{declined, Common::FS::FileAccessMode::Write,
+                                      Common::FS::FileType::TextFile};
+        }
+        return;
+    }
+    PrepareShadersFromRecipeFile(program_id, game_path, match);
+}
+
+void MainWindow::PrepareShadersFromRecipeFile(u64 program_id, const std::string& game_path,
+                                              const QString& recipe_path) {
+    const QString title = tr("Prepare Precompiled Shaders");
     std::vector<u8> recipe;
     {
         Common::FS::IOFile file{recipe_path.toStdString(), Common::FS::FileAccessMode::Read,

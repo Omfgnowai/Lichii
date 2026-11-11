@@ -32,12 +32,16 @@ Shader pre-loading (recommended, one time)
 The folder "recipes" holds an OoT precompile recipe (made by the Fritchii project,
 github.com/Frizti/Fritchii). A recipe contains no game code: it is combined with the shader
 programs from your own copy of the game.
-1. In Lichii's game list, right-click Ocarina of Time > "Prepare Precompiled Shaders from Recipe...".
-2. Pick recipes\OoT v131072 (cache v54).nx2recipe.
-3. Start the game. The first boot prepares the shaders (a few minutes, with a progress screen);
-   later boots skip it. This removes almost all first-visit shader stutter.
-The recipe is for game version v131072 (the current update). With another version some
-pipelines are missing and are compiled during play as usual.
+- The first time you start Ocarina of Time from the game list, Lichii asks whether to prepare
+  the shaders from it. Choose Yes: it reads the game's shaders (about a minute), then the game
+  compiles them once during its loading screen (a few minutes). Later starts skip this, and
+  almost all first-visit shader stutter is gone.
+- If you said No, or want to redo it: right-click the game > "Prepare Precompiled Shaders from
+  Recipe..." and pick recipes\OoT v131072 (cache v54).nx2recipe.
+- The recipe is for game version v131072 (the current update). With another version some
+  pipelines are missing and are compiled during play as usual.
+- NVIDIA: set "Shader Cache Size" to Unlimited in the NVIDIA Control Panel, or the driver keeps
+  only part of the compiled shaders.
 
 Recommended settings
 --------------------
@@ -46,8 +50,23 @@ Recommended settings
 - Pin GPU threads: on. Docked mode. VRAM usage: Aggressive.
 - Per-game "Frame rate limit (Switch 2)": 120 (or your refresh rate). Frame generation off while
   you judge native fps.
-- NVIDIA: set "Shader Cache Size" to Unlimited in the NVIDIA Control Panel.
 - Logging: set the log filter to *:Warning (or *:Error) for play; *:Info costs some CPU.
+
+Switching between this build and the main Lichii build
+------------------------------------------------------
+- Both use the same user folder (%APPDATA%\eden): settings, keys, mods and saves are shared.
+  Game saves are not changed by this build.
+- Shader caches live side by side in %APPDATA%\eden\cache\shader\0400486024dec000. This build
+  uses vulkan.fork-v54.bin and the precompiled files (precompiled.fork-v54.nx2prep, about
+  1.5 GB, plus precompiled_infos / precompiled_prepared). The main build uses lichii-cache.v2.bin
+  and, the first time, imports from vulkan.fork-v54.bin (read only). A few small files
+  (vulkan_static_pipelines.bin, precache-graphics.bin) are rewritten by whichever build ran
+  last, so the first start after switching may compile a bit more. If you switch often, back up
+  that folder first.
+- Features only in this build: the Pickup Counter Fix (in the main build the item count-up
+  stalls above 60 fps), the Hold 60 FPS hotkey, and shader preparation from a recipe.
+- Don't run both builds at the same time.
+- To remove this build's extra files: delete the precompiled.* files in the folder above.
 
 Known issues above 60 fps (game-side, from FPS Unlock)
 ------------------------------------------------------
