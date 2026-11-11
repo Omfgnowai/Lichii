@@ -4,7 +4,9 @@
 // SPDX-FileCopyrightText: 2022 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
 
 #include "common/assert.h"
@@ -327,8 +329,14 @@ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
             VideoCommon::Count(stats.latched);
             return true;
         }
+        // EDEN_NX2_ACQUIRE_VALVE_US: how long an unmet acquire polls before it drains (1000).
+        static const auto valve = [] {
+            const char* value = std::getenv("EDEN_NX2_ACQUIRE_VALVE_US");
+            const long long us = value != nullptr ? std::strtoll(value, nullptr, 10) : 1000;
+            return std::chrono::microseconds{std::clamp<long long>(us, 0, 100'000)};
+        }();
         const auto now = std::chrono::steady_clock::now();
-        if (now - pending_acquire->last_drain < std::chrono::milliseconds{1}) {
+        if (now - pending_acquire->last_drain < valve) {
             VideoCommon::Count(stats.polls);
             VerifyWithoutDrain(dma_pusher, *pending_acquire, check);
             return false;
