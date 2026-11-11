@@ -3153,7 +3153,16 @@ void RasterizerVulkan::DispatchCompute() {
 }
 
 void RasterizerVulkan::ResetCounter(VideoCommon::QueryType type) {
+    // Counters are B's (it begins and ends them around its draws): with B on its own thread the
+    // reset runs there, in order with the packets.
+    if (DeferToStageB([this, type] { ResetCounterNow(type); })) {
+        return;
+    }
     VideoCommon::DrawStages::JoinB(VideoCommon::DrawStages::Join::QueryCache);
+    ResetCounterNow(type);
+}
+
+void RasterizerVulkan::ResetCounterNow(VideoCommon::QueryType type) {
     switch (type) {
     case VideoCommon::QueryType::ZPassPixelCount64:
     case VideoCommon::QueryType::StreamingByteCount:
@@ -3169,6 +3178,15 @@ void RasterizerVulkan::ResetCounter(VideoCommon::QueryType type) {
 
 void RasterizerVulkan::Query(GPUVAddr gpu_addr, VideoCommon::QueryType type,
                              VideoCommon::QueryPropertiesFlags flags, u32 payload, u32 subreport) {
+    // A report that isn't a fence touches only the query cache and B's command buffer: with B on
+    // its own thread it runs there, in order with the packets. Fences keep the join (they reach
+    // the texture cache and may submit).
+    if (False(flags & VideoCommon::QueryPropertiesFlags::IsAFence) && DeferQueries() &&
+        DeferToStageB([this, gpu_addr, type, flags, payload, subreport] {
+            query_cache.CounterReport(gpu_addr, type, flags, payload, subreport);
+        })) {
+        return;
+    }
     VideoCommon::DrawStages::JoinB(VideoCommon::DrawStages::Join::QueryCache);
     VideoCommon::DrawStages::NoteGpuWrite(
         VideoCommon::DrawStages::Join::Query, *gpu_memory, gpu_addr,
@@ -3460,6 +3478,15 @@ void RasterizerVulkan::OnCacheInvalidations(std::span<const std::pair<DAddr, u64
     for (const auto& [addr, size] : ranges) {
         OnCacheInvalidation(addr, size);
     }
+}
+
+bool RasterizerVulkan::DeferQueries() {
+    // EDEN_NX2_BACK_STAGES_QUERIES=0: reports join B as before.
+    static const bool defer = [] {
+        const char* value = std::getenv("EDEN_NX2_BACK_STAGES_QUERIES");
+        return value == nullptr || value[0] != '0';
+    }();
+    return defer;
 }
 
 bool RasterizerVulkan::DeferToStageB(std::function<void()>&& callback) {
