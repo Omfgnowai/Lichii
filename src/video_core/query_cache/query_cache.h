@@ -367,6 +367,11 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
         if (!mirrored && counter_type == QueryType::Payload) {
             shadow.NoteDirectRelease(cpu_addr, addr);
         }
+        if (counter_type != QueryType::Payload && !mirrored &&
+            Tegra::Nx2SettledReports::Enabled()) {
+            Tegra::Nx2SettledReports::Get().Note(
+                cpu_addr, pointer, True(query_base->flags & QueryFlagBits::HasTimestamp) ? 16 : 4);
+        }
         Tegra::Nx2SemaphoreWaiters::Get().OnWrite(cpu_addr, static_cast<u32>(query_base->value));
         if (const u64 trace = QueryTrace::Sample(QueryTrace::Event::Write)) {
             const bool wide = True(query_base->flags & QueryFlagBits::HasTimestamp);

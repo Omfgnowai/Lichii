@@ -6,6 +6,8 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstdlib>
+#include <cstring>
 #include <functional>
 #include <map>
 #include <mutex>
@@ -187,6 +189,65 @@ inline bool Nx2InSemaphoreFirstPage(u64 address) {
 /// those words go to this table instead, and only GPU acquires read it. Words only the mirror
 /// writes keep getting guest memory writes. Keyed by device word address. Ported from
 /// jpasqui/Eglantine f8941169650 and ca73069b2e.
+/// EDEN_NX2_STALE_REPORT_READS=1 (experiment): the words each counter report (occlusion and other
+/// counts) wrote once its host query completed, by device address. A macro's read of a report whose
+/// newer value is still in flight then takes the last completed one instead of waiting for the GPU
+/// threads and the host GPU to finish everything before it.
+class Nx2SettledReports {
+public:
+    static Nx2SettledReports& Get() {
+        static Nx2SettledReports instance;
+        return instance;
+    }
+
+    [[nodiscard]] static bool Enabled() {
+        static const bool on = [] {
+            const char* value = std::getenv("EDEN_NX2_STALE_REPORT_READS");
+            return value != nullptr && value[0] == '1';
+        }();
+        return on;
+    }
+
+    /// A completed report wrote `bytes` (a multiple of 4, at most 16) at `device`.
+    void Note(u64 device, const u8* data, size_t bytes) {
+        std::scoped_lock lock{mutex};
+        if (records.size() >= MaxRecords) {
+            records.clear();
+        }
+        for (size_t offset = 0; offset + 4 <= bytes; offset += 4) {
+            const u64 word = device + offset;
+            Record& record = records[word & ~u64{15}];
+            const size_t index = (word & 15) / 4;
+            std::memcpy(&record.words[index], data + offset, sizeof(u32));
+            record.valid |= u8(1U << index);
+        }
+    }
+
+    /// The last completed words at [device, device + words * 4); false unless every one is known.
+    [[nodiscard]] bool Read(u64 device, u32* out, u32 words) const {
+        std::scoped_lock lock{mutex};
+        for (u32 i = 0; i < words; ++i) {
+            const u64 word = device + u64{i} * 4;
+            const auto it = records.find(word & ~u64{15});
+            const size_t index = (word & 15) / 4;
+            if (it == records.end() || (it->second.valid & (1U << index)) == 0) {
+                return false;
+            }
+            out[i] = it->second.words[index];
+        }
+        return true;
+    }
+
+private:
+    static constexpr size_t MaxRecords = size_t{1} << 16;
+    struct Record {
+        std::array<u32, 4> words{};
+        u8 valid{};
+    };
+    mutable std::mutex mutex;
+    std::unordered_map<u64, Record> records;
+};
+
 class Nx2MirrorShadow {
 public:
     static Nx2MirrorShadow& Get() {

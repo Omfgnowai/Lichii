@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <atomic>
 #include <cstring>
 #include <limits>
@@ -1716,12 +1717,54 @@ bool Maxwell3D::FrontContiguous(GPUVAddr address, u64 size, u64 device) const {
     return true;
 }
 
+namespace {
+// How the front's macro reads of memory went, logged every 10 s while they happen: answered without
+// a drain (after waiting for queued compute/copy work or not), from the last completed reports
+// (EDEN_NX2_STALE_REPORT_READS), or drained, by the reason ReadReportWordsQueued gave up.
+struct MacroReadOutcomes {
+    enum : size_t { Fast, FastAfterWriters, Stale, FailBase, Count = FailBase + 6 };
+    std::array<u64, Count> counts{};
+    std::chrono::steady_clock::time_point last{};
+
+    void Add(size_t outcome) {
+        ++counts[outcome];
+        if ((++calls & 1023) != 0) {
+            return;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (last == std::chrono::steady_clock::time_point{}) {
+            last = now;
+            return;
+        }
+        if (now - last < std::chrono::seconds{10}) {
+            return;
+        }
+        last = now;
+        LOG_INFO(HW_GPU,
+                 "Macro report reads in 10 s: {} without a drain ({} of them after waiting for "
+                 "queued compute/copy), {} from the last completed reports; drained: {} empty, {} "
+                 "not report memory, {} GPU-written page, {} counter report in flight, {} fence "
+                 "release landing, {} queued write not tracked",
+                 counts[Fast] + counts[FastAfterWriters], counts[FastAfterWriters], counts[Stale],
+                 counts[FailBase], counts[FailBase + 1], counts[FailBase + 2],
+                 counts[FailBase + 3], counts[FailBase + 4], counts[FailBase + 5]);
+        counts = {};
+    }
+    u64 calls{};
+};
+thread_local MacroReadOutcomes t_macro_reads;
+} // namespace
+
 bool ReadReportWordsQueued(MemoryManager& memory_manager, VideoCommon::GpuSplit& split,
                            GPUVAddr source, u32* out, u32 words, VideoCommon::DrainSite site,
                            u32* bail) {
-    const auto fail = [bail](u32 reason) {
+    const bool macro = site == VideoCommon::DrainSite::MacroDmaRead;
+    const auto fail = [bail, macro](u32 reason) {
         if (bail != nullptr) {
             *bail = reason;
+        }
+        if (macro) {
+            t_macro_reads.Add(MacroReadOutcomes::FailBase + reason);
         }
         return false;
     };
@@ -1741,7 +1784,7 @@ bool ReadReportWordsQueued(MemoryManager& memory_manager, VideoCommon::GpuSplit&
     }
     // Queued compute and copy work can write any page, and the back marks the pages GPU-written
     // only once it runs it.
-    split.WaitForWriters(site);
+    const bool waited_for_writers = split.WaitForWriters(site);
     // Every page where a contiguous device range puts it: the queued-write checks look at
     // [*device, *device + read_bytes).
     for (GPUVAddr page = source & ~GPUVAddr{0xfff}; page < source + read_bytes; page += 0x1000) {
@@ -1755,6 +1798,13 @@ bool ReadReportWordsQueued(MemoryManager& memory_manager, VideoCommon::GpuSplit&
     if (const u64 async_position = split.HasAsyncWrite(*device, read_bytes);
         async_position != 0 && (async_position > split.ConsumedNow() ||
                                 !Tegra::Nx2AsyncReportsSettled(*device, read_bytes))) {
+        // A counter report to these words is still in flight. A macro may take the last
+        // completed result (one report behind) rather than waiting for the GPU.
+        if (macro && Tegra::Nx2SettledReports::Enabled() &&
+            Tegra::Nx2SettledReports::Get().Read(*device, out, words)) {
+            t_macro_reads.Add(MacroReadOutcomes::Stale);
+            return true;
+        }
         return fail(3);
     }
     const u64 since = split.ConsumedNow();
@@ -1771,6 +1821,10 @@ bool ReadReportWordsQueued(MemoryManager& memory_manager, VideoCommon::GpuSplit&
             return fail(5);
         }
         memory_manager.ReadBlockUnsafe(source, out, read_bytes);
+    }
+    if (macro) {
+        t_macro_reads.Add(waited_for_writers ? MacroReadOutcomes::FastAfterWriters
+                                             : MacroReadOutcomes::Fast);
     }
     return true;
 }
