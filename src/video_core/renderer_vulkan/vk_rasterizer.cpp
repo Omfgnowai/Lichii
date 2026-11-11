@@ -3182,10 +3182,29 @@ void RasterizerVulkan::Query(GPUVAddr gpu_addr, VideoCommon::QueryType type,
     // its own thread it runs there, in order with the packets. Fences keep the join (they reach
     // the texture cache and may submit).
     if (False(flags & VideoCommon::QueryPropertiesFlags::IsAFence) && DeferQueries() &&
-        DeferToStageB([this, gpu_addr, type, flags, payload, subreport] {
-            query_cache.CounterReport(gpu_addr, type, flags, payload, subreport);
-        })) {
-        return;
+        back_ring && VideoCommon::DrawStages::OwnsRing()) {
+        if (type == VideoCommon::QueryType::ZPassPixelCount64) {
+            // The report is unsettled from now (the split's front checks this before it reads
+            // report memory), not only once B issues it.
+            if (const auto cpu_addr = gpu_memory->GpuToCpuAddress(gpu_addr)) {
+                auto& issued =
+                    Tegra::g_nx2_async_reports_issued[Tegra::Nx2AsyncReportSlot(*cpu_addr)];
+                issued.fetch_add(1, std::memory_order_release);
+                if (DeferToStageB([this, gpu_addr, type, flags, payload, subreport, &issued] {
+                        query_cache.CounterReport(gpu_addr, type, flags, payload, subreport);
+                        issued.fetch_sub(1, std::memory_order_release);
+                    })) {
+                    return;
+                }
+                issued.fetch_sub(1, std::memory_order_release);
+            }
+        } else if (type == VideoCommon::QueryType::Payload &&
+                   !VideoCommon::DrawStages::FrontWaitsForA() &&
+                   DeferToStageB([this, gpu_addr, type, flags, payload, subreport] {
+                       query_cache.CounterReport(gpu_addr, type, flags, payload, subreport);
+                   })) {
+            return;
+        }
     }
     VideoCommon::DrawStages::JoinB(VideoCommon::DrawStages::Join::QueryCache);
     VideoCommon::DrawStages::NoteGpuWrite(
@@ -3640,14 +3659,17 @@ void RasterizerVulkan::WaitForIdle() {
 }
 
 void RasterizerVulkan::FragmentBarrier() {
-    VideoCommon::DrawStages::JoinB(VideoCommon::DrawStages::Join::Barrier);
+    // With B on its own thread the barrier goes to the packet list (SpliceOp::DeferFragmentBarrier)
+    // and A's reuse checks already assume a pending one (g_threaded): no join needed.
+    if (!back_ring || !VideoCommon::DrawStages::OwnsRing()) {
+        VideoCommon::DrawStages::JoinB(VideoCommon::DrawStages::Join::Barrier);
+    }
     // The next draw breaks the render pass only if it reads what this one wrote (#161): Ocarina
     // ended ~5,900 render passes a second here.
     scheduler.DeferFragmentBarrier();
 }
 
 void RasterizerVulkan::TiledCacheBarrier() {
-    VideoCommon::DrawStages::JoinB(VideoCommon::DrawStages::Join::Barrier);
     // TODO: Implementing tiled barriers requires rewriting a good chunk of the Vulkan backend
 }
 
