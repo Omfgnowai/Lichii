@@ -1067,8 +1067,20 @@ bool Scheduler::DeferToList(SpliceOp op) {
     return true;
 }
 
+bool Scheduler::DeferCallback(std::function<void()>&& callback) {
+    if (Capturing() == nullptr) {
+        return false;
+    }
+    t_capture->ops.push_back({t_capture->count, SpliceOp::Callback,
+                              static_cast<u32>(t_capture->callbacks.size())});
+    t_capture->callbacks.push_back(std::move(callback));
+    return true;
+}
+
 void Scheduler::ApplySpliceOp(const ListOp& list_op) {
     switch (list_op.op) {
+    case SpliceOp::Callback:
+        break;
     case SpliceOp::EndRenderPass:
         EndRenderPass();
         break;
@@ -1096,7 +1108,16 @@ void Scheduler::SpliceList(PacketList& list) {
     u32 index = 0;
     const auto apply_ops = [&](u32 position) {
         while (next_op < list.ops.size() && list.ops[next_op].index <= position) {
-            ApplySpliceOp(list.ops[next_op++]);
+            const ListOp& op = list.ops[next_op++];
+            if (op.op == SpliceOp::Callback) {
+                // Moved out first: a callback can join, which splices this list again.
+                auto callback = std::move(list.callbacks[op.callback]);
+                if (callback) {
+                    callback();
+                }
+            } else {
+                ApplySpliceOp(op);
+            }
         }
     };
     list.commands->TakeAll([&](Command& command) {
@@ -1140,6 +1161,7 @@ void Scheduler::SpliceList(PacketList& list) {
     }
     list.count = 0;
     list.ops.clear();
+    list.callbacks.clear();
     list.pending.clear();
     t_capture = saved;
 }

@@ -3386,7 +3386,15 @@ void RasterizerVulkan::InnerInvalidation(std::span<const std::pair<DAddr, std::s
     if (Settings::values.skip_cpu_inner_invalidation.GetValue()) {
         return;
     }
-    {
+    // With stage B on its own thread the buffer cache is B's: the invalidation runs there, in
+    // order with the packets, instead of a join at every draw (constant buffer data).
+    if (!DeferToStageB([this, ranges = std::vector<std::pair<DAddr, std::size_t>>(
+                                  sequences.begin(), sequences.end())] {
+            std::scoped_lock lock{buffer_cache.mutex};
+            for (const auto& [addr, size] : ranges) {
+                buffer_cache.WriteMemory(addr, size);
+            }
+        })) {
         std::scoped_lock lock{buffer_cache.mutex};
         for (const auto& [addr, size] : sequences) {
             buffer_cache.WriteMemory(addr, size);
@@ -3419,6 +3427,30 @@ bool RasterizerVulkan::OnCPUWrite(DAddr addr, u64 size) {
 }
 
 void RasterizerVulkan::OnCacheInvalidations(std::span<const std::pair<DAddr, u64>> ranges) {
+    // Stage B on its own thread: the buffer cache's part runs on B in order with the packets.
+    const bool deferred = DeferToStageB(
+        [this, writes = std::vector<std::pair<DAddr, u64>>(ranges.begin(), ranges.end())] {
+            std::scoped_lock lock{buffer_cache.mutex};
+            buffer_cache.ClaimCpuWrites(writes);
+            for (const auto& [addr, size] : writes) {
+                if (addr != 0 && size != 0) {
+                    buffer_cache.WriteMemory(addr, size);
+                }
+            }
+        });
+    if (deferred) {
+        for (const auto& [addr, size] : ranges) {
+            if (addr == 0 || size == 0) {
+                continue;
+            }
+            {
+                std::scoped_lock lock{texture_cache.mutex};
+                texture_cache.WriteMemory(addr, size);
+            }
+            pipeline_cache.InvalidateRegion(addr, size);
+        }
+        return;
+    }
     // Out of the GPU-written ranges first: applying one write downloads the GPU's bytes elsewhere
     // on its pages (WriteMemory), which would write over the next collected write.
     {
@@ -3428,6 +3460,11 @@ void RasterizerVulkan::OnCacheInvalidations(std::span<const std::pair<DAddr, u64
     for (const auto& [addr, size] : ranges) {
         OnCacheInvalidation(addr, size);
     }
+}
+
+bool RasterizerVulkan::DeferToStageB(std::function<void()>&& callback) {
+    return back_ring && VideoCommon::DrawStages::OwnsRing() &&
+           scheduler.DeferCallback(std::move(callback));
 }
 
 void RasterizerVulkan::OnCacheInvalidation(DAddr addr, u64 size) {
