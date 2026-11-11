@@ -149,6 +149,7 @@ void GpuSplit::Stop() {
     last_writer_position = 0;
     pending_write_count = 0;
     async_writes.clear();
+    async_kinds.clear();
     fence_writes.clear();
     report_pages.clear();
     last_sync_position = 0;
@@ -250,6 +251,10 @@ void GpuSplit::Drain(DrainSite site) {
         }
         Backoff(spins, write_position);
     }
+}
+
+u64 GpuSplit::GpuTicks() const {
+    return system->GPU().GetTicks();
 }
 
 bool GpuSplit::WaitForWriters(DrainSite site) {

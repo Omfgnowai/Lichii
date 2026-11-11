@@ -1654,7 +1654,16 @@ void Maxwell3D::FrontNoteMemoryWrite(VideoCommon::GpuSplit& split, FrontState& f
             // Counters and timed releases are written when the host query completes, not when
             // the back runs them: reads of these bytes wait until the back ran the report and
             // the host query completed.
-            split.NoteAsyncWrite(*device, 16);
+            const bool timed_payload =
+                query_regs.query.operation == Regs::ReportSemaphore::Operation::Release &&
+                query_regs.query.report == Regs::ReportSemaphore::Report::Payload;
+            split.NoteAsyncWrite(
+                *device, 16,
+                timed_payload
+                    ? VideoCommon::GpuSplit::AsyncKindTimedPayload | fs.regs[base + 2]
+                    : u64{(static_cast<u32>(query_regs.query.report.Value()) + 1) |
+                          (static_cast<u32>(query_regs.query.operation.Value()) << 8)}
+                          << 32);
             split.NoteMemoryWrite(*device, 16, "3D report");
         }
         return;
@@ -1722,7 +1731,18 @@ namespace {
 // a drain (after waiting for queued compute/copy work or not), from the last completed reports
 // (EDEN_NX2_STALE_REPORT_READS), or drained, by the reason ReadReportWordsQueued gave up.
 struct MacroReadOutcomes {
-    enum : size_t { Fast, FastAfterWriters, Stale, FailBase, Count = FailBase + 6 };
+    enum : size_t {
+        Fast,
+        FastAfterWriters,
+        Stale,
+        TimedRelease,
+        InFlightTimedQueued,
+        InFlightTimedRan,
+        InFlightCounterQueued,
+        InFlightCounterRan,
+        FailBase,
+        Count = FailBase + 6
+    };
     std::array<u64, Count> counts{};
     std::chrono::steady_clock::time_point last{};
 
@@ -1744,10 +1764,15 @@ struct MacroReadOutcomes {
                  "Macro report reads in 10 s: {} without a drain ({} of them after waiting for "
                  "queued compute/copy), {} from the last completed reports; drained: {} empty, {} "
                  "not report memory, {} GPU-written page, {} counter report in flight, {} fence "
-                 "release landing, {} queued write not tracked",
+                 "release landing, {} queued write not tracked; in flight: timed releases {} "
+                 "queued / {} ran, counter reports {} queued / {} ran; {} timed releases answered "
+                 "on the front",
                  counts[Fast] + counts[FastAfterWriters], counts[FastAfterWriters], counts[Stale],
                  counts[FailBase], counts[FailBase + 1], counts[FailBase + 2],
-                 counts[FailBase + 3], counts[FailBase + 4], counts[FailBase + 5]);
+                 counts[FailBase + 3], counts[FailBase + 4], counts[FailBase + 5],
+                 counts[InFlightTimedQueued], counts[InFlightTimedRan],
+                 counts[InFlightCounterQueued], counts[InFlightCounterRan],
+                 counts[TimedRelease]);
         counts = {};
     }
     u64 calls{};
@@ -1798,12 +1823,51 @@ bool ReadReportWordsQueued(MemoryManager& memory_manager, VideoCommon::GpuSplit&
     if (const u64 async_position = split.HasAsyncWrite(*device, read_bytes);
         async_position != 0 && (async_position > split.ConsumedNow() ||
                                 !Tegra::Nx2AsyncReportsSettled(*device, read_bytes))) {
-        // A counter report to these words is still in flight. A macro may take the last
-        // completed result (one report behind) rather than waiting for the GPU.
-        if (macro && Tegra::Nx2SettledReports::Enabled() &&
-            Tegra::Nx2SettledReports::Get().Read(*device, out, words)) {
-            t_macro_reads.Add(MacroReadOutcomes::Stale);
-            return true;
+        // A report to these words is still in flight.
+        if (macro) {
+            const u64 kind = split.AsyncKind(*device);
+            const bool queued = async_position > split.ConsumedNow();
+            const bool timed = (kind & VideoCommon::GpuSplit::AsyncKindTimedPayload) != 0;
+            t_macro_reads.Add(timed ? (queued ? MacroReadOutcomes::InFlightTimedQueued
+                                              : MacroReadOutcomes::InFlightTimedRan)
+                                    : (queued ? MacroReadOutcomes::InFlightCounterQueued
+                                              : MacroReadOutcomes::InFlightCounterRan));
+            if (static u32 samples{}; samples < 48) {
+                ++samples;
+                u32 known[4]{};
+                LOG_INFO(HW_GPU,
+                         "Macro report read in flight: device {:#x}, {} words, kind {:#x}, {}, "
+                         "last completed report known: {}",
+                         *device, words, kind, queued ? "queued for the back" : "back ran it",
+                         Tegra::Nx2SettledReports::Get().Read(*device, known,
+                                                              (std::min)(words, 4U)));
+            }
+            // EDEN_NX2_TIMED_RELEASE_READS=1: a four-word payload release writes its known payload
+            // and the GPU's ticks when it runs; the front answers with the ticks of now.
+            static const bool timed_reads = [] {
+                const char* value = std::getenv("EDEN_NX2_TIMED_RELEASE_READS");
+                return value != nullptr && value[0] == '1';
+            }();
+            const u64 record = *device & ~u64{15};
+            if (timed && timed_reads && *device + read_bytes <= record + 16) {
+                std::array<u32, 4> words16{};
+                const u64 value = static_cast<u32>(kind);
+                const u64 ticks = split.GpuTicks();
+                std::memcpy(&words16[0], &value, sizeof(value));
+                std::memcpy(&words16[2], &ticks, sizeof(ticks));
+                for (u32 i = 0; i < words; ++i) {
+                    out[i] = words16[(*device - record) / 4 + i];
+                }
+                t_macro_reads.Add(MacroReadOutcomes::TimedRelease);
+                return true;
+            }
+            // A counter report: a macro may take the last completed result (one report behind)
+            // rather than waiting for the GPU.
+            if (!timed && Tegra::Nx2SettledReports::Enabled() &&
+                Tegra::Nx2SettledReports::Get().Read(*device, out, words)) {
+                t_macro_reads.Add(MacroReadOutcomes::Stale);
+                return true;
+            }
         }
         return fail(3);
     }

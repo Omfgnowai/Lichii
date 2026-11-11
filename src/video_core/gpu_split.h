@@ -294,12 +294,22 @@ public:
     bool WaitForWritesTo(u64 begin, u64 size);
     /// Front: a write that lands when a host query completes or a fence signals (counter
     /// reports, timed releases), not when the back runs it (Tegra::Nx2AsyncReportsSettled).
-    void NoteAsyncWrite(u64 begin, u64 size) {
+    void NoteAsyncWrite(u64 begin, u64 size, u64 kind = 0) {
         NoteReportWrite(begin, size);
         for (u64 slot = begin >> 4; slot <= (begin + size - 1) >> 4; ++slot) {
             async_writes[slot] = write_position;
+            async_kinds[slot] = (begin & 15) == 0 ? kind : 0;
         }
     }
+    /// Front: what the newest async write noted at the 16-byte slot of `begin` is: the report
+    /// and operation (+1, in the high 32 bits), AsyncKindTimedPayload with the payload in the low
+    /// 32 bits, or 0.
+    [[nodiscard]] u64 AsyncKind(u64 begin) const {
+        const auto it = async_kinds.find(begin >> 4);
+        return it != async_kinds.end() ? it->second : 0;
+    }
+    /// AsyncKind: a four-word (timed) payload release; its payload sits in the low 32 bits.
+    static constexpr u64 AsyncKindTimedPayload = u64{1} << 63;
     /// Front: a fence release with a known payload. Below GPU accuracy High the query cache writes
     /// it when its host fence signals, after the back ran it: reads overlay the payload while it
     /// is queued, and wait for the fence once the back ran it (Tegra::Nx2AsyncReportsSettled).
@@ -325,6 +335,8 @@ public:
         }
     }
     /// Front: the ring position of the newest async write noted to these bytes, or 0.
+    /// The system's GPU ticks (what a timed release writes).
+    [[nodiscard]] u64 GpuTicks() const;
     [[nodiscard]] u64 HasAsyncWrite(u64 begin, u64 size) const {
         return Newest(async_writes, begin, size);
     }
@@ -373,6 +385,7 @@ private:
     static constexpr u64 Direct = 1 << 6; ///< Method: call it even if not executable (macros)
 
     std::unordered_map<u64, u64> async_writes; ///< Front: 16-byte slot -> ring position
+    std::unordered_map<u64, u64> async_kinds;  ///< Front: 16-byte slot -> AsyncKind
     std::unordered_map<u64, u64> fence_writes; ///< Front: 16-byte slot -> ring position
     [[nodiscard]] static u64 Newest(const decltype(async_writes)& writes, u64 begin, u64 size) {
         u64 newest = 0;
