@@ -2027,7 +2027,7 @@ private:
         }();
         const bool mkw_dynamic =
             process != nullptr && process->GetProgramId() == Settings::MarioKartWorldProgramId &&
-            process->IsMkwDynamicFpsPatchApplied() && Settings::values.mkw_dynamic_fps.GetValue();
+            process->IsMkwDynamicFpsPatchApplied();
         u32 swap_interval = std::clamp<u32>(timing >> 16, 1, 4);
         if (mkw_dynamic) {
             swap_interval = 1;
