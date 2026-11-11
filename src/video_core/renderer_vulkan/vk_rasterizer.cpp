@@ -575,8 +575,13 @@ void RasterizerVulkan::ReportFastDraws() {
     if (now - stats.window_start < 10'000'000'000ULL) {
         return;
     }
-    // Logged only with EDEN_NX2_GPU_PROFILE or EDEN_NX2_FAST_DRAW_VERIFY.
-    if (!VideoCommon::Nx2Profile::Enabled() && !fast_draw_verify) {
+    // Logged only with EDEN_NX2_GPU_PROFILE, EDEN_NX2_FAST_DRAW_VERIFY or EDEN_NX2_FAST_DRAW_STATS=1
+    // (the counters run anyway; the last logs them without profiling's cost).
+    static const bool stats_wanted = [] {
+        const char* const value = std::getenv("EDEN_NX2_FAST_DRAW_STATS");
+        return value != nullptr && value[0] == '1';
+    }();
+    if (!VideoCommon::Nx2Profile::Enabled() && !fast_draw_verify && !stats_wanted) {
         stats = FastDrawStats{.window_start = now};
         return;
     }
