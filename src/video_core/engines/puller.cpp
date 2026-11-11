@@ -8,6 +8,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
+#include <mutex>
 
 #include "common/assert.h"
 #include "common/logging.h"
@@ -304,10 +305,48 @@ bool Puller::PendingAcquire::WaitsToReach() const {
     return static_cast<GpuSemaphoreOperation>(operation) == GpuSemaphoreOperation::AcquireGequal;
 }
 
+void Puller::NoteValveDrain(DmaPusher& dma_pusher, u32 before, u32 after) {
+    static std::atomic<u64> drains{}, met_before{}, met_after{}, latched{}, unmet{};
+    static std::atomic<u64> waited_us{};
+    static std::atomic<u32> samples{};
+    static std::mutex report_mutex;
+    static auto next_report = std::chrono::steady_clock::now() + std::chrono::seconds{10};
+    const bool was_met = pending_acquire->Matches(before);
+    const bool is_met = pending_acquire->Matches(after);
+    const bool is_latched = Nx2SemaphoreWaiters::Get().Latched(this);
+    const auto waited = std::chrono::steady_clock::now() - pending_acquire->since;
+    drains.fetch_add(1, std::memory_order_relaxed);
+    (was_met ? met_before : is_met ? met_after : is_latched ? latched : unmet)
+        .fetch_add(1, std::memory_order_relaxed);
+    waited_us.fetch_add(
+        static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(waited).count()),
+        std::memory_order_relaxed);
+    if (samples.fetch_add(1, std::memory_order_relaxed) < 48) {
+        const auto device = dma_pusher.memory_manager.GpuToCpuAddress(pending_acquire->address);
+        LOG_INFO(HW_GPU,
+                 "Acquire valve drain: channel {} semaphore {:#x} (device {:#x}) op {} value {:#x}; "
+                 "word {:#x} before the drain, {:#x} after, latched {}; waited {} us",
+                 dma_pusher.channel_state.bind_id, pending_acquire->address, device.value_or(0),
+                 pending_acquire->operation, pending_acquire->value, before, after, is_latched,
+                 std::chrono::duration_cast<std::chrono::microseconds>(waited).count());
+    }
+    std::scoped_lock lock{report_mutex};
+    if (const auto now = std::chrono::steady_clock::now(); now >= next_report) {
+        next_report = now + std::chrono::seconds{10};
+        const u64 total = drains.exchange(0);
+        LOG_INFO(HW_GPU,
+                 "Acquire valve drains in 10 s: {}; word already met before the drain {}, met "
+                 "after it {}, latched {}, still unmet {}; average wait at the drain {} us",
+                 total, met_before.exchange(0), met_after.exchange(0), latched.exchange(0),
+                 unmet.exchange(0), total != 0 ? waited_us.exchange(0) / total : 0);
+    }
+}
+
 bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
     if (!pending_acquire) {
         return true;
     }
+    bool valve_drain = false;
     auto& stats = VideoCommon::g_acquire_stats;
     switch (const AcquireCheck check = CheckWithoutDrain(dma_pusher, *pending_acquire); check) {
     case AcquireCheck::MetByQueued:
@@ -343,6 +382,7 @@ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
         }
         pending_acquire->last_drain = now;
         VideoCommon::Count(stats.valve_drains);
+        valve_drain = true;
         break;
     }
     case AcquireCheck::Drain:
@@ -355,10 +395,22 @@ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
         break;
     }
     VideoCommon::Count(stats.drained);
+    // EDEN_NX2_ACQUIRE_VALVE_LOG=1: what the valve's drains find (the word before and after).
+    static const bool valve_log = [] {
+        const char* value = std::getenv("EDEN_NX2_ACQUIRE_VALVE_LOG");
+        return value != nullptr && value[0] == '1';
+    }();
+    u32 before_drain = 0;
+    if (valve_log && valve_drain) {
+        before_drain = dma_pusher.memory_manager.Read<u32>(pending_acquire->address);
+    }
     // The release may still be queued for the split GPU thread's back half (and the caches
     // ReadSemaphoreWord asks are its state).
     DrainBack();
     const u32 current = ReadSemaphoreWord(dma_pusher, pending_acquire->address);
+    if (valve_log && valve_drain) {
+        NoteValveDrain(dma_pusher, before_drain, current);
+    }
     if (Nx2SemaphoreWaiters::Get().Latched(this)) {
         if (static std::atomic<u32> rescued{};
             !pending_acquire->Matches(current) && rescued.fetch_add(1) < 64) {

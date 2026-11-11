@@ -92,6 +92,8 @@ public:
         return pending_acquire.has_value();
     }
     [[nodiscard]] bool CanResumeAcquire(DmaPusher& dma_pusher);
+    /// EDEN_NX2_ACQUIRE_VALVE_LOG: what a drain by the 1 ms valve found.
+    void NoteValveDrain(DmaPusher& dma_pusher, u32 before, u32 after);
     /// Clears the pending acquire once it is met; false while the channel has to keep waiting.
     bool ResumeAcquire(DmaPusher& dma_pusher);
 
