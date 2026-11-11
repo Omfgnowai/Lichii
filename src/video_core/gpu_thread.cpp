@@ -82,6 +82,7 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
         std::chrono::nanoseconds pending_poll = MaxPendingPoll;
         bool waited = false;
         bool wait_woken = false;
+        auto wait_start = last_progress;
         auto& wake = Tegra::Nx2PendingWake::Get();
         auto& acquire_stats = VideoCommon::g_acquire_stats;
         // A channel moved or a command arrived after the thread waited: adapt the poll to how long
@@ -92,13 +93,21 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
             }
             waited = false;
             const auto wait = now - last_progress;
-            if (!wait_woken) {
-                VideoCommon::Count(wait <= pending_poll ? acquire_stats.front_found_polling
-                                                        : acquire_stats.front_found_late);
+            if (wait_woken) {
+                if (wait > MaxPendingPoll) {
+                    pending_poll = Common::NextPollWindow(pending_poll, wait, MaxPendingPoll);
+                }
+                return;
             }
-            if (!wait_woken || wait > MaxPendingPoll) {
-                pending_poll = Common::NextPollWindow(pending_poll, wait, MaxPendingPoll);
-            }
+            VideoCommon::Count(wait <= pending_poll ? acquire_stats.front_found_polling
+                                                    : acquire_stats.front_found_late);
+            // A timed-out wait only bounds when the channel moved: after the wait started. One
+            // that started within MaxPendingPoll ends there, so count the move as within it.
+            const std::chrono::nanoseconds moved_by =
+                wait_start - last_progress < MaxPendingPoll
+                    ? std::min<std::chrono::nanoseconds>(wait, MaxPendingPoll)
+                    : wait;
+            pending_poll = Common::NextPollWindow(pending_poll, moved_by, MaxPendingPoll);
         };
         namespace Profile = VideoCommon::Nx2Profile;
         auto& split = VideoCommon::GpuSplit::Get();
@@ -137,13 +146,17 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                     split.SettleIdleBack();
                     const auto now = std::chrono::steady_clock::now();
                     waited = true;
+                    wait_start = now;
                     if (now - last_progress < pending_poll) {
                         VideoCommon::Count(acquire_stats.front_polls);
                         wait_woken = wake.Poll(
                             std::min(now + PendingPollPeriod, last_progress + pending_poll));
                     } else {
+                        // Up to MaxPendingPoll, sleeps end there (see end_wait).
+                        const auto horizon = last_progress + MaxPendingPoll;
                         VideoCommon::Count(acquire_stats.front_sleeps);
-                        wait_woken = wake.Sleep(std::chrono::microseconds{500});
+                        wait_woken = wake.Sleep(now < horizon ? horizon - now
+                                                              : std::chrono::microseconds{500});
                     }
                     if (wait_woken) {
                         VideoCommon::Count(acquire_stats.front_woken);
