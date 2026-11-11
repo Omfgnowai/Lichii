@@ -244,6 +244,8 @@ private:
     /// (false, and nothing queued, otherwise).
     bool DeferToStageB(std::function<void()>&& callback);
     static bool ReleasesOnA();
+    static bool FenceReportsOnB();
+    u64 b_fence_reports{}; ///< Fence-flagged counter reports deferred to B
     bool ReleaseOnA(GPUVAddr gpu_addr, VideoCommon::QueryPropertiesFlags flags, u32 payload);
     u64 a_releases{}; ///< Semaphore releases written on stage A (EDEN_NX2_BACK_STAGES_A_RELEASES)
     /// Set on stage B while it signals a fence A deferred: A already invalidated the GPU cache.

@@ -3210,6 +3210,28 @@ void RasterizerVulkan::Query(GPUVAddr gpu_addr, VideoCommon::QueryType type,
             return;
         }
     }
+    // EDEN_NX2_BACK_STAGES_FENCE_REPORTS (on unless =0): a fence-flagged counter report runs on B
+    // too, its fence included, in order with the packets. It is unsettled from now; A invalidates
+    // the GPU cache as signalling the fence would.
+    if (True(flags & VideoCommon::QueryPropertiesFlags::IsAFence) &&
+        type != VideoCommon::QueryType::Payload && FenceReportsOnB() && back_ring &&
+        VideoCommon::DrawStages::OwnsRing()) {
+        if (const auto cpu_addr = gpu_memory->GpuToCpuAddress(gpu_addr)) {
+            auto& issued = Tegra::g_nx2_async_reports_issued[Tegra::Nx2AsyncReportSlot(*cpu_addr)];
+            issued.fetch_add(1, std::memory_order_release);
+            InvalidateGPUCache();
+            if (DeferToStageB([this, gpu_addr, type, flags, payload, subreport, &issued] {
+                    t_skip_gpu_cache_invalidation = true;
+                    query_cache.CounterReport(gpu_addr, type, flags, payload, subreport);
+                    t_skip_gpu_cache_invalidation = false;
+                    issued.fetch_sub(1, std::memory_order_release);
+                })) {
+                ++b_fence_reports;
+                return;
+            }
+            issued.fetch_sub(1, std::memory_order_release);
+        }
+    }
     VideoCommon::DrawStages::JoinB(VideoCommon::DrawStages::Join::QueryCache);
     VideoCommon::DrawStages::NoteGpuWrite(
         VideoCommon::DrawStages::Join::Query, *gpu_memory, gpu_addr,
@@ -3518,6 +3540,14 @@ bool RasterizerVulkan::DeferQueries() {
 // unless a report to its word is still pending. The fence a fence-flagged one makes still goes to
 // B in order. The split's front waits for releases, so they no longer wait for B's lag.
 thread_local bool RasterizerVulkan::t_skip_gpu_cache_invalidation = false;
+
+bool RasterizerVulkan::FenceReportsOnB() {
+    static const bool on = [] {
+        const char* value = std::getenv("EDEN_NX2_BACK_STAGES_FENCE_REPORTS");
+        return value == nullptr || value[0] != '0';
+    }();
+    return on;
+}
 
 bool RasterizerVulkan::ReleasesOnA() {
     static const bool on = [] {
@@ -4283,8 +4313,10 @@ void RasterizerVulkan::TickFrame() {
             const auto window = static_cast<u64>(
                 std::chrono::duration_cast<std::chrono::nanoseconds>(now - stage_a_report).count());
             stage_a_report = now;
-            LOG_INFO(Render_Vulkan, "Stage A: {} semaphore releases written on A{}",
-                     std::exchange(a_releases, 0), VideoCommon::DrawStages::FormatJoins(window));
+            LOG_INFO(Render_Vulkan,
+                     "Stage A: {} semaphore releases written on A, {} fence reports sent to B{}",
+                     std::exchange(a_releases, 0), std::exchange(b_fence_reports, 0),
+                     VideoCommon::DrawStages::FormatJoins(window));
         }
     }
     if (VideoCore::Nx2Debug::HasRequests()) {
