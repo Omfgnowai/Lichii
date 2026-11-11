@@ -3175,10 +3175,21 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
         if (!ClearCovers(width, height)) {
             return false;
         }
-        // The clear covers the framebuffer's render area, the smallest bound target.
+        // The clear covers the framebuffer's render area, the smallest bound target. Not for the
+        // clear's own depth target, which follows IsFullClear as an existing one does (its
+        // contents are dropped whatever the colour targets' sizes): Ocarina of Time binds a
+        // 1920x1024 depth buffer under 1280x720 colour, and this rule uploaded its 7.5 MiB from
+        // guest memory every frame (port of Fritchii EXP56). EDEN_NX2_DEPTH_CLEAR_UPLOAD=1 restores.
+        static const bool depth_clear_upload = [] {
+            const char* const value = std::getenv("EDEN_NX2_DEPTH_CLEAR_UPLOAD");
+            return value != nullptr && value[0] == '1';
+        }();
+        const bool depth_follows_full_clear =
+            !depth_clear_upload && regs.zeta_enable && regs.zeta.Address() == gpu_addr;
         for (u32 index = 0; index < regs.rt_control.count && index < NUM_RT; ++index) {
             const auto& rt = regs.rt[index];
-            if (rt.Address() != 0 && rt.format != Tegra::RenderTargetFormat::NONE &&
+            if (!depth_follows_full_clear && rt.Address() != 0 &&
+                rt.format != Tegra::RenderTargetFormat::NONE &&
                 (rt.width < width || rt.height < height)) {
                 return false;
             }
