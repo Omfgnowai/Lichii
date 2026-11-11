@@ -471,6 +471,9 @@ jobs:
           if (Test-Path dist/oot-perf/README-OoT-perf-test.txt) {
             Copy-Item dist/oot-perf/README-OoT-perf-test.txt build/release/bin/
           }
+          if (Test-Path dist/oot-perf/recipes) {
+            Copy-Item -Recurse -Force dist/oot-perf/recipes build/release/bin/
+          }
 
       # A self-contained app bundle: macdeployqt copies Qt and every other Homebrew library both
       # programs load into the bundle, then the leftover Homebrew and build-tree search paths are

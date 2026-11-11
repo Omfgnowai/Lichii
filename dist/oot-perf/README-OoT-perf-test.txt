@@ -7,8 +7,7 @@ A test build of Lichii (zortos293/Lichii, nx2 branch) with extra performance wor
 Ocarina of Time remake (title 0400486024DEC000). It is meant for normal play on other hardware so
 we can see whether the gains hold beyond the machine it was tuned on.
 
-It contains no game mods (no randomizer, no benchmark). Diagnostics are built in but all off
-unless you turn them on.
+Diagnostics are built in but all off unless you turn them on.
 
 On the development PC (Ryzen 9 7950X3D, RTX 4090, 1x resolution, frame rate limit 120), Castle Town
 went from ~55-62 fps to ~68-72 fps compared with the previous test build. Results on other
@@ -24,10 +23,21 @@ What's in it (on top of upstream nx2 as of 2026-11-09, plus upstream perf merges
 - Upstream 2026-11-11: 3D state registers written in one call (#1095), split GpuSplit cache
   lines (#1332), dynarmic plain loads / no DMB (#1327), exclusive reservation cache lines (#1331),
   skip empty FlushCommands submits (#1329), guard house texture pool patch (#1313).
-- Shaders: Switch 2 pipelines are never evicted; precompiled pipelines from a recipe (#896)
-  if you have one.
+- Shaders: Switch 2 pipelines are never evicted; precompiled pipelines from a recipe (#896).
 - Fixes: SMMU device-space leak after ~1 h of play, Pickup Counter Fix built in (item count-up
   stalled above 60 fps), Hold 60 FPS hotkey (Ctrl+6, or Home+ZR on a controller).
+
+Shader pre-loading (recommended, one time)
+------------------------------------------
+The folder "recipes" holds an OoT precompile recipe (made by the Fritchii project,
+github.com/Frizti/Fritchii). A recipe contains no game code: it is combined with the shader
+programs from your own copy of the game.
+1. In Lichii's game list, right-click Ocarina of Time > "Prepare Precompiled Shaders from Recipe...".
+2. Pick recipes\OoT v131072 (cache v54).nx2recipe.
+3. Start the game. The first boot prepares the shaders (a few minutes, with a progress screen);
+   later boots skip it. This removes almost all first-visit shader stutter.
+The recipe is for game version v131072 (the current update). With another version some
+pipelines are missing and are compiled during play as usual.
 
 Recommended settings
 --------------------
