@@ -46,8 +46,6 @@ add_library(core STATIC
     debugger/gdbstub.h
     debugger/gdbstub_arch.cpp
     debugger/gdbstub_arch.h
-    debugger/nx2_code_trace.cpp
-    debugger/nx2_code_trace.h
     debugger/nx2_debug_server.cpp
     debugger/nx2_debug_server.h
     debugger/nx2_debug_tools.cpp

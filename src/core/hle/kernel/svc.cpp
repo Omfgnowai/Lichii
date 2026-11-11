@@ -10,7 +10,6 @@
 #include <cstring>
 #include <type_traits>
 
-#include "core/debugger/nx2_code_trace.h"
 #include "core/arm/arm_interface.h"
 #include "core/core.h"
 #include "core/hle/kernel/k_process.h"
@@ -2502,9 +2501,6 @@ static void Call64(Core::System& system, u32 imm, std::span<uint64_t, 8> args) {
     }
 }
 void Call(Core::System& system, u32 imm) {
-    if (Core::Nx2CodeTrace::HandleSvc(system, imm)) {
-        return;  // a debug server code hook, not a real supervisor call
-    }
     auto& kernel = system.Kernel();
     auto& process = GetCurrentProcess(kernel);
     std::array<uint64_t, 8> args;

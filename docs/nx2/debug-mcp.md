@@ -142,7 +142,6 @@ server is on but idle, its thread sleeps in `epoll`/IOCP.
 | `shaders` (inventory) | Shader dump and offline sweep | List loaded programs: key, hash, stage, address, lowered or rejected with the error | 2 |
 | `switches` (live `EDEN_NX2_*`) | Relaunch per switch | Toggle the observer switches live (classification below) | 2 |
 | `read_memory`, `search_memory`, `read_gpu_memory` | GDB stub session or log prints plus a rebuild | Read a range by address, find known values in the heap (done) | 3 |
-| `code_hook_set`, `code_hook_clear`, `code_hook_read` | Static disassembly only | Log which functions run, with their arguments, while the owner plays (done) | 3 |
 | `dump_texture`, `dump_buffer` | Frame dump of the whole frame | One resource by GPU address, as PNG plus raw | 3 |
 | `gpu_timings` | `EDEN_NX2_GPU_PROFILE` relaunch, zones only | Per-pass GPU time of one frame | 3 |
 | Capture options (pass range, shader filter) | Not possible | Smaller captures, for example only passes 40 to 60 | 3 |
@@ -306,27 +305,6 @@ How the reads are safe:
   (`src/video_core/memory_manager.cpp:742`, `:474`), the reads the GPU itself makes. It does not
   flush the GPU caches, so the result is what guest memory holds, not data that is still only in
   GPU buffers.
-
-### Code hooks (implemented)
-
-**`code_hook_set`** `{address}` (one address or a list), **`code_hook_clear`** `{address?}` (one,
-or every hook) and **`code_hook_read`** `{since?, max?}` log every run of chosen guest
-instructions without stopping the game, for finding which function handles what (for example
-the item-get path, by hooking candidates and picking an item up).
-
-A hook replaces one HINT-class instruction (NOP, PACIBSP, PACIASP, BTI: the first instruction of
-nearly every function in a PAC build, so hook function entries) with `SVC #0xC0DE`
-(`nx2_code_trace.h`). `svc::Call` hands that number to `Nx2CodeTrace::HandleSvc` before the real
-dispatch: it records x0-x7, lr, sp, the thread and the present count in an 8192-entry ring and
-returns, and the guest goes on at the next instruction. Dynarmic translates every HINT as a no-op
-(`TranslatorVisitor::HINT`), so skipping the replaced instruction changes nothing; other
-instructions are refused. Setting and clearing write guest code with `Memory::Write32` and call
-`InvalidateCacheRange` on every core, as the page table does for code changes. Hooks belong to
-the process they were written into and are forgotten with it.
-
-`code_hook_read` returns the hits with `seq >= since`, oldest first, `next` (pass it as `since`
-next time), `dropped` (hits overwritten before they were read) and the installed hooks with
-their hit counts. Module bases change per boot: take `Module main loaded at` from the log.
 
 ### Input (implemented)
 
