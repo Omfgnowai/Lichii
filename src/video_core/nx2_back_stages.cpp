@@ -1,10 +1,13 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <algorithm>
 #include <chrono>
+#include <cstdlib>
 
 #include <fmt/format.h>
 
+#include "common/logging.h"
 #include "common/thread.h"
 #include "video_core/nx2_back_stages.h"
 
@@ -35,7 +38,19 @@ u64 NowNs() {
 
 } // namespace
 
-BackRing::BackRing() = default;
+BackRing::BackRing() {
+    const auto read = [](const char* name, u64 fallback, u64 low, u64 high) {
+        const char* const value = std::getenv(name);
+        if (value == nullptr || value[0] == '\0') {
+            return fallback;
+        }
+        return std::clamp<u64>(std::strtoull(value, nullptr, 10), low, high);
+    };
+    batch = read("EDEN_NX2_BACK_STAGES_BATCH", Batch, 1, Capacity);
+    spin_ns = read("EDEN_NX2_BACK_STAGES_SPIN_US", SpinNs / 1'000, 0, 1'000) * 1'000;
+    LOG_INFO(HW_GPU, "Back stages: hand-over every {} packets, spin {} us", batch,
+             spin_ns / 1'000);
+}
 
 BackRing::~BackRing() {
     Stop();
@@ -104,7 +119,7 @@ void BackRing::WaitConsumed(u64 target) {
         if (consumed_cache >= target) {
             break;
         }
-        if (NowNs() - start < SpinNs) {
+        if (NowNs() - start < spin_ns) {
             Pause();
             continue;
         }
@@ -164,7 +179,7 @@ void BackRing::Loop(std::stop_token stop_token) {
         u64 available = published.load(std::memory_order_acquire);
         if (available == next) {
             const u64 spin_start = NowNs();
-            while (available == next && NowNs() - spin_start < SpinNs) {
+            while (available == next && NowNs() - spin_start < spin_ns) {
                 Pause();
                 available = published.load(std::memory_order_acquire);
             }
