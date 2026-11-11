@@ -240,6 +240,9 @@ private:
         /// EDEN_NX2_BACK_STAGES_VERIFY: the device ranges B reads (begin, size, hash at A).
         std::vector<std::array<u64, 3>> reads;
     };
+    /// Stage A with B on its own thread: `callback` runs on B where it splices A's commands
+    /// (false, and nothing queued, otherwise).
+    bool DeferToStageB(std::function<void()>&& callback);
     void StartBackStages();
     void StopBackStages();
     /// Stage A: notes what B reads for the slot, hands it to B and takes the next.

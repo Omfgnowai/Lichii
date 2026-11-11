@@ -213,11 +213,16 @@ public:
         InvalidateState,       ///< The scheduler's part (A took the state tracker's)
         DeferFragmentBarrier,
         DispatchWork,
+        Callback, ///< Runs PacketList::callbacks[ListOp::callback] (DeferCallback)
     };
     struct ListOp {
         u32 index; ///< Applied before the command with this index
         SpliceOp op;
+        u32 callback{};
     };
+    /// Stage A, B on its own thread: `callback` runs where B splices the list, in order with the
+    /// commands A recorded (false otherwise: nothing is queued).
+    bool DeferCallback(std::function<void()>&& callback);
     /// Stage A, B on its own thread: the change goes to the packet's list (false otherwise).
     bool DeferToList(SpliceOp op);
     /// The calling thread (stage A) records into `list`; null records into the scheduler.
@@ -757,6 +762,7 @@ struct Scheduler::PacketList {
     std::unique_ptr<CommandChunk> commands;
     u32 count{}; ///< Commands in `commands`
     std::vector<ListOp> ops;
+    std::vector<std::function<void()>> callbacks;
     /// EDEN_NX2_CMDLIST_VERIFY: what was recorded, in order.
     std::vector<CommandListVerifyEntry> pending;
 };
