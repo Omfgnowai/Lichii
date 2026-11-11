@@ -132,14 +132,14 @@ inline constexpr auto stutter_categories = [] {
 // A plain flag: Enabled() runs several times per method write (no guard to check).
 inline bool g_enabled = std::getenv("EDEN_NX2_GPU_PROFILE") != nullptr;
 /// Whether zones measure: for the profile or for EDEN_NX2_STUTTER_TRACE.
-inline bool g_zones_enabled = g_enabled || StutterTrace::ReadEnv();
+inline bool g_zones_enabled = g_enabled || (StutterTrace::ReadEnv() && StutterTrace::ZonesWanted());
 
 /// Called by VideoCore::CreateGPU: static initialization runs before the frontend loads
 /// nx2_switches.txt, so a switch set only there takes effect from that point on.
 inline void ReadSwitch() {
     g_enabled = std::getenv("EDEN_NX2_GPU_PROFILE") != nullptr;
     StutterTrace::ReadSwitch();
-    g_zones_enabled = g_enabled || StutterTrace::Enabled();
+    g_zones_enabled = g_enabled || (StutterTrace::Enabled() && StutterTrace::ZonesWanted());
     Common::g_count_spin_contention = g_enabled;
 }
 

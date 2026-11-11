@@ -99,6 +99,13 @@ inline constexpr std::array<std::string_view, SiteCount> site_names{
 
 inline bool g_enabled = ReadEnv();
 
+/// EDEN_NX2_STUTTER_ZONES=0: keep the frame-time summary but leave Nx2Profile's zones off (the
+/// zones cost the GPU back thread ~1.5M updates a second in busy scenes).
+[[nodiscard]] inline bool ZonesWanted() {
+    const char* const value = std::getenv("EDEN_NX2_STUTTER_ZONES");
+    return value == nullptr || value[0] != '0';
+}
+
 /// Called with Nx2Profile::ReadSwitch, once nx2_switches.txt is applied.
 inline void ReadSwitch() {
     g_enabled = ReadEnv();
