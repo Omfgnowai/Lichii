@@ -1,0 +1,6 @@
+# Lichii switches for the OoT performance test build (read at start; a copy in %APPDATA%\eden wins).
+# Frame-time logging for reports: a "Nx2StutterSummary" line every 10 s in eden_log.txt, plus a line
+# for each frame over 33 ms. Costs ~nothing with the per-draw timing zones left off.
+# Put a # in front of both lines to turn the logging off.
+EDEN_NX2_STUTTER_TRACE=1
+EDEN_NX2_STUTTER_ZONES=0

@@ -76,9 +76,16 @@ Known issues above 60 fps (game-side, from FPS Unlock)
 - Occasional white glowing blobs / stretched planes after a while in a session: upstream issue
   #867, not fixed yet. Restarting clears it.
 
+Frame-rate logging
+------------------
+nx2_switches.txt beside lichii.exe turns on a light frame-time log (one summary line every 10 s,
+plus a line for each frame over 33 ms). It costs about nothing; the log is what lets us compare
+results across machines. To turn it off, put a # in front of both lines in that file.
+
 What to report
 --------------
 - CPU, GPU, RAM, OS, driver version, resolution scale and frame rate limit.
 - Rough fps in a few places (Castle Town market square, Hyrule Field, Kokiri Forest, Lake Hylia).
+  The log's Nx2StutterSummary lines have the exact numbers.
 - Any crash or visual problem, with the log: %APPDATA%\eden\log\eden_log.txt (copy it before
   starting Lichii again; it is overwritten at launch).

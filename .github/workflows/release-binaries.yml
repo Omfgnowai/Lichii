@@ -471,6 +471,9 @@ jobs:
           if (Test-Path dist/oot-perf/README-OoT-perf-test.txt) {
             Copy-Item dist/oot-perf/README-OoT-perf-test.txt build/release/bin/
           }
+          if (Test-Path dist/oot-perf/nx2_switches.txt) {
+            Copy-Item dist/oot-perf/nx2_switches.txt build/release/bin/
+          }
           if (Test-Path dist/oot-perf/recipes) {
             Copy-Item -Recurse -Force dist/oot-perf/recipes build/release/bin/
           }
