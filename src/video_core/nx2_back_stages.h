@@ -152,13 +152,14 @@ inline void* g_after_join_argument{};
 inline void (*g_back_exit)(void*){};
 inline void* g_back_exit_argument{};
 
-/// EDEN_NX2_BACK_STAGES_FRONT_A=1 (experiment): the split's front waits count the drawing
-/// thread's position, not B's. Semaphore releases then stay on that thread; only samples-counter
-/// reports go to B, marked unsettled from the start.
+/// EDEN_NX2_BACK_STAGES_FRONT_A (on unless =0): the split's front waits count the drawing
+/// thread's position, not B's. Semaphore releases then stay on that thread (written there without
+/// a join, EDEN_NX2_BACK_STAGES_A_RELEASES); only samples-counter reports go to B, marked unsettled
+/// from the start.
 [[nodiscard]] inline bool FrontWaitsForA() {
     static const bool front_a = [] {
         const char* value = std::getenv("EDEN_NX2_BACK_STAGES_FRONT_A");
-        return value != nullptr && value[0] == '1';
+        return value == nullptr || value[0] != '0';
     }();
     return front_a;
 }

@@ -3178,6 +3178,10 @@ void RasterizerVulkan::ResetCounterNow(VideoCommon::QueryType type) {
 
 void RasterizerVulkan::Query(GPUVAddr gpu_addr, VideoCommon::QueryType type,
                              VideoCommon::QueryPropertiesFlags flags, u32 payload, u32 subreport) {
+    if (type == VideoCommon::QueryType::Payload && back_ring &&
+        VideoCommon::DrawStages::OwnsRing() && ReleaseOnA(gpu_addr, flags, payload)) {
+        return;
+    }
     // A report that isn't a fence touches only the query cache and B's command buffer: with B on
     // its own thread it runs there, in order with the packets. Fences keep the join (they reach
     // the texture cache and may submit).
@@ -3508,6 +3512,87 @@ bool RasterizerVulkan::DeferQueries() {
     return defer;
 }
 
+// EDEN_NX2_BACK_STAGES_A_RELEASES (on unless =0): with stage B on its own thread, a semaphore
+// release the query cache would write at once (low accuracy: plain releases, and fence-flagged
+// ones while payload releases stay synchronized, #874) is written here on A without joining B,
+// unless a report to its word is still pending. The fence a fence-flagged one makes still goes to
+// B in order. The split's front waits for releases, so they no longer wait for B's lag.
+thread_local bool RasterizerVulkan::t_skip_gpu_cache_invalidation = false;
+
+bool RasterizerVulkan::ReleasesOnA() {
+    static const bool on = [] {
+        const char* value = std::getenv("EDEN_NX2_BACK_STAGES_A_RELEASES");
+        return value == nullptr || value[0] != '0';
+    }();
+    return on;
+}
+
+bool RasterizerVulkan::ReleaseOnA(GPUVAddr gpu_addr, VideoCommon::QueryPropertiesFlags flags,
+                                  u32 payload) {
+    using Flags = VideoCommon::QueryPropertiesFlags;
+    if (!ReleasesOnA() || Settings::IsGPULevelHigh() || True(flags & Flags::Nx2Mirror)) {
+        return false;
+    }
+    const bool is_fence = True(flags & Flags::IsAFence);
+    if (is_fence) {
+        static const bool sync_payload_releases = [] {
+            const char* value = std::getenv("EDEN_NX2_SYNC_PAYLOAD_RELEASES");
+            return value == nullptr || value[0] != '0';
+        }();
+        const bool low_fences = Settings::IsGPUFenceBehaviorDefault()
+                                    ? !Settings::IsGPULevelHigh()
+                                    : !Settings::IsGPUFenceBehaviorBalanced() &&
+                                          !Settings::IsGPUFenceBehaviorAccurate();
+        if (!sync_payload_releases || !low_fences) {
+            return false;
+        }
+    }
+    const auto cpu_addr = gpu_memory->GpuToCpuAddress(gpu_addr);
+    if (!cpu_addr) {
+        return false;
+    }
+    // A report to the word still in flight (deferred to B, or waiting for its fence) must land
+    // first: those take the query cache's path, in order.
+    const u64 slot = Tegra::Nx2AsyncReportSlot(*cpu_addr);
+    if (Tegra::g_nx2_async_reports_issued[slot].load(std::memory_order_acquire) !=
+        Tegra::g_nx2_async_reports_completed[slot].load(std::memory_order_acquire)) {
+        return false;
+    }
+    u8* const pointer = device_memory.GetPointer<u8>(*cpu_addr);
+    if (pointer == nullptr) {
+        return false;
+    }
+    if (True(flags & Flags::HasTimeout)) {
+        u8* const pointer_timestamp = device_memory.GetPointer<u8>(*cpu_addr + 8);
+        if (pointer_timestamp == nullptr) {
+            return false;
+        }
+        const u64 timestamp = gpu.GetTicks();
+        const u64 value = payload;
+        std::memcpy(pointer_timestamp, &timestamp, sizeof(timestamp));
+        std::memcpy(pointer, &value, sizeof(value));
+    } else {
+        std::memcpy(pointer, &payload, sizeof(payload));
+    }
+    Tegra::Nx2MirrorShadow::Get().NoteDirectRelease(*cpu_addr, gpu_addr);
+    Tegra::Nx2SemaphoreWaiters::Get().OnWrite(*cpu_addr, payload);
+    ++a_releases;
+    if (is_fence) {
+        // The fence keeps its place among B's work (its cache flushes and submit cadence). Its
+        // GPU cache invalidation runs here on A, as it did when A signalled the fence.
+        InvalidateGPUCache();
+        if (!DeferToStageB([this] {
+                t_skip_gpu_cache_invalidation = true;
+                fence_manager.SignalFence([] {});
+                t_skip_gpu_cache_invalidation = false;
+            })) {
+            VideoCommon::DrawStages::JoinB(VideoCommon::DrawStages::Join::Fence);
+            fence_manager.SignalFence([] {});
+        }
+    }
+    return true;
+}
+
 bool RasterizerVulkan::DeferToStageB(std::function<void()>&& callback) {
     return back_ring && VideoCommon::DrawStages::OwnsRing() &&
            scheduler.DeferCallback(std::move(callback));
@@ -3546,6 +3631,9 @@ bool RasterizerVulkan::TryCacheInvalidation(DAddr addr, u64 size) {
 }
 
 void RasterizerVulkan::InvalidateGPUCache() {
+    if (t_skip_gpu_cache_invalidation) {
+        return;
+    }
     gpu.InvalidateGPUCache();
 }
 
@@ -4186,6 +4274,19 @@ void RasterizerVulkan::FrameDumpPass(const Framebuffer* framebuffer) {
 
 void RasterizerVulkan::TickFrame() {
     VideoCommon::DrawStages::JoinB(VideoCommon::DrawStages::Join::Frame);
+    if (back_ring && VideoCommon::DrawStages::OwnsRing() && !VideoCommon::Nx2Profile::Enabled()) {
+        // Without the profile (which logs them itself), the joins by site every 10 s.
+        const auto now = std::chrono::steady_clock::now();
+        if (stage_a_report == std::chrono::steady_clock::time_point{}) {
+            stage_a_report = now;
+        } else if (now - stage_a_report >= std::chrono::seconds{10}) {
+            const auto window = static_cast<u64>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(now - stage_a_report).count());
+            stage_a_report = now;
+            LOG_INFO(Render_Vulkan, "Stage A: {} semaphore releases written on A{}",
+                     std::exchange(a_releases, 0), VideoCommon::DrawStages::FormatJoins(window));
+        }
+    }
     if (VideoCore::Nx2Debug::HasRequests()) {
         if (auto capture = VideoCore::Nx2Debug::TakeCapture()) {
             frame_dump.Arm(std::move(capture->directory), capture->sampled, capture->buffers,

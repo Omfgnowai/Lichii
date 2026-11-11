@@ -243,6 +243,12 @@ private:
     /// Stage A with B on its own thread: `callback` runs on B where it splices A's commands
     /// (false, and nothing queued, otherwise).
     bool DeferToStageB(std::function<void()>&& callback);
+    static bool ReleasesOnA();
+    bool ReleaseOnA(GPUVAddr gpu_addr, VideoCommon::QueryPropertiesFlags flags, u32 payload);
+    u64 a_releases{}; ///< Semaphore releases written on stage A (EDEN_NX2_BACK_STAGES_A_RELEASES)
+    /// Set on stage B while it signals a fence A deferred: A already invalidated the GPU cache.
+    static thread_local bool t_skip_gpu_cache_invalidation;
+    std::chrono::steady_clock::time_point stage_a_report{};
     static bool DeferQueries();
     void ResetCounterNow(VideoCommon::QueryType type);
     void StartBackStages();
