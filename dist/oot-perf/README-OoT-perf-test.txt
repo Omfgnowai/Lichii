@@ -7,11 +7,11 @@ A test build of Lichii (zortos293/Lichii, nx2 branch) with extra performance wor
 Ocarina of Time remake (title 0400486024DEC000). It is meant for normal play on other hardware so
 we can see whether the gains hold beyond the machine it was tuned on.
 
-Diagnostics are built in but all off unless you turn them on.
+Diagnostics are built in but off, except a light frame-time log (see "Frame-rate logging").
 
 On the development PC (Ryzen 9 7950X3D, RTX 4090, 1x resolution, frame rate limit 120), Castle Town
-went from ~55-62 fps to ~68-72 fps compared with the previous test build. Results on other
-hardware are exactly what we want to learn.
+runs at ~72 fps and Hyrule Field at ~74-79 fps, up from ~55-65 fps on the fork's builds of the
+day before. Results on other hardware are exactly what we want to learn.
 
 What's in it (on top of upstream nx2 as of 2026-11-09, plus upstream perf merges of 2026-11-11)
 ----------------------------------------------------------------------------------------------
