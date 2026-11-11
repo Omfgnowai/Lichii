@@ -257,6 +257,7 @@ void PhysicalCore::Idle(KernelCore& kernel) {
     const std::chrono::nanoseconds limit = std::chrono::microseconds{spin_us};
     const auto start = std::chrono::steady_clock::now();
     bool polled = false;
+    std::chrono::steady_clock::rep interrupt_time{};
     if (limit.count() > 0) {
         if (m_idle_poll.count() <= 0 || m_idle_poll > limit) {
             m_idle_poll = limit;
@@ -266,6 +267,8 @@ void PhysicalCore::Idle(KernelCore& kernel) {
     if (!polled) {
         std::unique_lock lk{m_guard};
         m_on_interrupt.wait(lk, [this] { return m_is_interrupted.load(); });
+        // Under m_guard, as Interrupt writes it: no later interrupt can replace it yet.
+        interrupt_time = m_interrupt_time.load(std::memory_order_relaxed);
     }
     const auto end = std::chrono::steady_clock::now();
     const auto poll = m_idle_poll;
@@ -285,7 +288,7 @@ void PhysicalCore::Idle(KernelCore& kernel) {
         ++m_stats_polled;
     } else {
         const std::chrono::steady_clock::time_point interrupt{
-            std::chrono::steady_clock::duration{m_interrupt_time.load(std::memory_order_relaxed)}};
+            std::chrono::steady_clock::duration{interrupt_time}};
         m_stats_blocked_wakes.push_back(end - std::max(interrupt, start));
     }
     if (end - m_stats_start < std::chrono::seconds{10}) {
