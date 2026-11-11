@@ -441,11 +441,3 @@ the server again on the same port.
 - `log_tail` sees lines logged after the game finished loading. The boot itself is in
   `eden_log.txt`.
 - Runtime rejections last for one boot. Starting the next session clears them.
-
-### File relay
-
-`EDEN_NX2_DEBUG_FILE_DIR=<dir>` (with `EDEN_NX2_DEBUG_SERVER` set, any loopback port, `0` picks one)
-also serves the same requests as files, for clients that cannot reach the host's loopback (a VM
-that only shares folders). Write one request line to `<dir>/<name>.req`; the relay thread polls
-every 50 ms, removes the `.req`, and writes the response line to `<dir>/<name>.resp` (whole, via
-`<name>.tmp` and a rename). Requests are answered one at a time, sorted by name.
