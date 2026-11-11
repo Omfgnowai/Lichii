@@ -28,7 +28,6 @@
 #include "video_core/nx2_fast_draw.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/nx2_profile.h"
-#include "video_core/nx2_stage_probe.h"
 #include "video_core/query_cache/frame_trace.h"
 #include "video_core/query_dma.h"
 #include "video_core/rasterizer_interface.h"
@@ -735,8 +734,6 @@ void Maxwell3D::CallConstBufferWords(Core::System& system, const u32* methods,
     if (VideoCommon::Nx2FastDraw::Enabled()) {
         NoteFastDrawConstantData(address + offset, address + offset + bytes);
     }
-    VideoCommon::Nx2StageProbe::NoteGpuWrite(VideoCommon::Nx2StageProbe::Site::CbData,
-                                             memory_manager, address + offset, bytes);
     memory_manager.WriteWordsCached(address + offset, values.data(), count);
     regs.const_buffer.offset += static_cast<u32>(bytes);
 }
@@ -1119,8 +1116,6 @@ void Maxwell3D::ProcessCBMultiData(const u32* start_base, u32 amount) {
         if (VideoCommon::Nx2FastDraw::Enabled()) {
             NoteFastDrawConstantData(address, address + write_size);
         }
-        VideoCommon::Nx2StageProbe::NoteGpuWrite(VideoCommon::Nx2StageProbe::Site::CbData,
-                                                 memory_manager, address, write_size);
         memory_manager.WriteBlockCached(address, start_base, write_size);
     }
     if (write_size != copy_size) {

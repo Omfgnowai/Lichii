@@ -75,7 +75,6 @@
 #include "video_core/nx2_debug_control.h"
 #include "video_core/nx2_fast_draw.h"
 #include "video_core/nx2_profile.h"
-#include "video_core/nx2_stage_probe.h"
 
 namespace Vulkan {
 
@@ -1103,8 +1102,6 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
 
     {
         Profile::Scope scope{Profile::Zone::DynamicState};
-        VideoCommon::Nx2StageProbe::Scope stage_probe{
-            VideoCommon::Nx2StageProbe::Region::DynamicState};
         UpdateDynamicStates(pipeline);
     }
 
@@ -1113,8 +1110,6 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     query_cache.CounterEnable(VideoCommon::QueryType::ZPassPixelCount64, maxwell3d->regs.zpass_pixel_count_enable);
     {
         Profile::Scope scope{Profile::Zone::DrawRecord};
-        VideoCommon::Nx2StageProbe::Scope stage_probe{
-            VideoCommon::Nx2StageProbe::Region::DrawRecord};
         scheduler.TraceGraphicsPipeline(pipeline->ShaderHashes());
         trace_draw_hashes = {pipeline->ShaderHashes()[1], pipeline->ShaderHashes()[5]};
         draw_func();
@@ -1269,7 +1264,6 @@ void TraceWindowTarget(const Tegra::Engines::Maxwell3D& maxwell3d, Tegra::Memory
 
 void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Draw};
-    VideoCommon::Nx2StageProbe::CoarseScope stage_probe{VideoCommon::Nx2StageProbe::Region::Draw};
     {
         // A draw's first and count can come from memory a skipped (rejected) compute program
         // should have written. Past 16M vertices they are garbage: building the quad index
@@ -1508,7 +1502,6 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
 
 void RasterizerVulkan::DrawIndirect() {
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Draw};
-    VideoCommon::Nx2StageProbe::CoarseScope stage_probe{VideoCommon::Nx2StageProbe::Region::Draw};
     const auto& params = maxwell3d->draw_manager.indirect_state;
     if (Common::DkbFrameTrace::Enabled()) {
         ++trace_indirect;
@@ -1781,7 +1774,6 @@ void RasterizerVulkan::CollectIndirectTrace() {
 }
 
 void RasterizerVulkan::DrawTexture() {
-    VideoCommon::Nx2StageProbe::CoarseScope stage_probe{VideoCommon::Nx2StageProbe::Region::Draw};
 
     SCOPE_EXIT {
         gpu.TickWork();
@@ -1833,7 +1825,6 @@ void RasterizerVulkan::DrawTexture() {
 
 void RasterizerVulkan::Clear(u32 layer_count) {
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Clear};
-    VideoCommon::Nx2StageProbe::CoarseScope stage_probe{VideoCommon::Nx2StageProbe::Region::Clear};
     if (Tegra::Engines::g_nx2_trace_draws_after_upscale > 0) {
         const auto& regs = maxwell3d->regs;
         LOG_INFO(HW_GPU, "after upscale: clear rt0 {:#x} {}x{} fmt {:#x} surface {:#x} colour {} {} {} {}",
@@ -2059,8 +2050,6 @@ void RasterizerVulkan::Clear(u32 layer_count) {
 
 void RasterizerVulkan::DispatchCompute() {
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Compute};
-    VideoCommon::Nx2StageProbe::CoarseScope stage_probe{
-        VideoCommon::Nx2StageProbe::Region::Compute};
     FlushWork();
     gpu_memory->FlushCaching();
     if (frame_dump.Capturing()) {
@@ -2271,9 +2260,6 @@ void RasterizerVulkan::ResetCounter(VideoCommon::QueryType type) {
 
 void RasterizerVulkan::Query(GPUVAddr gpu_addr, VideoCommon::QueryType type,
                              VideoCommon::QueryPropertiesFlags flags, u32 payload, u32 subreport) {
-    VideoCommon::Nx2StageProbe::NoteGpuWrite(
-        VideoCommon::Nx2StageProbe::Site::Query, *gpu_memory, gpu_addr,
-        True(flags & VideoCommon::QueryPropertiesFlags::HasTimeout) ? 16 : 4);
     query_cache.CounterReport(gpu_addr, type, flags, payload, subreport);
 }
 
@@ -2353,9 +2339,6 @@ void RasterizerVulkan::FlushRegion(DAddr addr, u64 size, VideoCommon::CacheType 
     }
     if ((True(which & VideoCommon::CacheType::BufferCache))) {
         std::scoped_lock lock{buffer_cache.mutex};
-        if (VideoCommon::Nx2StageProbe::Enabled()) {
-            VideoCommon::Nx2StageProbe::NoteBufferFlush(buffer_cache.IsRegionGpuModified(addr, size));
-        }
         buffer_cache.DownloadMemory(addr, size);
     }
     if ((True(which & VideoCommon::CacheType::QueryCache))) {
@@ -3366,8 +3349,6 @@ void RasterizerVulkan::AccelerateInlineToMemory(GPUVAddr address, size_t copy_si
         return;
     }
     gpu_memory->WriteBlockUnsafe(address, memory.data(), copy_size);
-    VideoCommon::Nx2StageProbe::NoteWrite(VideoCommon::Nx2StageProbe::Site::Inline, *cpu_addr,
-                                          copy_size);
     // EDEN_NX2_INLINE_DEFER=0: invalidate every cache at once (for comparisons).
     static const bool defer = [] {
         const char* value = std::getenv("EDEN_NX2_INLINE_DEFER");
@@ -3381,10 +3362,6 @@ void RasterizerVulkan::AccelerateInlineToMemory(GPUVAddr address, size_t copy_si
         // Guest memory has the words now: a command list copy of the page no longer does.
         buffer_cache.Nx2NoteListHostWrite(*cpu_addr, copy_size);
         uploaded = buffer_cache.InlineMemory(*cpu_addr, copy_size, memory);
-        if (uploaded) {
-            VideoCommon::Nx2StageProbe::Count(
-                VideoCommon::Nx2StageProbe::Counter::InlineViaBufferCache);
-        }
         if (!uploaded && !defer) {
             buffer_cache.WriteMemory(*cpu_addr, copy_size);
         }
@@ -3523,16 +3500,13 @@ AccelerateDMA::AccelerateDMA(BufferCache& buffer_cache_, TextureCache& texture_c
 
 bool AccelerateDMA::BufferClear(GPUVAddr src_address, u64 amount, u32 value) {
     std::scoped_lock lock{buffer_cache.mutex};
-    const bool cleared = buffer_cache.DMAClear(src_address, amount, value);
-    VideoCommon::Nx2StageProbe::NoteDmaBufferCache(cleared);
-    return cleared;
+    return buffer_cache.DMAClear(src_address, amount, value);
 }
 
 bool AccelerateDMA::BufferCopy(GPUVAddr src_address, GPUVAddr dest_address, u64 amount) {
     std::scoped_lock lock{buffer_cache.mutex};
     buffer_cache.Nx2CollectListCopies(true);
     const bool copied = buffer_cache.DMACopy(src_address, dest_address, amount);
-    VideoCommon::Nx2StageProbe::NoteDmaBufferCache(copied);
     if (buffer_cache.Nx2CopyListPages(scheduler.CurrentTick())) {
         scheduler.Flush();
     }
@@ -3544,7 +3518,6 @@ template <bool IS_IMAGE_UPLOAD>
 bool AccelerateDMA::DmaBufferImageCopy(const Tegra::DMA::ImageCopy& copy_info,
                                        const Tegra::DMA::BufferOperand& buffer_operand,
                                        const Tegra::DMA::ImageOperand& image_operand) {
-    VideoCommon::Nx2StageProbe::NoteTextureToBufferCache();
     std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
     const auto image_id = texture_cache.DmaImageId(image_operand, IS_IMAGE_UPLOAD);
     if (image_id == VideoCommon::NULL_IMAGE_ID) {
