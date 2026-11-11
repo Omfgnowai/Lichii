@@ -243,6 +243,8 @@ private:
     /// Stage A with B on its own thread: `callback` runs on B where it splices A's commands
     /// (false, and nothing queued, otherwise).
     bool DeferToStageB(std::function<void()>&& callback);
+    static bool DeferQueries();
+    void ResetCounterNow(VideoCommon::QueryType type);
     void StartBackStages();
     void StopBackStages();
     /// Stage A: notes what B reads for the slot, hands it to B and takes the next.
