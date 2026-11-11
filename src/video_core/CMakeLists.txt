@@ -18,14 +18,11 @@ add_library(video_core STATIC
     buffer_cache/buffer_cache_base.h
     buffer_cache/buffer_cache.cpp
     buffer_cache/buffer_cache.h
-    buffer_cache/geometry_ranges.h
     buffer_cache/memory_tracker_base.h
     buffer_cache/usage_tracker.h
     buffer_cache/virtual_range_cache.h
     buffer_cache/word_manager.h
     cache_types.h
-    back_split_pool.cpp
-    back_split_pool.h
     capture.h
     cdma_pusher.cpp
     cdma_pusher.h
@@ -177,8 +174,6 @@ add_library(video_core STATIC
     renderer_vulkan/present/window_adapt_pass.h
     renderer_vulkan/blit_image.cpp
     renderer_vulkan/blit_image.h
-    renderer_vulkan/vk_back_split.cpp
-    renderer_vulkan/vk_back_split.h
     renderer_vulkan/fixed_pipeline_state.cpp
     renderer_vulkan/fixed_pipeline_state.h
     renderer_vulkan/framebuffer_clear_layers.h

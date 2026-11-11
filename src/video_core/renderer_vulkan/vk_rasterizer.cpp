@@ -428,9 +428,6 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
     VideoCommon::GpuSplit::Get().SetIdleHook(
         [](void* argument) { static_cast<Scheduler*>(argument)->FlushDeferred(); },
         &scheduler);
-    if (const std::optional<u32> workers = BackSplit::Workers()) {
-        back_split.emplace(*workers);
-    }
 }
 
 RasterizerVulkan::~RasterizerVulkan() {
@@ -790,18 +787,6 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     }
     fast_draw_verify = fast_draw_on && FastDraw::VerifyEnabled();
     const u64 fast_draw_start = fast_draw_on ? Profile::Now() : 0;
-    // EDEN_NX2_BACK_SPLIT: a worker resolves the index and vertex stream ranges from here until
-    // the buffer cache takes them under the locks.
-    BackSplit* const split = back_split ? &*back_split : nullptr;
-    if (split != nullptr) {
-        split->PostGeometry(*maxwell3d, *gpu_memory, is_indexed);
-    }
-    SCOPE_EXIT {
-        if (split != nullptr) {
-            split->JoinGeometry();
-            split->Report();
-        }
-    };
     {
         Profile::Scope scope{Profile::Zone::FlushWork};
         FlushWork();
@@ -1033,11 +1018,6 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
             }
         }
     }
-    buffer_cache.UsePreparedGeometry(split != nullptr ? split->TakeGeometry(*maxwell3d, *gpu_memory)
-                                                      : nullptr);
-    SCOPE_EXIT {
-        buffer_cache.UsePreparedGeometry(nullptr);
-    };
     const bool delta_holds =
         delta_pipeline != nullptr && DeltaStillHolds(draw_serial, draw_map_serial);
     const DrawPath path = delta_holds && !verify_pipeline ? DrawPath::Delta : DrawPath::Full;
@@ -1049,9 +1029,6 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
             return;
         }
         ++fast_draw_stats.delta;
-        if (split != nullptr) {
-            split->NoteDeltaDraw();
-        }
     } else {
         // What the delta draw would have kept: the texture buffer bindings.
         const u64 kept_bindings =
@@ -1059,7 +1036,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         if (fast_draw_on) {
             pipeline->CaptureNextDelta(verify_views);
         }
-        if (Profile::Scope scope{Profile::Zone::Configure}; !pipeline->Configure(is_indexed, split)) {
+        if (Profile::Scope scope{Profile::Zone::Configure}; !pipeline->Configure(is_indexed)) {
             report_failure("configure failed");
             TraceRenderState(is_indexed, "configure-failed", nullptr);
             return;
@@ -1073,9 +1050,6 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         }
     }
 
-    if (split != nullptr) {
-        split->FinishGeometry(pipeline->ShaderHashes()[1]);
-    }
 #ifdef EGLANTINE_STREAMLINE
     TrackOcarinaCamera();
     TrackOcarinaActor(pipeline->ShaderHashes()[1], is_indexed, is_indirect);

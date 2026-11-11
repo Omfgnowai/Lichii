@@ -21,7 +21,6 @@
 #include "video_core/oot_network.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/renderer_vulkan/blit_image.h"
-#include "video_core/renderer_vulkan/vk_back_split.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
 #include "video_core/renderer_vulkan/vk_descriptor_buffer.h"
 #include "video_core/renderer_vulkan/vk_descriptor_pool.h"
@@ -453,8 +452,6 @@ private:
     /// Nx2FastDraw::Enabled and VerifyEnabled as the drawing thread last read them.
     bool fast_draw_on{};
     bool fast_draw_verify{};
-    /// EDEN_NX2_BACK_SPLIT: the pool that prepares pieces of each draw (vk_back_split.h).
-    std::optional<BackSplit> back_split;
 
     struct IndirectTrace {
         vk::Buffer readback;
