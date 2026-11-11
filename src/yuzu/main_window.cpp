@@ -3096,7 +3096,8 @@ void MainWindow::MaybePrepareBundledRecipe(u64 program_id, const std::string& ga
         return;
     }
     const std::filesystem::path recipe_dir{
-        (QCoreApplication::applicationDirPath() + QStringLiteral("/recipes")).toStdU16String()};
+        QString(QCoreApplication::applicationDirPath() + QStringLiteral("/recipes"))
+            .toStdU16String()};
     if (!std::filesystem::is_directory(recipe_dir, error)) {
         return;
     }
