@@ -672,8 +672,10 @@ void GpuSplit::StoreConsumed(u64 position) {
         // With stage B on its own thread the front's waits count B's position: entries are
         // consumed once B recorded the packets they made, and what the back holds goes to B now.
         ring->Publish();
-        ring->Mark(position);
-        return;
+        if (!DrawStages::FrontWaitsForA()) {
+            ring->Mark(position);
+            return;
+        }
     }
     consumed.store(position, std::memory_order_seq_cst);
     NotifyFront();

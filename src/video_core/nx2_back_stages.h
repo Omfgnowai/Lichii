@@ -4,6 +4,7 @@
 #pragma once
 
 #include <array>
+#include <cstdlib>
 #include <atomic>
 #include <functional>
 #include <mutex>
@@ -150,6 +151,17 @@ inline void* g_after_join_argument{};
 /// Called on the split's back thread as it exits: the ring stops on the thread that owns it.
 inline void (*g_back_exit)(void*){};
 inline void* g_back_exit_argument{};
+
+/// EDEN_NX2_BACK_STAGES_FRONT_A=1 (experiment): the split's front waits count the drawing
+/// thread's position, not B's. Semaphore releases then stay on that thread; only samples-counter
+/// reports go to B, marked unsettled from the start.
+[[nodiscard]] inline bool FrontWaitsForA() {
+    static const bool front_a = [] {
+        const char* value = std::getenv("EDEN_NX2_BACK_STAGES_FRONT_A");
+        return value != nullptr && value[0] == '1';
+    }();
+    return front_a;
+}
 
 /// On the thread that draws: hands the packets in flight to B and waits until B consumed them (a
 /// join at `site`), then records what A captured since. Anything there that uses B's state calls
