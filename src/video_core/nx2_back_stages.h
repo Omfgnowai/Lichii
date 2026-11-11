@@ -61,7 +61,7 @@ public:
     /// The packet in the slot Acquire returned is complete: hands the batch over once full.
     void Commit() {
         ++committed;
-        if (committed - published_local >= Batch) {
+        if (committed - published_local >= batch) {
             Publish();
         }
     }
@@ -114,6 +114,11 @@ private:
     Consume consume;
     MarkReached mark_reached;
     std::function<void()> thread_start;
+
+    // EDEN_NX2_BACK_STAGES_BATCH (packets per hand-over, default Batch) and
+    // EDEN_NX2_BACK_STAGES_SPIN_US (how long B, and A at a join, spin before blocking).
+    u64 batch{Batch};
+    u64 spin_ns{SpinNs};
 
     // Stage A's side.
     u64 committed{};
