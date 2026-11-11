@@ -50,7 +50,7 @@ Recommended settings
 - Pin GPU threads: on. Docked mode. VRAM usage: Aggressive.
 - Per-game "Frame rate limit (Switch 2)": 120 (or your refresh rate). Frame generation off while
   you judge native fps.
-- Logging: set the log filter to *:Warning (or *:Error) for play; *:Info costs some CPU.
+- Logging: keep the log filter at its default (*:Info) so the frame-time lines are written.
 
 Switching between this build and the main Lichii build
 ------------------------------------------------------
