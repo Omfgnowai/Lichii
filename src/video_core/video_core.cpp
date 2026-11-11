@@ -15,6 +15,7 @@
 #include "video_core/host1x/host1x.h"
 #include "video_core/nx2_cmdpage_diag.h"
 #include "video_core/nx2_download_trace.h"
+#include "video_core/nx2_perf.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/nx2_stage_probe.h"
 #include "video_core/nx2_stutter_trace.h"
@@ -58,6 +59,7 @@ void CreateGPU(std::optional<Tegra::GPU>& gpu, Core::Frontend::EmuWindow& emu_wi
     VideoCommon::StutterTrace::StartSession();
     Tegra::Nx2CmdPageDiag::ReadSwitch();
     VideoCommon::Nx2DownloadTrace::ReadSwitch();
+    VideoCommon::Nx2Perf::ReadSwitch();
 
     const auto nvdec_value = Settings::values.nvdec_emulation.GetValue();
     const bool use_nvdec = nvdec_value != Settings::NvdecEmulation::Off;
