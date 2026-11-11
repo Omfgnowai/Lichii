@@ -3,6 +3,7 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <thread>
 
 #include <catch2/catch_test_macros.hpp>
@@ -111,4 +112,45 @@ TEST_CASE("Semaphore waiters see what the writer wrote before the latch",
             waiters.Remove(&owners[word]);
         }
     }
+}
+
+TEST_CASE("Pending wakes end hardware and OS waits", "[video_core][nx2_waiters]") {
+    using namespace std::chrono_literals;
+    Tegra::Nx2PendingWake wake;
+    wake.Arm();
+    CHECK_FALSE(wake.Poll(std::chrono::steady_clock::now() + 1ms));
+    CHECK_FALSE(wake.Sleep(1ms));
+
+    // A wake between Arm and the wait is not lost.
+    wake.Notify();
+    CHECK(wake.Poll(std::chrono::steady_clock::now()));
+    CHECK(wake.Sleep(5s));
+    wake.Arm();
+    CHECK_FALSE(wake.Poll(std::chrono::steady_clock::now()));
+
+    for (int i = 0; i < 20; ++i) {
+        const bool sleep = i % 2 != 0;
+        wake.Arm();
+        std::jthread notifier([&] {
+            std::this_thread::sleep_for(1ms);
+            wake.Notify();
+        });
+        const auto start = std::chrono::steady_clock::now();
+        CHECK((sleep ? wake.Sleep(5s) : wake.Poll(start + 5s)));
+        CHECK(std::chrono::steady_clock::now() - start < 1s);
+    }
+}
+
+TEST_CASE("Latching writes wake the GPU thread", "[video_core][nx2_waiters]") {
+    Nx2SemaphoreWaiters waiters;
+    auto& wake = Tegra::Nx2PendingWake::Get();
+    const int owner{};
+    REQUIRE(waiters.Add(&owner, 0x1000, 5, Nx2SemaphoreWaiters::AcquireGequal));
+    wake.Arm();
+    waiters.OnWrite(0x1000, 4);
+    waiters.OnWrite(0x2000, 9);
+    CHECK_FALSE(wake.Poll(std::chrono::steady_clock::now()));
+    waiters.OnWrite(0x1000, 5);
+    CHECK(wake.Poll(std::chrono::steady_clock::now()));
+    waiters.Remove(&owner);
 }
