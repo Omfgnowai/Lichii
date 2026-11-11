@@ -24,7 +24,6 @@
 #include "common/scope_exit.h"
 #include "video_core/renderer_vulkan/maxwell_to_vk.h"
 #include "video_core/renderer_vulkan/pipeline_statistics.h"
-#include "video_core/renderer_vulkan/vk_back_split.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
 #include "video_core/renderer_vulkan/vk_frame_dump.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
@@ -232,7 +231,7 @@ bool Passes(const std::array<bool, NUM_STAGES>& stages,
     return true;
 }
 
-using ConfigureFuncPtr = bool (*)(GraphicsPipeline*, bool, BackSplit*);
+using ConfigureFuncPtr = bool (*)(GraphicsPipeline*, bool);
 
 template <typename Spec, typename... Specs>
 ConfigureFuncPtr FindSpec(const std::array<bool, NUM_STAGES>& stages,
@@ -630,7 +629,7 @@ void GraphicsPipeline::AddTransition(GraphicsPipeline* transition) {
 }
 
 template <typename Spec>
-bool GraphicsPipeline::ConfigureImpl(bool is_indexed, BackSplit* back_split) {
+bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     boost::container::small_vector<VideoCommon::ImageViewInOut, 160> views;
     boost::container::small_vector<VideoCommon::SamplerId, 96> samplers;
     views.reserve(num_image_elements);
@@ -989,24 +988,6 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed, BackSplit* back_split) {
         }
     }
 
-    // EDEN_NX2_BACK_SPLIT: a worker builds the image descriptors while the buffers are resolved,
-    // synchronized and bound below; views and samplers stay as they are until it is joined.
-    const bool images_posted = back_split != nullptr && back_split->PostsImages() &&
-                               (num_textures != 0 || Spec::has_images);
-    if (images_posted) {
-        std::array<const Shader::Info*, NUM_STAGES> infos{};
-        for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
-            infos[stage] = Spec::enabled_stages[stage] ? &stage_infos[stage] : nullptr;
-        }
-        back_split->PostImageDescriptors(texture_cache, infos, samplers.data(), views.data());
-    }
-    SCOPE_EXIT {
-        if (images_posted) {
-            back_split->JoinImageDescriptors();
-        }
-    };
-    std::optional<bool> prepared_images;
-
     if (regs.transform_feedback_enabled != 0) {
         scheduler.RequestOutsideRenderPassOperationContext();
     }
@@ -1041,21 +1022,8 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed, BackSplit* back_split) {
             Profile::Scope scope{Profile::Zone::PushDescriptors};
             Nx2StageProbe::Scope stage_probe{Nx2StageProbe::Region::Descriptors};
             const size_t first_entry = guest_descriptor_queue.UpdateCount();
-            if (images_posted && !prepared_images) {
-                prepared_images = back_split->TakeImageDescriptors(texture_cache, rescaling);
-            }
-            if (prepared_images.value_or(false)) {
-                guest_descriptor_queue.AddEntries(back_split->ImageDescriptors(stage));
-            } else {
-                PushImageDescriptors(texture_cache, guest_descriptor_queue, stage_infos[stage],
-                                     rescaling, samplers_it, views_it);
-                if (images_posted) {
-                    back_split->VerifyImageDescriptors(
-                        key.Hash(), stage,
-                        {guest_descriptor_queue.UpdateData() + first_entry,
-                         guest_descriptor_queue.UpdateCount() - first_entry});
-                }
-            }
+            PushImageDescriptors(texture_cache, guest_descriptor_queue, stage_infos[stage],
+                                 rescaling, samplers_it, views_it);
             Nx2StageProbe::AddPacketBytes(Nx2StageProbe::PacketImageBytes *
                                           static_cast<u32>(guest_descriptor_queue.UpdateCount() -
                                                            first_entry));
@@ -1087,9 +1055,6 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed, BackSplit* back_split) {
     }
     if constexpr (Spec::enabled_stages[4]) {
         prepare_stage(4);
-    }
-    if (images_posted && !prepared_images.value_or(false)) {
-        back_split->VerifyRescaling(key.Hash(), rescaling);
     }
     if (captured_delta) {
         kept_rescaling = rescaling.Data();
