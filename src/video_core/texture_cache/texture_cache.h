@@ -3377,7 +3377,12 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
     // its exact shape (not used for a frame), as EXP43 moves a drifted one.
     const bool reuse_shaped = ReuseEnabled() && clearing_render_targets &&
                               RelocationShaped(new_info) && overwritten_by_clear();
-    if (reuse_shaped && join_bad_overlap_ids.empty() && join_copies_to_do.empty() &&
+    // Bad overlaps of other shapes (neighbouring targets in the per-frame arena) stay bad
+    // overlaps, linked to the reused image as to a new one; one of the same shape is EXP43's.
+    const bool no_same_shape_overlap = std::ranges::none_of(
+        join_bad_overlap_ids,
+        [&](ImageId id) { return SameRelocationShape(slot_images[id].info, new_info); });
+    if (reuse_shaped && no_same_shape_overlap && join_copies_to_do.empty() &&
         join_left_aliased_ids.empty() && join_right_aliased_ids.empty() &&
         join_ignore_textures.empty()) {
         const RelocationShape& shape = relocation_shapes[RelocationShapeKey(new_info)];
@@ -3386,6 +3391,23 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
                 relocation_seen = true;
                 ++relocation_reused;
                 RelocateImage(old_id, gpu_addr, cpu_addr);
+                Image& moved = slot_images[old_id];
+                for (const ImageId other_id : join_bad_overlap_ids) {
+                    if (other_id == old_id) {
+                        continue;
+                    }
+                    ImageBase& other = slot_images[other_id];
+                    other.overlapping_images.push_back(old_id);
+                    moved.overlapping_images.push_back(other_id);
+                    if (other.info.resources.levels == 1 && other.info.block.depth == 0 &&
+                        other.overlapping_images.size() > 1) {
+                        other.flags |= ImageFlagBits::BadOverlap;
+                    }
+                    if (moved.info.resources.levels == 1 && moved.info.block.depth == 0 &&
+                        moved.overlapping_images.size() > 1) {
+                        moved.flags |= ImageFlagBits::BadOverlap;
+                    }
+                }
                 return old_id;
             }
         }
