@@ -449,7 +449,16 @@ bool Maxwell3D::IsFastDrawAttributeFormat(u32 method, u32 old_value, u32 new_val
         return attribute.constant != 0 ? 0U
                                        : classes[static_cast<size_t>(attribute.type.Value())];
     };
-    return type_class(old_value) == type_class(new_value);
+    if (type_class(old_value) == type_class(new_value)) {
+        return true;
+    }
+    // A type class change of an attribute the current pipeline's vertex shader does not read:
+    // its canonical key drops that attribute's type, so the same pipeline is looked up.
+    const u32 index = method - formats;
+    return VideoCommon::Nx2FastDraw::AttributeMaskEnabled() &&
+           ((VideoCommon::Nx2FastDraw::g_attribute_read_mask.load(std::memory_order_relaxed) >>
+             index) &
+            1) == 0;
 }
 
 bool Maxwell3D::IsFastDrawDeltaMethod(u32 method) {

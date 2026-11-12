@@ -99,6 +99,22 @@ inline std::atomic<bool> g_vertex_layout_dynamic{false};
     return allowed && g_vertex_layout_dynamic.load(std::memory_order_relaxed);
 }
 
+/// The generic attributes the current graphics pipeline's vertex shader reads, as its key was
+/// canonicalized with (PipelineCache::CurrentGraphicsPipeline; all ones when the key keeps every
+/// attribute). An attribute format write that changes the type class of an attribute outside it
+/// leaves the canonical key, so the pipeline, as it was (FixedPipelineState::CanonicalizeNative).
+inline std::atomic<u32> g_attribute_read_mask{~0U};
+
+/// EDEN_NX2_FAST_ATTR_MASK=1: attribute format writes to attributes the current pipeline does
+/// not read are draw parameters whatever their type class (off by default while measured).
+[[nodiscard]] inline bool AttributeMaskEnabled() {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_FAST_ATTR_MASK");
+        return value != nullptr && value[0] == '1';
+    }();
+    return enabled;
+}
+
 inline std::atomic<u64> g_serial{1};
 /// The last break's reason and, for Register and Method, its 3D method (diagnostics).
 inline std::atomic<u32> g_last_break{};
