@@ -520,7 +520,7 @@ GraphicsPipeline* RasterizerVulkan::TakeReusableDraw(bool is_indexed, bool is_in
     FastDraw::g_delta.Reset();
     const FastDraw::Delta& delta = taken_delta;
     const auto full = [&](FullDraw reason) -> GraphicsPipeline* {
-        ++fast_draw_stats.full[static_cast<size_t>(reason)];
+        ++draw_stats->full[static_cast<size_t>(reason)];
         return nullptr;
     };
     if (draw.pipeline == nullptr) {
@@ -534,14 +534,14 @@ GraphicsPipeline* RasterizerVulkan::TakeReusableDraw(bool is_indexed, bool is_in
     }
     if (draw.serial != FastDraw::Serial()) {
         const u32 last_break = FastDraw::g_last_break.load(std::memory_order_relaxed);
-        ++fast_draw_stats.breaks[last_break & 0xff];
+        ++draw_stats->breaks[last_break & 0xff];
         if (const u32 method = last_break >> 8; method < Maxwell::NUM_REGS) {
-            ++fast_draw_stats.break_methods[method];
+            ++draw_stats->break_methods[method];
         }
         return full(FullDraw::StateChanged);
     }
     if (draw.map_serial != gpu_memory->MapSerial()) {
-        ++fast_draw_stats.breaks[static_cast<size_t>(FastDraw::Reason::Map)];
+        ++draw_stats->breaks[static_cast<size_t>(FastDraw::Reason::Map)];
         return full(FullDraw::StateChanged);
     }
     if (draw.tick != scheduler.CurrentTick()) {
@@ -552,7 +552,7 @@ GraphicsPipeline* RasterizerVulkan::TakeReusableDraw(bool is_indexed, bool is_in
         return full(FullDraw::RenderPass);
     }
     if (!draw.pipeline->TakesDeltaDraws()) {
-        ++fast_draw_stats.delta_blockers[static_cast<size_t>(draw.pipeline->DeltaDrawBlocker())];
+        ++draw_stats->delta_blockers[static_cast<size_t>(draw.pipeline->DeltaDrawBlocker())];
         return full(FullDraw::DeltaPipeline);
     }
     const auto& handles = draw.pipeline->HandleConstantBuffers();
@@ -584,7 +584,7 @@ GraphicsPipeline* RasterizerVulkan::TakeReusableDraw(bool is_indexed, bool is_in
 
 bool RasterizerVulkan::DeltaStillHolds(u64 serial, u64 map_serial) {
     const auto full = [&](FullDraw reason) {
-        ++fast_draw_stats.full[static_cast<size_t>(reason)];
+        ++draw_stats->full[static_cast<size_t>(reason)];
         return false;
     };
     // TakeReusableDraw ran before the caches were locked, while other threads could still write,
@@ -628,7 +628,7 @@ void RasterizerVulkan::NoteResolvedDraw(GraphicsPipeline* pipeline, bool is_inde
         return std::nullopt;
     }();
     if (ineligible) {
-        ++fast_draw_stats.ineligible[static_cast<size_t>(*ineligible)];
+        ++draw_stats->ineligible[static_cast<size_t>(*ineligible)];
         return;
     }
     reusable_draw = ReusableDraw{
@@ -650,7 +650,13 @@ void RasterizerVulkan::ReportFastDraws() {
         stats.window_start = now;
         return;
     }
-    if (now - stats.window_start < 10'000'000'000ULL) {
+    // EDEN_NX2_FAST_DRAW_STATS_MS: report window (default 10 s).
+    static const u64 window_ns = [] {
+        const char* const value = std::getenv("EDEN_NX2_FAST_DRAW_STATS_MS");
+        const u64 ms = value != nullptr ? std::strtoull(value, nullptr, 10) : 0;
+        return (ms != 0 ? ms : 10'000ULL) * 1'000'000ULL;
+    }();
+    if (now - stats.window_start < window_ns) {
         return;
     }
     // Logged only with EDEN_NX2_GPU_PROFILE, EDEN_NX2_FAST_DRAW_VERIFY or EDEN_NX2_FAST_DRAW_STATS=1
@@ -659,20 +665,31 @@ void RasterizerVulkan::ReportFastDraws() {
         const char* const value = std::getenv("EDEN_NX2_FAST_DRAW_STATS");
         return value != nullptr && value[0] == '1';
     }();
-    if (!VideoCommon::Nx2Profile::Enabled() && !fast_draw_verify && !stats_wanted) {
-        stats = FastDrawStats{.window_start = now};
-        return;
+    if (VideoCommon::Nx2Profile::Enabled() || fast_draw_verify || stats_wanted) {
+        const double seconds = static_cast<double>(now - stats.window_start) / 1e9;
+        // Draws into render passes without color targets (shadow maps, depth prepasses) are
+        // counted apart: their per-draw cost decides how much the shadow cascades cost the back.
+        ReportFastDrawStats(fast_draw_stats, "", seconds);
+        if (depth_draw_stats.prepare_draws[0] + depth_draw_stats.prepare_draws[1] +
+                depth_draw_stats.delta != 0) {
+            ReportFastDrawStats(depth_draw_stats, "Depth-only: ", seconds);
+        }
     }
-    const double seconds = static_cast<double>(now - stats.window_start) / 1e9;
+    fast_draw_stats = FastDrawStats{.window_start = now};
+    depth_draw_stats = FastDrawStats{.window_start = now};
+}
+
+void RasterizerVulkan::ReportFastDrawStats(const FastDrawStats& stats, std::string_view label,
+                                           double seconds) {
     const auto per_second = [&](FullDraw reason) {
         return static_cast<double>(stats.full[static_cast<size_t>(reason)]) / seconds;
     };
     LOG_INFO(Render_Vulkan,
-             "Fast draw per second: {:.0f} delta | full: {:.0f} after an ineligible draw, {:.0f} "
+             "{}Fast draw per second: {:.0f} delta | full: {:.0f} after an ineligible draw, {:.0f} "
              "different kind, {:.0f} state changed, {:.0f} after a submit, {:.0f} render pass or "
              "pipeline changed, {:.0f} pipeline takes no delta draws, {:.0f} handle buffer bound, "
              "{:.0f} handle data written, {:.0f} sampled image to prepare",
-             static_cast<double>(stats.delta) / seconds, per_second(FullDraw::NoCandidate),
+             label, static_cast<double>(stats.delta) / seconds, per_second(FullDraw::NoCandidate),
              per_second(FullDraw::Kind), per_second(FullDraw::StateChanged),
              per_second(FullDraw::Submitted), per_second(FullDraw::RenderPass),
              per_second(FullDraw::DeltaPipeline), per_second(FullDraw::HandleBind),
@@ -709,17 +726,17 @@ void RasterizerVulkan::ReportFastDraws() {
     }
     ineligible += " | pipelines without delta draws:" + (blockers.empty() ? std::string{" none"} : blockers);
     LOG_INFO(Render_Vulkan,
-             "Fast draw ineligible per second:{} | prepare us per draw: full {:.2f}, delta {:.2f}, "
+             "{}Fast draw ineligible per second:{} | prepare us per draw: full {:.2f}, delta {:.2f}, "
              "all {:.2f} ({:.0f} draws/s)",
-             ineligible, micros(DrawPath::Full), micros(DrawPath::Delta),
+             label, ineligible, micros(DrawPath::Full), micros(DrawPath::Delta),
              all_draws == 0 ? 0.0 : static_cast<double>(all_ns) / 1e3 / static_cast<double>(all_draws),
              static_cast<double>(all_draws) / seconds);
     if (fast_draw_verify) {
         LOG_INFO(Render_Vulkan,
-                 "Fast draw verify per second: {:.0f} checked, {:.0f} pipeline mismatches, {:.0f} "
+                 "{}Fast draw verify per second: {:.0f} checked, {:.0f} pipeline mismatches, {:.0f} "
                  "view or sampler mismatches, {:.0f} kept buffer binding mismatches (totals {} {} "
                  "{} {})",
-                 static_cast<double>(stats.verified) / seconds,
+                 label, static_cast<double>(stats.verified) / seconds,
                  static_cast<double>(stats.pipeline_mismatches) / seconds,
                  static_cast<double>(stats.view_mismatches) / seconds,
                  static_cast<double>(stats.binding_mismatches) / seconds, stats.verified,
@@ -745,10 +762,10 @@ void RasterizerVulkan::ReportFastDraws() {
         top += fmt::format(" {:#x}:{:.0f}", methods[i].second,
                            static_cast<double>(methods[i].first) / seconds);
     }
-    LOG_INFO(Render_Vulkan, "Fast draw state changes per second by last break:{} | by method:{}",
-             breaks, top);
-    stats = FastDrawStats{.window_start = now};
+    LOG_INFO(Render_Vulkan, "{}Fast draw state changes per second by last break:{} | by method:{}",
+             label, breaks, top);
 }
+
 
 // Experimental adaptation of PokeDinner commit 76df4591a747: execute the reset shader's
 // indirect record writes on the host until general GPU-address translation is available.
@@ -870,9 +887,11 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         reusable_draw = {};
         FastDraw::g_delta.Reset();
         fast_draw_stats = {};
+        depth_draw_stats = {};
     }
     fast_draw_verify = fast_draw_on && FastDraw::VerifyEnabled();
     const u64 fast_draw_start = fast_draw_on ? Profile::Now() : 0;
+    draw_stats = maxwell3d->regs.rt_control.count == 0 ? &depth_draw_stats : &fast_draw_stats;
     // EDEN_NX2_BACK_SPLIT: a worker resolves the index and vertex stream ranges from here until
     // the buffer cache takes them under the locks.
     BackSplit* const split = back_split ? &*back_split : nullptr;
@@ -915,8 +934,8 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     }()};
     const bool verify_views = verify_pipeline != nullptr && verify_pipeline == pipeline;
     if (verify_pipeline != nullptr) {
-        ++fast_draw_stats.verified;
-        fast_draw_stats.pipeline_mismatches += verify_pipeline != pipeline ? 1 : 0;
+        ++draw_stats->verified;
+        draw_stats->pipeline_mismatches += verify_pipeline != pipeline ? 1 : 0;
     }
     if (!pipeline) {
         report_failure("no pipeline");
@@ -1150,7 +1169,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
             TraceRenderState(is_indexed, "configure-failed", nullptr);
             return;
         }
-        ++fast_draw_stats.delta;
+        ++draw_stats->delta;
         if (split != nullptr) {
             split->NoteDeltaDraw();
         }
@@ -1167,11 +1186,11 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
             return;
         }
         if (verify_views && pipeline->DeltaMismatch()) {
-            ++fast_draw_stats.view_mismatches;
+            ++draw_stats->view_mismatches;
         }
         if (verify_views &&
             kept_bindings != buffer_cache.KeptGraphicsBindingsHash(false, false, true)) {
-            ++fast_draw_stats.binding_mismatches;
+            ++draw_stats->binding_mismatches;
         }
     }
 
@@ -1267,8 +1286,8 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     if (fast_draw_on) {
         NoteResolvedDraw(pipeline, is_indexed, is_indirect, draw_serial, draw_map_serial);
         const size_t index = static_cast<size_t>(path);
-        fast_draw_stats.prepare_ns[index] += Profile::Now() - fast_draw_start;
-        ++fast_draw_stats.prepare_draws[index];
+        draw_stats->prepare_ns[index] += Profile::Now() - fast_draw_start;
+        ++draw_stats->prepare_draws[index];
     }
     static u32 native_capture_count{};
     if (maxwell3d->GetNativeMacroEngine().native_turing &&

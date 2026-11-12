@@ -441,6 +441,7 @@ private:
     void NoteResolvedDraw(GraphicsPipeline* pipeline, bool is_indexed, bool is_indirect, u64 serial,
                           u64 map_serial);
     void ReportFastDraws();
+    void ReportFastDrawStats(const FastDrawStats& stats, std::string_view label, double seconds);
     ReusableDraw reusable_draw;
     ReusableDraw taken_draw; ///< The draw TakeReusableDraw last returned the pipeline of
     /// Device memory of the constant buffers TakeReusableDraw checks for texture handle writes.
@@ -450,6 +451,8 @@ private:
     /// The constant buffer binds and data since the previous draw.
     VideoCommon::Nx2FastDraw::Delta taken_delta;
     FastDrawStats fast_draw_stats;
+    FastDrawStats depth_draw_stats; ///< Draws into passes without color targets
+    FastDrawStats* draw_stats = &fast_draw_stats; ///< The draw in progress counts here
     /// Nx2FastDraw::Enabled and VerifyEnabled as the drawing thread last read them.
     bool fast_draw_on{};
     bool fast_draw_verify{};
