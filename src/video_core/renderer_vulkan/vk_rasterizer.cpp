@@ -439,6 +439,79 @@ RasterizerVulkan::~RasterizerVulkan() {
     scheduler.Finish();
 }
 
+namespace {
+/// EDEN_NX2_FAST_HANDLE_WORDS=1: a constant buffer write into a buffer that holds texture
+/// handles ends delta draws only when it reaches a handle word the pipeline reads, not anywhere
+/// in the buffer (off by default while it is measured).
+bool FastHandleWordsEnabled() {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_FAST_HANDLE_WORDS");
+        return value != nullptr && value[0] == '1';
+    }();
+    return enabled;
+}
+
+/// Whether the delta's constant buffer writes reach a texture or image handle word the stage
+/// reads from constant buffer `slot` at `cbuf_address`: the words GraphicsPipeline's read_handle
+/// reads (offset + (index << size_shift), and the secondary word), by GPU address and by the
+/// device address each lands on.
+bool HandleWordsReached(const Tegra::MemoryManager& memory, const Shader::Info& info, u32 slot,
+                        GPUVAddr cbuf_address, const VideoCommon::Nx2FastDraw::Delta& delta) {
+    bool reached = false;
+    const auto check = [&](u32 offset) {
+        if (reached) {
+            return;
+        }
+        const GPUVAddr begin = cbuf_address + offset;
+        const GPUVAddr end = begin + sizeof(u32);
+        for (u32 write = 0; write < delta.num_writes; ++write) {
+            if (delta.write_begin[write] < end && begin < delta.write_end[write]) {
+                reached = true;
+                return;
+            }
+        }
+        if (delta.num_device_writes == 0) {
+            return;
+        }
+        // A word never crosses a page (handles are 4-byte aligned).
+        const std::optional<DAddr> device = memory.GpuToCpuAddress(begin);
+        if (!device) {
+            reached = true; // unmapped: as the whole-buffer check would decide
+            return;
+        }
+        const DAddr device_end = *device + sizeof(u32);
+        for (u32 write = 0; write < delta.num_device_writes; ++write) {
+            if (delta.device_begin[write] < device_end && *device < delta.device_end[write]) {
+                reached = true;
+                return;
+            }
+        }
+    };
+    const auto words = [&](const auto& descriptors) {
+        for (const auto& desc : descriptors) {
+            if (desc.cbuf_index == slot) {
+                for (u32 index = 0; index < desc.count && !reached; ++index) {
+                    check(desc.cbuf_offset + (index << desc.size_shift));
+                }
+            }
+            if constexpr (requires { desc.has_secondary; }) {
+                if (desc.has_secondary && desc.secondary_cbuf_index == slot) {
+                    check(desc.secondary_cbuf_offset);
+                }
+            }
+            if (reached) {
+                return;
+            }
+        }
+    };
+    words(info.texture_buffer_descriptors);
+    words(info.image_buffer_descriptors);
+    words(info.texture_descriptors);
+    words(info.image_descriptors);
+    return reached;
+}
+} // Anonymous namespace
+
 GraphicsPipeline* RasterizerVulkan::TakeReusableDraw(bool is_indexed, bool is_indirect) {
     namespace FastDraw = VideoCommon::Nx2FastDraw;
     const ReusableDraw draw = std::exchange(reusable_draw, ReusableDraw{});
@@ -496,7 +569,11 @@ GraphicsPipeline* RasterizerVulkan::TakeReusableDraw(bool is_indexed, bool is_in
             FastDraw::DeviceSpans& spans = handle_spans[stage][slot];
             spans.Update(*gpu_memory, cbuf.address, cbuf.size);
             if (delta.Reaches(cbuf.address, cbuf.size, spans)) {
-                return full(FullDraw::HandleData);
+                const Shader::Info* const info = draw.pipeline->StageInfo(stage);
+                if (!FastHandleWordsEnabled() || info == nullptr ||
+                    HandleWordsReached(*gpu_memory, *info, slot, cbuf.address, delta)) {
+                    return full(FullDraw::HandleData);
+                }
             }
         }
     }
