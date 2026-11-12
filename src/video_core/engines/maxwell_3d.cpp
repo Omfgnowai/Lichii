@@ -367,6 +367,22 @@ bool Maxwell3D::IsFastDrawParameter(u32 method) {
         }();
         return parameter;
     }
+    case 0x154: // SET_MME_MEM_ADDRESS_A
+    case 0x155: // SET_MME_MEM_ADDRESS_B
+    case 0x156: // SET_MME_DATA_RAM_ADDRESS
+    case 0x157: // MME_DMA_READ
+    case 0x158: { // MME_DMA_READ_FIFOED
+        // The macro engine's own memory reads: NVN's conditional render macro points them at
+        // each draw's query report (Ocarina of Time: the last break of ~14k full draws a second
+        // in the build-76 stats run). Nothing a delta draw keeps reads them; the render enable
+        // the macro sets from the read is a query method above. EDEN_NX2_FAST_MME_REGS=1 treats
+        // them as parameters (off by default while it is measured).
+        static const bool parameter = [] {
+            const char* const value = std::getenv("EDEN_NX2_FAST_MME_REGS");
+            return value != nullptr && value[0] == '1';
+        }();
+        return parameter;
+    }
     default:
         return DrawManager::IsInstanceLoopMethod(method) || IsFastDrawDeltaMethod(method) ||
                IsFastDrawVertexBuffer(method) || IsFastDrawQueryMethod(method);
