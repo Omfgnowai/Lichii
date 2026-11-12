@@ -650,7 +650,7 @@ void TextureCache<P>::TickFrame() {
 
     runtime.TickFrame();
     ++frame_tick;
-    if (relocation_seen && frame_tick % 600 == 0) {
+    if ((relocation_seen || ReuseEnabled()) && frame_tick % 600 == 0) {
         u32 guarded_shapes = 0;
         for (const auto& [key, shape] : relocation_shapes) {
             guarded_shapes += shape.guard != 0 ? 1 : 0;
@@ -664,6 +664,25 @@ void TextureCache<P>::TickFrame() {
                  relocation_relocated, relocation_retired, relocation_crowded, guarded_shapes,
                  relocation_shapes.size(), relocation_guarded_addresses.size(), relocation_reused,
                  reuse_misses);
+        if (ReuseEnabled()) {
+            // Why cleared render targets of relocation shape were made new instead of reused.
+            LOG_INFO(HW_GPU,
+                     "Render target reuse blocks: {} not overwritten by the clear, {} same-shape "
+                     "overlap, {} copies or aliases, {} shape guard, {} address guard, {} empty "
+                     "pool; pooled images passed over: {} used in the last 2 frames, {} guarded, "
+                     "{} excluded, {} other channel, {} downloading, {} bound; far loads kept "
+                     "off the shape guard {}",
+                     reuse_blocks[ReuseBlockNotOverwritten], reuse_blocks[ReuseBlockSameShapeOverlap],
+                     reuse_blocks[ReuseBlockJoin], reuse_blocks[ReuseBlockShapeGuard],
+                     reuse_blocks[ReuseBlockAddressGuard], reuse_blocks[ReuseBlockEmptyPool],
+                     reuse_rejects[ReuseRejectRecent], reuse_rejects[ReuseRejectGuard],
+                     reuse_rejects[ReuseRejectExcluded], reuse_rejects[ReuseRejectChannel],
+                     reuse_rejects[ReuseRejectDownload], reuse_rejects[ReuseRejectBound],
+                     relocation_far_loads);
+            reuse_blocks.fill(0);
+            reuse_rejects.fill(0);
+            relocation_far_loads = 0;
+        }
         relocation_candidates = relocation_guarded = relocation_relocated = relocation_retired =
             relocation_crowded = relocation_reused = reuse_misses = 0;
     }
@@ -3375,13 +3394,31 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
     }
     // EDEN_NX2_RT_REUSE: a cleared render target that overlaps nothing takes a pooled image of
     // its exact shape (not used for a frame), as EXP43 moves a drifted one.
-    const bool reuse_shaped = ReuseEnabled() && clearing_render_targets &&
-                              RelocationShaped(new_info) && overwritten_by_clear();
+    const bool reuse_overwritten =
+        ReuseEnabled() && clearing_render_targets && RelocationShaped(new_info) &&
+        overwritten_by_clear();
+    const bool reuse_shaped = reuse_overwritten;
+    if (ReuseEnabled() && clearing_render_targets && RelocationShaped(new_info) &&
+        !reuse_overwritten) {
+        ++reuse_blocks[ReuseBlockNotOverwritten];
+    }
     // Bad overlaps of other shapes (neighbouring targets in the per-frame arena) stay bad
     // overlaps, linked to the reused image as to a new one; one of the same shape is EXP43's.
     const bool no_same_shape_overlap = std::ranges::none_of(
         join_bad_overlap_ids,
         [&](ImageId id) { return SameRelocationShape(slot_images[id].info, new_info); });
+    if (reuse_shaped) {
+        if (!no_same_shape_overlap) {
+            ++reuse_blocks[ReuseBlockSameShapeOverlap];
+        } else if (!join_copies_to_do.empty() || !join_left_aliased_ids.empty() ||
+                   !join_right_aliased_ids.empty() || !join_ignore_textures.empty()) {
+            ++reuse_blocks[ReuseBlockJoin];
+        } else if (relocation_shapes[RelocationShapeKey(new_info)].guard != 0) {
+            ++reuse_blocks[ReuseBlockShapeGuard];
+        } else if (relocation_guarded_addresses.contains(gpu_addr)) {
+            ++reuse_blocks[ReuseBlockAddressGuard];
+        }
+    }
     if (reuse_shaped && no_same_shape_overlap && join_copies_to_do.empty() &&
         join_left_aliased_ids.empty() && join_right_aliased_ids.empty() &&
         join_ignore_textures.empty()) {
@@ -4710,7 +4747,8 @@ template <class P>
 ImageId TextureCache<P>::ReuseCandidate(const ImageInfo& new_info, GPUVAddr gpu_addr,
                                         DAddr cpu_addr) {
     const auto pool = reuse_pool.find(RelocationShapeKey(new_info));
-    if (pool == reuse_pool.end()) {
+    if (pool == reuse_pool.end() || pool->second.empty()) {
+        ++reuse_blocks[ReuseBlockEmptyPool];
         return ImageId{};
     }
     constexpr DAddr StandInBase = ~(1ULL << 40);
@@ -4737,6 +4775,7 @@ ImageId TextureCache<P>::ReuseCandidate(const ImageInfo& new_info, GPUVAddr gpu_
         // Used (prepared) or written in this frame or the previous one: it may still be read.
         if (image.last_use_frame + 2 > frame_tick ||
             (image.last_write_frame != ~u64{0} && image.last_write_frame + 2 > frame_tick)) {
+            ++reuse_rejects[ReuseRejectRecent];
             continue;
         }
         if (!SameRelocationShape(image.info, new_info) || image.relocation_guard_noted != 0 ||
@@ -4744,6 +4783,10 @@ ImageId TextureCache<P>::ReuseCandidate(const ImageInfo& new_info, GPUVAddr gpu_
             image.info.forced_flushed || image.info.dma_downloaded ||
             True(image.flags & excluded) || False(image.flags & ImageFlagBits::Registered) ||
             image.HasScaled() || !image.aliased_images.empty() || image.cpu_addr >= StandInBase) {
+            ++reuse_rejects[image.relocation_guard_noted != 0 ||
+                                    relocation_guarded_addresses.contains(image.gpu_addr)
+                                ? ReuseRejectGuard
+                                : ReuseRejectExcluded];
             continue;
         }
         if (image.last_use_frame >= best_use) {
@@ -4752,11 +4795,13 @@ ImageId TextureCache<P>::ReuseCandidate(const ImageInfo& new_info, GPUVAddr gpu_
         // Registered in this channel's GPU page table.
         const auto page = gpu_pages.find(image.gpu_addr >> YUZU_PAGEBITS);
         if (page == gpu_pages.end() || std::ranges::find(page->second, id) == page->second.end()) {
+            ++reuse_rejects[ReuseRejectChannel];
             continue;
         }
         if (queued(id, uncommitted_downloads) ||
             std::ranges::any_of(committed_downloads,
                                 [&](const auto& downloads) { return queued(id, downloads); })) {
+            ++reuse_rejects[ReuseRejectDownload];
             continue;
         }
         // Not bound as a target of this clear.
@@ -4773,6 +4818,7 @@ ImageId TextureCache<P>::ReuseCandidate(const ImageInfo& new_info, GPUVAddr gpu_
             bound = true;
         }
         if (bound) {
+            ++reuse_rejects[ReuseRejectBound];
             continue;
         }
         best = id;
@@ -4789,6 +4835,21 @@ template <class P>
 void TextureCache<P>::NoteRelocationGuard(ImageBase& image, RelocationGuard reason) {
     image.relocation_guard_noted |= reason;
     relocation_guarded_addresses[image.gpu_addr] |= reason;
+    // EDEN_NX2_RELOC_FAR_LOAD=<frames>: a render target drawn to without a clear more than this
+    // many frames after the GPU last wrote it guards its address and itself, not its whole
+    // shape. Ocarina of Time's per-frame arena hands an address back to a target of the same
+    // shape hundreds of frames later (202 of 431 shape trips in AO1 were over 200 frames), which
+    // guarded 442 of 458 shapes for the session; a target kept across frames (history, a
+    // dialogue box drawn over several frames) trips within a few frames and guards its shape.
+    static const u64 far_load = [] {
+        const char* const value = std::getenv("EDEN_NX2_RELOC_FAR_LOAD");
+        return value != nullptr ? std::strtoull(value, nullptr, 10) : 0ULL;
+    }();
+    if (far_load != 0 && reason == GuardLoaded && image.last_write_frame != ~u64{0} &&
+        frame_tick > image.last_write_frame + far_load) {
+        ++relocation_far_loads;
+        return;
+    }
     RelocationShape& shape = relocation_shapes[RelocationShapeKey(image.info)];
     if ((shape.guard & reason) != 0) {
         return;

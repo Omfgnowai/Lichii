@@ -662,6 +662,30 @@ private:
     ::Common::unordered_map<u64, std::vector<ImageId>> reuse_pool;
     u64 relocation_reused{};
     u64 reuse_misses{};
+    /// Why a cleared render target of relocation shape was made new (TickFrame's report).
+    enum ReuseBlock : size_t {
+        ReuseBlockNotOverwritten,
+        ReuseBlockSameShapeOverlap,
+        ReuseBlockJoin,
+        ReuseBlockShapeGuard,
+        ReuseBlockAddressGuard,
+        ReuseBlockEmptyPool,
+        ReuseBlockCount,
+    };
+    /// Why ReuseCandidate passed over a pooled image.
+    enum ReuseReject : size_t {
+        ReuseRejectRecent,
+        ReuseRejectGuard,
+        ReuseRejectExcluded,
+        ReuseRejectChannel,
+        ReuseRejectDownload,
+        ReuseRejectBound,
+        ReuseRejectCount,
+    };
+    std::array<u64, ReuseBlockCount> reuse_blocks{};
+    std::array<u64, ReuseRejectCount> reuse_rejects{};
+    /// GuardLoaded trips kept off the shape guard (EDEN_NX2_RELOC_FAR_LOAD).
+    u64 relocation_far_loads{};
 
     /// Removes the image from its overlaps' overlap lists (DeleteImage, RelocateImage).
     void DropOverlapLinks(ImageId image_id);
