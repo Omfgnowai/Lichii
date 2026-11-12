@@ -71,6 +71,7 @@ add_library(dynarmic STATIC
     frontend/decoder/matcher.h
     frontend/imm.cpp
     frontend/imm.h
+    interface/block_hook.h
     interface/halt_reason.h
     interface/exclusive_monitor.h
     interface/optimization_flags.h

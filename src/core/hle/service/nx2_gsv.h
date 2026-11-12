@@ -78,6 +78,7 @@
 #include "core/hle/service/sm/sm.h"
 #include "core/hle/service/server_manager.h"
 #include "core/hle/service/service.h"
+#include "common/nx2_sampler.h"
 
 namespace Service {
 
@@ -1834,6 +1835,7 @@ private:
             m_vsync->trace_present.store(m_presents, std::memory_order_relaxed);
         }
         const u64 present = Core::g_nx2_present_count.fetch_add(1, std::memory_order_relaxed) + 1;
+        ::Nx2Sampler::NotePresent();
         if (Core::g_nx2_present_time_services.load(std::memory_order_relaxed) != 0) {
             const u64 present_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
                                        std::chrono::steady_clock::now().time_since_epoch())

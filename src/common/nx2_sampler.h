@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <cstddef>
+#include <cstdint>
 #include <string>
 
 namespace Nx2Sampler {
@@ -14,6 +16,18 @@ namespace Nx2Sampler {
 // function (where the thread is, and everything on its stack) go to EDEN_NX2_SAMPLE_OUT
 // (default nx2_samples.txt).
 void StartFromEnvironment();
+
+/// Timeline recording, on whenever EDEN_NX2_SAMPLE is set: every sample also gets its time,
+/// the thread's CPU cycles and (CPU cores) the guest thread on the core; game presents and JIT
+/// blocks are logged so the analysis can split samples by frame time and name game code.
+/// The report then also writes <out>.timeline.tsv, <out>.stacks.tsv and <out>.presents.tsv.
+bool Recording();
+/// The kernel scheduler switched core `core` to guest thread `thread_id`.
+void NoteCoreThread(unsigned core, std::uint64_t thread_id);
+/// The JIT emitted host code [start, start + size) for the guest code at `guest_pc`.
+void NoteJitBlock(const void* start, std::size_t size, std::uint64_t guest_pc);
+/// The game presented a frame.
+void NotePresent();
 
 /// Samples the named threads for `seconds` now (blocking), writes the report to `out` (and
 /// the folded stacks to `out`.folded) and returns the report.

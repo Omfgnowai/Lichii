@@ -17,6 +17,8 @@
 #include "core/core_timing.h"
 #include "core/hle/kernel/k_process.h"
 #include "dynarmic/interface/A64/config.h"
+#include "dynarmic/interface/block_hook.h"
+#include "common/nx2_sampler.h"
 
 namespace Core {
 
@@ -299,6 +301,14 @@ void DynarmicCallbacks64::ReturnException(u64 pc, Dynarmic::HaltReason hr) {
 }
 
 void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_space_bits) {
+    // EDEN_NX2_SAMPLE: log every JIT block (host range -> guest PC) so the sampling profiler
+    // can name game code.
+    if (::Nx2Sampler::Recording() && Dynarmic::g_block_hook == nullptr) {
+        Dynarmic::g_block_hook = [](const void* start, std::size_t size, std::uint64_t location) {
+            constexpr std::uint64_t PcMask = (std::uint64_t{1} << 56) - 1;
+            ::Nx2Sampler::NoteJitBlock(start, size, location & PcMask);
+        };
+    }
     Dynarmic::A64::UserConfig config;
 
     // Callbacks

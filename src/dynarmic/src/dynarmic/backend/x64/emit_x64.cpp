@@ -7,6 +7,7 @@
  */
 
 #include "dynarmic/backend/x64/emit_x64.h"
+#include "dynarmic/interface/block_hook.h"
 
 #include <iterator>
 
@@ -350,6 +351,9 @@ Xbyak::Label EmitX64::EmitCond(IR::Cond cond) {
 
 EmitX64::BlockDescriptor EmitX64::RegisterBlock(const IR::LocationDescriptor& descriptor, CodePtr entrypoint, size_t size) {
     PerfMapRegister(entrypoint, code.getCurr(), LocationDescriptorToFriendlyName(descriptor));
+    if (const BlockHook hook = g_block_hook) {
+        hook(entrypoint, size, descriptor.Value());
+    }
     Patch(descriptor, entrypoint);
 
     BlockDescriptor block_desc{entrypoint, size};

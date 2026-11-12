@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -33,16 +34,47 @@ namespace {
 constexpr size_t MaxDepth = 40;
 
 struct Sample {
+    DWORD64 qpc;          ///< QueryPerformanceCounter when taken
+    DWORD64 cycles;       ///< the thread's CPU cycles so far (QueryThreadCycleTime)
+    DWORD64 guest_thread; ///< CPU cores: the guest thread on the core, else 0
+    size_t offset;        ///< first frame in the frame store
     unsigned thread;
     unsigned depth;
-    std::array<DWORD64, MaxDepth> frames;
 };
 
 struct Target {
     HANDLE handle;
     std::string name;
     const NT_TIB* tib; ///< the thread's stack bounds, null if unknown
+    int core;          ///< N for CPUCore_N, else -1
 };
+
+constexpr size_t MaxCores = 8;
+std::array<std::atomic<DWORD64>, MaxCores> g_core_thread{};
+
+struct JitBlock {
+    DWORD64 start;
+    DWORD64 end;
+    DWORD64 guest_pc;
+    DWORD64 qpc;
+};
+std::mutex g_log_mutex;
+std::vector<JitBlock> g_jit_blocks;
+std::vector<DWORD64> g_presents;
+
+DWORD64 Qpc() {
+    LARGE_INTEGER value{};
+    QueryPerformanceCounter(&value);
+    return static_cast<DWORD64>(value.QuadPart);
+}
+
+bool RecordingEnabled() {
+    static const bool enabled = [] {
+        const char* names = std::getenv("EDEN_NX2_SAMPLE");
+        return names != nullptr && *names != '\0';
+    }();
+    return enabled;
+}
 
 const NT_TIB* ThreadTib(HANDLE handle) {
     struct BasicInformation {
@@ -134,7 +166,14 @@ std::vector<Target> FindThreads(const std::vector<std::string>& patterns) {
             LocalFree(wide);
         }
         if (Matches(name, patterns)) {
-            targets.push_back({handle, name, ThreadTib(handle)});
+            int core = -1;
+            if (name.rfind("CPUCore_", 0) == 0) {
+                core = std::atoi(name.c_str() + 8);
+                if (core < 0 || core >= static_cast<int>(MaxCores)) {
+                    core = -1;
+                }
+            }
+            targets.push_back({handle, name, ThreadTib(handle), core});
         } else {
             CloseHandle(handle);
         }
@@ -341,9 +380,109 @@ struct Symbolizer {
     std::unordered_map<DWORD64, std::string> cache;
 };
 
+// JIT code named by the guest code it runs ("g:<guest pc of the block>"): the block covering
+// the address that was emitted last before the sample (the code cache reuses addresses).
+class JitNames {
+public:
+    JitNames() {
+        std::scoped_lock lock{g_log_mutex};
+        blocks = g_jit_blocks;
+        std::sort(blocks.begin(), blocks.end(),
+                  [](const JitBlock& a, const JitBlock& b) { return a.start < b.start; });
+    }
+    /// 0 when no block covers `address` at `qpc`.
+    DWORD64 GuestPc(DWORD64 address, DWORD64 qpc) const {
+        auto it = std::upper_bound(blocks.begin(), blocks.end(), address,
+                                   [](DWORD64 value, const JitBlock& b) { return value < b.start; });
+        DWORD64 best_qpc = 0;
+        DWORD64 best_pc = 0;
+        for (int scanned = 0; it != blocks.begin() && scanned < 512; ++scanned) {
+            --it;
+            if (address < it->end && it->qpc <= qpc && it->qpc >= best_qpc) {
+                best_qpc = it->qpc;
+                best_pc = it->guest_pc;
+            }
+        }
+        return best_pc;
+    }
+    size_t Size() const {
+        return blocks.size();
+    }
+
+private:
+    std::vector<JitBlock> blocks;
+};
+
+template <typename Names>
+void WriteTimeline(const std::vector<Target>& targets, const std::vector<Sample>& samples,
+                   const std::vector<DWORD64>& store, Names& symbolizer, const char* path) {
+    const JitNames jit;
+    std::vector<DWORD64> presents;
+    {
+        std::scoped_lock lock{g_log_mutex};
+        presents = g_presents;
+    }
+    LARGE_INTEGER frequency{};
+    QueryPerformanceFrequency(&frequency);
+    std::unordered_map<std::string, unsigned> stack_ids;
+    std::vector<const std::string*> stacks;
+    const std::string base{path};
+    if (std::FILE* const out = std::fopen((base + ".timeline.tsv").c_str(), "w")) {
+        std::fprintf(out, "# qpc_frequency %lld\n", static_cast<long long>(frequency.QuadPart));
+        for (unsigned i = 0; i < targets.size(); ++i) {
+            std::fprintf(out, "# thread %u %s\n", i, targets[i].name.c_str());
+        }
+        std::fprintf(out, "# jit_blocks %zu\n# qpc\tthread\tcycles\tguest_thread\tstack\n",
+                     jit.Size());
+        std::string line;
+        for (const Sample& sample : samples) {
+            line.clear();
+            for (unsigned i = sample.depth; i-- > 0;) {
+                const DWORD64 address = store[sample.offset + i];
+                const std::string& name = symbolizer.Name(address);
+                if (!line.empty()) {
+                    line += ';';
+                }
+                if (name == "(jit)") {
+                    if (const DWORD64 pc = jit.GuestPc(address, sample.qpc); pc != 0) {
+                        line += fmt::format("g:{:#x}", pc);
+                        continue;
+                    }
+                }
+                line += name;
+            }
+            const auto [it, is_new] =
+                stack_ids.try_emplace(line, static_cast<unsigned>(stacks.size()));
+            if (is_new) {
+                stacks.push_back(&it->first);
+            }
+            std::fprintf(out, "%llu\t%u\t%llu\t%llx\t%u\n",
+                         static_cast<unsigned long long>(sample.qpc), sample.thread,
+                         static_cast<unsigned long long>(sample.cycles),
+                         static_cast<unsigned long long>(sample.guest_thread), it->second);
+        }
+        std::fclose(out);
+    }
+    if (std::FILE* const out = std::fopen((base + ".stacks.tsv").c_str(), "w")) {
+        for (size_t i = 0; i < stacks.size(); ++i) {
+            std::fprintf(out, "%zu\t%s\n", i, stacks[i]->c_str());
+        }
+        std::fclose(out);
+    }
+    if (std::FILE* const out = std::fopen((base + ".presents.tsv").c_str(), "w")) {
+        for (const DWORD64 qpc : presents) {
+            std::fprintf(out, "%llu\n", static_cast<unsigned long long>(qpc));
+        }
+        std::fclose(out);
+    }
+}
+
 std::string Report(const std::vector<Target>& targets, const std::vector<Sample>& samples,
-                   const char* path) {
+                   const std::vector<DWORD64>& store, const char* path) {
     Symbolizer symbolizer;
+    const auto frame = [&store](const Sample& sample, unsigned i) {
+        return store[sample.offset + i];
+    };
     std::string text;
     for (unsigned thread = 0; thread < targets.size(); ++thread) {
         std::map<std::string, unsigned> self;
@@ -355,14 +494,14 @@ std::string Report(const std::vector<Target>& targets, const std::vector<Sample>
                 continue;
             }
             ++total;
-            const std::string& top = symbolizer.Name(sample.frames[0]);
+            const std::string& top = symbolizer.Name(frame(sample, 0));
             ++self[top];
             if (sample.depth > 1) {
-                ++self_caller[top + "  <-  " + symbolizer.Name(sample.frames[1])];
+                ++self_caller[top + "  <-  " + symbolizer.Name(frame(sample, 1))];
             }
             std::set<std::string> seen;
             for (unsigned i = 0; i < sample.depth; ++i) {
-                const std::string& name = symbolizer.Name(sample.frames[i]);
+                const std::string& name = symbolizer.Name(frame(sample, i));
                 if (seen.insert(name).second) {
                     ++inclusive[name];
                 }
@@ -389,7 +528,7 @@ std::string Report(const std::vector<Target>& targets, const std::vector<Sample>
         std::map<DWORD64, unsigned> addresses;
         for (const Sample& sample : samples) {
             if (sample.thread == thread && sample.depth != 0) {
-                ++addresses[sample.frames[0]];
+                ++addresses[frame(sample, 0)];
             }
         }
         std::vector<std::pair<unsigned, DWORD64>> hot;
@@ -428,7 +567,7 @@ std::string Report(const std::vector<Target>& targets, const std::vector<Sample>
         std::string line = targets[sample.thread].name;
         for (unsigned i = sample.depth; i-- > 0;) {
             line += ';';
-            line += symbolizer.Name(sample.frames[i]);
+            line += symbolizer.Name(frame(sample, i));
         }
         ++folded[line];
     }
@@ -437,6 +576,9 @@ std::string Report(const std::vector<Target>& targets, const std::vector<Sample>
             std::fprintf(out, "%s %u\n", line.c_str(), count);
         }
         std::fclose(out);
+    }
+    if (RecordingEnabled()) {
+        WriteTimeline(targets, samples, store, symbolizer, path);
     }
     return text;
 }
@@ -450,11 +592,28 @@ std::string SampleThreads(const std::vector<std::string>& patterns, double secon
         return "no thread matches";
     }
     const std::vector<ModuleRange> modules = ListModules();
+    // EDEN_NX2_SAMPLE_INTERVAL_MS: pause between rounds (default 1; 2 halves the data of a
+    // whole benchmark tour).
+    static const DWORD interval_ms = [] {
+        const char* text = std::getenv("EDEN_NX2_SAMPLE_INTERVAL_MS");
+        const long value = text != nullptr ? std::atol(text) : 1;
+        return static_cast<DWORD>(value >= 0 && value <= 1000 ? value : 1);
+    }();
+    constexpr size_t MaxSamples = size_t{24} << 20;
     std::vector<Sample> samples;
-    samples.reserve(static_cast<size_t>(seconds * 1100.0) * targets.size() + 16);
+    std::vector<DWORD64> store;
+    samples.reserve(static_cast<size_t>(seconds * 700.0) * targets.size() + 16);
+    store.reserve(samples.capacity() * 8);
+    std::array<DWORD64, MaxDepth> frames{};
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::duration<double>(seconds);
-    while (std::chrono::steady_clock::now() < deadline &&
-           samples.size() + targets.size() <= samples.capacity()) {
+    while (std::chrono::steady_clock::now() < deadline && samples.size() < MaxSamples) {
+        // Grow the buffers only while no thread is paused (a paused thread may hold the heap).
+        if (samples.capacity() - samples.size() < targets.size()) {
+            samples.reserve(samples.capacity() * 2);
+        }
+        if (store.capacity() - store.size() < targets.size() * MaxDepth) {
+            store.reserve(store.capacity() * 2 + targets.size() * MaxDepth);
+        }
         for (unsigned i = 0; i < targets.size(); ++i) {
             const HANDLE handle = targets[i].handle;
             if (SuspendThread(handle) == static_cast<DWORD>(-1)) {
@@ -464,18 +623,29 @@ std::string SampleThreads(const std::vector<std::string>& patterns, double secon
             context.ContextFlags = CONTEXT_FULL;
             if (GetThreadContext(handle, &context)) {
                 Sample& sample = samples.emplace_back();
+                sample.qpc = Qpc();
+                ULONG64 cycles{};
+                QueryThreadCycleTime(handle, &cycles);
+                sample.cycles = cycles;
+                sample.guest_thread =
+                    targets[i].core >= 0
+                        ? g_core_thread[static_cast<size_t>(targets[i].core)].load(
+                              std::memory_order_relaxed)
+                        : 0;
                 sample.thread = i;
-                sample.depth = Walk(context, sample.frames, targets[i].tib, modules);
+                sample.depth = Walk(context, frames, targets[i].tib, modules);
+                sample.offset = store.size();
+                store.insert(store.end(), frames.begin(), frames.begin() + sample.depth);
             }
             ResumeThread(handle);
         }
-        Sleep(1);
+        Sleep(interval_ms);
     }
     // DbgHelp is single-threaded: the debug server's `sample` and EDEN_NX2_SAMPLE can report at
     // the same time.
     static std::mutex report_mutex;
     std::unique_lock report_lock{report_mutex};
-    std::string text = Report(targets, samples, out.c_str());
+    std::string text = Report(targets, samples, store, out.c_str());
     report_lock.unlock();
     std::fprintf(stderr, "nx2 sampler: %zu samples written to %s\n", samples.size(), out.c_str());
     for (const auto& target : targets) {
@@ -488,6 +658,37 @@ std::string SampleThreads(const std::vector<std::string>& patterns, double secon
 
 std::string Sample(const char* names, double seconds, const std::string& out) {
     return SampleThreads(SplitNames(names), seconds, out);
+}
+
+bool Recording() {
+    return RecordingEnabled();
+}
+
+void NoteCoreThread(unsigned core, std::uint64_t thread_id) {
+    if (core < MaxCores && RecordingEnabled()) {
+        g_core_thread[core].store(thread_id, std::memory_order_relaxed);
+    }
+}
+
+void NoteJitBlock(const void* start, std::size_t size, std::uint64_t guest_pc) {
+    if (!RecordingEnabled()) {
+        return;
+    }
+    const auto begin = reinterpret_cast<DWORD64>(start);
+    std::scoped_lock lock{g_log_mutex};
+    if (g_jit_blocks.size() < (size_t{8} << 20)) {
+        g_jit_blocks.push_back({begin, begin + size, guest_pc, Qpc()});
+    }
+}
+
+void NotePresent() {
+    if (!RecordingEnabled()) {
+        return;
+    }
+    std::scoped_lock lock{g_log_mutex};
+    if (g_presents.size() < (size_t{4} << 20)) {
+        g_presents.push_back(Qpc());
+    }
 }
 
 void StartFromEnvironment() {
@@ -509,6 +710,12 @@ void StartFromEnvironment() {
 #else
 
 namespace Nx2Sampler {
+bool Recording() {
+    return false;
+}
+void NoteCoreThread(unsigned, std::uint64_t) {}
+void NoteJitBlock(const void*, std::size_t, std::uint64_t) {}
+void NotePresent() {}
 void StartFromEnvironment() {}
 std::string Sample(const char*, double, const std::string&) {
     return "the sampler is Windows only";

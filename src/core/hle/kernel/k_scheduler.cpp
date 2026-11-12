@@ -21,6 +21,7 @@
 #include "core/hle/kernel/k_thread.h"
 #include "core/hle/kernel/kernel.h"
 #include "core/hle/kernel/physical_core.h"
+#include "common/nx2_sampler.h"
 
 namespace Kernel {
 
@@ -373,6 +374,7 @@ void KScheduler::SwitchThread(KernelCore& kernel, KThread* next_thread) {
     // Set the new thread.
     SetCurrentThread(kernel, next_thread);
     m_current_thread = next_thread;
+    ::Nx2Sampler::NoteCoreThread(static_cast<unsigned>(m_core_id), next_thread->GetThreadId());
 
     // Set the new Thread Local region.
     // cpu::SwitchThreadLocalRegion(GetInteger(next_thread->GetThreadLocalRegionAddress()));
