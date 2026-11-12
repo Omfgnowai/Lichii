@@ -589,7 +589,21 @@ private:
         u8 guard{};
         bool candidate_logged{};
         bool relocated_logged{};
+        bool lineage_logged{};
     };
+    /// EDEN_NX2_RELOC_LINEAGE=1: a cross-frame read of an image that did not drift (a target the
+    /// game keeps at one address, like the main depth buffer) guards only its address, not its
+    /// whole shape: one such buffer of a shape kept every drifting per-frame target of that shape
+    /// from relocating (Kokiri Forest: 2560x1440 and 640x360 depth, 2560x1440 format 21).
+    [[nodiscard]] static bool LineageGuard() {
+        static const bool enabled = [] {
+            const char* const value = std::getenv("EDEN_NX2_RELOC_LINEAGE");
+            return value != nullptr && value[0] == '1';
+        }();
+        return enabled;
+    }
+    u64 relocation_shape_trips_skipped{}; ///< Shape trips the lineage guard kept to the address
+    bool pending_churn_born{};
     ::Common::unordered_map<u64, RelocationShape> relocation_shapes;
     /// The guard by address too: OoT draws every dialogue box's text into a render target at one
     /// address, sized to the box, so per shape each new box size relocated once before its guard

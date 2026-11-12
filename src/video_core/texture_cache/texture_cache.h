@@ -754,6 +754,12 @@ void TextureCache<P>::TickFrame() {
                  reuse_misses);
         relocation_candidates = relocation_guarded = relocation_relocated = relocation_retired =
             relocation_crowded = relocation_reused = reuse_misses = 0;
+        if (LineageGuard()) {
+            LOG_INFO(HW_GPU, "Render target relocation lineage guard: {} cross-frame reads of "
+                             "non-drifting targets kept to their address",
+                     relocation_shape_trips_skipped);
+            relocation_shape_trips_skipped = 0;
+        }
     }
 
     if constexpr (IMPLEMENTS_ASYNC_DOWNLOADS) {
@@ -3442,6 +3448,15 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
             return false;
         }
     };
+    // A drifting per-frame target: cleared over an earlier image of its shape the GPU did not
+    // write in this frame (what EXP43 relocates). Targets kept at one address have none.
+    pending_churn_born =
+        clearing_render_targets && RelocationShaped(new_info) &&
+        std::ranges::any_of(join_bad_overlap_ids, [&](ImageId id) {
+            const ImageBase& overlap = slot_images[id];
+            return SameRelocationShape(overlap.info, new_info) &&
+                   overlap.last_write_frame != frame_tick;
+        });
     // EDEN_NX2_EXP43 (port of Fritchii EXP43): a cleared render target that drifted off an
     // image of its shape takes that image's place (2, 3: the image moves here, keeping its host
     // image, views and framebuffers) or retires it at once (1). Ocarina of Time's bump-allocated
@@ -3482,6 +3497,7 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
                     RelocateImage(old_id, gpu_addr, cpu_addr);
                     // The other bad overlaps are linked to it as to a new image.
                     Image& moved = slot_images[old_id];
+                    moved.churn_born = true;
                     for (const ImageId other_id : join_bad_overlap_ids) {
                         if (other_id == old_id) {
                             continue;
@@ -3573,6 +3589,8 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
         }
     }
     Image& new_image = slot_images[new_image_id];
+    new_image.churn_born = pending_churn_born;
+    pending_churn_born = false;
 
     new_image.allocation_tick = frame_tick;
     new_image.last_use_frame = frame_tick;
@@ -4954,6 +4972,19 @@ void TextureCache<P>::NoteRelocationGuard(ImageBase& image, RelocationGuard reas
     image.relocation_guard_noted |= reason;
     relocation_guarded_addresses[image.gpu_addr] |= reason;
     RelocationShape& shape = relocation_shapes[RelocationShapeKey(image.info)];
+    if (LineageGuard() && !image.churn_born && reason != GuardCpuRead) {
+        ++relocation_shape_trips_skipped;
+        if (!shape.lineage_logged) {
+            shape.lineage_logged = true;
+            LOG_INFO(HW_GPU,
+                     "Render target relocation guard (EXP43, lineage): format {} {}x{} at {:#x} "
+                     "{} in a later frame; not a drifting target, so only its address is guarded",
+                     static_cast<u32>(image.info.format), image.info.size.width,
+                     image.info.size.height, image.gpu_addr,
+                     reason == GuardSampled ? "sampled" : "rendered to without a clear");
+        }
+        return;
+    }
     if ((shape.guard & reason) != 0) {
         return;
     }

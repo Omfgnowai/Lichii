@@ -140,6 +140,9 @@ struct ImageBase {
     /// (~0 = never, or contents discarded), and the guard reasons this image already reported.
     u64 last_write_frame = ~u64{0};
     u8 relocation_guard_noted = 0;
+    /// Cleared over an earlier image of its own shape: a drifting per-frame target
+    /// (EDEN_NX2_RELOC_LINEAGE).
+    bool churn_born = false;
     /// Render target reuse (EDEN_NX2_RT_REUSE): the frame the image was last prepared (sampled,
     /// copied, rendered to), and whether it is in the reuse pool of its shape.
     u64 last_use_frame = 0;
