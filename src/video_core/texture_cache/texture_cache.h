@@ -8,6 +8,7 @@
 
 #include <chrono>
 #include <algorithm>
+#include <set>
 #include <functional>
 #include <numeric>
 #include <cstdlib>
@@ -2649,6 +2650,39 @@ bool TextureCache<P>::ImageCanRescale(ImageBase& image) {
         image.info.size.width == image.info.size.height) {
         const bool is_color = GetFormatType(image.info.format) == SurfaceType::ColorTexture;
         if (!is_color || (no_rescale_square >= 2 && image.info.size.width >= 256)) {
+            return false;
+        }
+    }
+    // EDEN_NX2_NO_RESCALE_SQUARE_SIZES=4096,2400: keep square images of exactly these guest
+    // widths at guest size (any format), to find which shadow map breaks lighting at non-1x
+    // scales. Logs each square size/format asked about once.
+    static const std::vector<u32> no_rescale_sizes = [] {
+        std::vector<u32> sizes;
+        if (const char* value = std::getenv("EDEN_NX2_NO_RESCALE_SQUARE_SIZES")) {
+            for (const char* c = value; *c != '\0';) {
+                char* end{};
+                const unsigned long size = std::strtoul(c, &end, 10);
+                if (end == c) {
+                    ++c;
+                    continue;
+                }
+                sizes.push_back(static_cast<u32>(size));
+                c = end;
+            }
+        }
+        return sizes;
+    }();
+    if (!no_rescale_sizes.empty() && image.info.type == ImageType::e2D &&
+        image.info.size.width == image.info.size.height) {
+        static std::set<std::pair<u32, u32>> logged;
+        const bool excluded = std::find(no_rescale_sizes.begin(), no_rescale_sizes.end(),
+                                        image.info.size.width) != no_rescale_sizes.end();
+        if (logged.emplace(image.info.size.width, static_cast<u32>(image.info.format)).second) {
+            LOG_INFO(HW_GPU, "Square image {}x{} format {} at {:#x}: {}", image.info.size.width,
+                     image.info.size.height, static_cast<u32>(image.info.format),
+                     image.gpu_addr, excluded ? "kept at guest size" : "may rescale");
+        }
+        if (excluded) {
             return false;
         }
     }
