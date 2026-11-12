@@ -2640,6 +2640,17 @@ bool TextureCache<P>::ImageCanRescale(ImageBase& image) {
     if (!image.info.rescaleable) {
         return false;
     }
+    // Huge render targets (8192+ on a side) are shadow atlases, never the screen: keep them at
+    // guest size. Ocarina of Time's 12288x12288 D16 static shadow map, scaled with the rest at
+    // 1.5x (18432x18432), lost the sun in the main lighting pass: the scene was lit by the sky
+    // alone, a purple/lavender tint at every scale but 1x. EDEN_NX2_RESCALE_HUGE=1 scales them.
+    static const bool rescale_huge = [] {
+        const char* value = std::getenv("EDEN_NX2_RESCALE_HUGE");
+        return value != nullptr && value[0] == '1';
+    }();
+    if (!rescale_huge && std::max(image.info.size.width, image.info.size.height) >= 8192) {
+        return false;
+    }
     // EDEN_NX2_NO_RESCALE_SQUARE: keep square images (shadow maps) at guest size when the
     // resolution scale is not 1x. 1 = depth images only, 2 = depth and color images of 256+.
     static const int no_rescale_square = [] {
