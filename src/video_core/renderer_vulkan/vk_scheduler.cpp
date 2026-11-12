@@ -24,6 +24,7 @@
 #include "common/settings.h"
 #include "common/dkb_cpu_trace.h"
 #include "common/thread.h"
+#include "common/nx2_sampler.h"
 #include "video_core/gpu_logging/gpu_logging.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/renderer_vulkan/upload_batch.h"
@@ -179,6 +180,27 @@ Scheduler::Scheduler(const Device& device_, StateTracker& state_tracker_)
         } else {
             LOG_INFO(Render_Vulkan, "DKB gpu_timestamp unsupported: valid_bits={} period_ns={}",
                      trace_timestamp_bits, trace_timestamp_period);
+        }
+    }
+
+    if (::Nx2Sampler::Recording()) {
+        const auto physical = device.GetPhysical();
+        timeline_bits =
+            physical.GetQueueFamilyProperties()[device.GetGraphicsFamily()].timestampValidBits;
+        timeline_period = physical.GetProperties().limits.timestampPeriod;
+        if (timeline_bits != 0 && timeline_bits <= 64 && timeline_period > 0) {
+            try {
+                timeline_pool = device.GetLogical().CreateQueryPool({
+                    .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
+                    .pNext = nullptr,
+                    .flags = 0,
+                    .queryType = VK_QUERY_TYPE_TIMESTAMP,
+                    .queryCount = TimelineSlots * 2,
+                    .pipelineStatistics = 0,
+                });
+            } catch (const vk::Exception& error) {
+                LOG_WARNING(Render_Vulkan, "GPU timeline unavailable: {}", error.what());
+            }
         }
     }
 
@@ -665,6 +687,47 @@ void Scheduler::AllocateWorkerCommandBuffer() {
     if (trace_query_pool && !trace_gpu_failed) {
         TraceGpuSubmission();
     }
+    if (timeline_pool) {
+        TimelineCollect();
+        if (timeline_pending.size() < TimelineSlots) {
+            timeline_slot = timeline_next_slot;
+            timeline_next_slot = (timeline_next_slot + 1) % TimelineSlots;
+            current_upload_cmdbuf.ResetQueryPool(*timeline_pool, timeline_slot * 2, 2);
+            current_upload_cmdbuf.WriteTimestamp(VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, *timeline_pool,
+                                                 timeline_slot * 2);
+            timeline_recording = true;
+        }
+    }
+}
+
+void Scheduler::TimelineCollect() {
+    if (timeline_pending.empty()) {
+        return;
+    }
+    master_semaphore->Refresh();
+    while (!timeline_pending.empty() && master_semaphore->IsFree(timeline_pending.front().tick)) {
+        const TimelinePending item = timeline_pending.front();
+        timeline_pending.pop_front();
+        struct Result {
+            u64 timestamp;
+            u64 available;
+        };
+        std::array<Result, 2> results{};
+        const auto result = device.GetLogical().GetQueryResults(
+            *timeline_pool, item.slot * 2, 2, sizeof(results), results.data(), sizeof(Result),
+            VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
+        if (result != VK_SUCCESS || results[0].available == 0 || results[1].available == 0) {
+            continue;
+        }
+        const u64 mask = timeline_bits >= 64 ? ~u64{0} : (u64{1} << timeline_bits) - 1;
+        const auto to_ns = [this](u64 ticks) {
+            return static_cast<u64>(static_cast<double>(ticks) * timeline_period);
+        };
+        const u64 begin = results[0].timestamp & mask;
+        const u64 end = begin + Common::DkbFrameTrace::TimestampDelta(
+                                    results[0].timestamp, results[1].timestamp, timeline_bits);
+        ::Nx2Sampler::NoteGpuSubmission(item.submit_qpc, to_ns(begin), to_ns(end));
+    }
 }
 
 void Scheduler::TraceShader(u64 hash, u32 stage) {
@@ -900,6 +963,12 @@ u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_se
         }
         if (trace_query_pool) {
             trace_work = {};
+        }
+        if (timeline_recording) {
+            cmdbuf.WriteTimestamp(VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, *timeline_pool,
+                                 timeline_slot * 2 + 1);
+            timeline_pending.push_back({signal_value, ::Nx2Sampler::NowQpc(), timeline_slot});
+            timeline_recording = false;
         }
         cmdbuf.End();
 

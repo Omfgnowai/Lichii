@@ -61,6 +61,19 @@ struct JitBlock {
 std::mutex g_log_mutex;
 std::vector<JitBlock> g_jit_blocks;
 std::vector<DWORD64> g_presents;
+struct GpuSubmission {
+    DWORD64 submit_qpc;
+    DWORD64 begin_ns;
+    DWORD64 end_ns;
+};
+std::vector<GpuSubmission> g_gpu;
+struct FileRead {
+    DWORD64 begin_qpc;
+    DWORD64 end_qpc;
+    DWORD64 bytes;
+    std::string path;
+};
+std::vector<FileRead> g_reads;
 
 DWORD64 Qpc() {
     LARGE_INTEGER value{};
@@ -484,6 +497,33 @@ void WriteTimeline(const std::vector<Target>& targets, const std::vector<Sample>
         }
         std::fclose(out);
     }
+    std::vector<GpuSubmission> gpu;
+    std::vector<FileRead> reads;
+    {
+        std::scoped_lock lock{g_log_mutex};
+        gpu = g_gpu;
+        reads = g_reads;
+    }
+    if (std::FILE* const out = std::fopen((base + ".gpu.tsv").c_str(), "w")) {
+        std::fprintf(out, "# submit_qpc\tgpu_begin_ns\tgpu_end_ns\n");
+        for (const GpuSubmission& item : gpu) {
+            std::fprintf(out, "%llu\t%llu\t%llu\n",
+                         static_cast<unsigned long long>(item.submit_qpc),
+                         static_cast<unsigned long long>(item.begin_ns),
+                         static_cast<unsigned long long>(item.end_ns));
+        }
+        std::fclose(out);
+    }
+    if (std::FILE* const out = std::fopen((base + ".reads.tsv").c_str(), "w")) {
+        std::fprintf(out, "# begin_qpc\tend_qpc\tbytes\tpath\n");
+        for (const FileRead& item : reads) {
+            std::fprintf(out, "%llu\t%llu\t%llu\t%s\n",
+                         static_cast<unsigned long long>(item.begin_qpc),
+                         static_cast<unsigned long long>(item.end_qpc),
+                         static_cast<unsigned long long>(item.bytes), item.path.c_str());
+        }
+        std::fclose(out);
+    }
     if (std::FILE* const out = std::fopen((base + ".presents.tsv").c_str(), "w")) {
         for (const DWORD64 qpc : presents) {
             std::fprintf(out, "%llu\n", static_cast<unsigned long long>(qpc));
@@ -706,6 +746,31 @@ void NotePresent() {
     }
 }
 
+std::uint64_t NowQpc() {
+    return Qpc();
+}
+
+void NoteGpuSubmission(std::uint64_t submit_qpc, std::uint64_t begin_ns, std::uint64_t end_ns) {
+    if (!RecordingEnabled()) {
+        return;
+    }
+    std::scoped_lock lock{g_log_mutex};
+    if (g_gpu.size() < (size_t{8} << 20)) {
+        g_gpu.push_back({submit_qpc, begin_ns, end_ns});
+    }
+}
+
+void NoteFileRead(std::uint64_t begin_qpc, std::uint64_t end_qpc, std::uint64_t bytes,
+                  const std::string& path) {
+    if (!RecordingEnabled()) {
+        return;
+    }
+    std::scoped_lock lock{g_log_mutex};
+    if (g_reads.size() < (size_t{4} << 20)) {
+        g_reads.push_back({begin_qpc, end_qpc, bytes, path});
+    }
+}
+
 void StartFromEnvironment() {
     const char* names = std::getenv("EDEN_NX2_SAMPLE");
     if (names == nullptr || *names == '\0') {
@@ -731,6 +796,11 @@ bool Recording() {
 void NoteCoreThread(unsigned, std::uint64_t) {}
 void NoteJitBlock(const void*, std::size_t, std::uint64_t) {}
 void NotePresent() {}
+std::uint64_t NowQpc() {
+    return 0;
+}
+void NoteGpuSubmission(std::uint64_t, std::uint64_t, std::uint64_t) {}
+void NoteFileRead(std::uint64_t, std::uint64_t, std::uint64_t, const std::string&) {}
 void StartFromEnvironment() {}
 std::string Sample(const char*, double, const std::string&) {
     return "the sampler is Windows only";

@@ -28,6 +28,15 @@ void NoteCoreThread(unsigned core, std::uint64_t thread_id);
 void NoteJitBlock(const void* start, std::size_t size, std::uint64_t guest_pc);
 /// The game presented a frame.
 void NotePresent();
+/// QueryPerformanceCounter now (0 off Windows): the clock of every timeline record.
+std::uint64_t NowQpc();
+/// One host GPU submission: submitted at `submit_qpc`, ran on the GPU from `begin_ns` to
+/// `end_ns` (GPU timestamp clock). Written to <out>.gpu.tsv.
+void NoteGpuSubmission(std::uint64_t submit_qpc, std::uint64_t begin_ns, std::uint64_t end_ns);
+/// A guest read of game data from `begin_qpc` to `end_qpc`: `bytes` from `path` (the first file
+/// the read touches, empty if unknown). Written to <out>.reads.tsv.
+void NoteFileRead(std::uint64_t begin_qpc, std::uint64_t end_qpc, std::uint64_t bytes,
+                  const std::string& path);
 
 /// Samples the named threads for `seconds` now (blocking), writes the report to `out` (and
 /// the folded stacks to `out`.folded) and returns the report.

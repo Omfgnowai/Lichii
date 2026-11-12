@@ -14,6 +14,7 @@
 
 #include "common/logging.h"
 #include "common/settings.h"
+#include "common/nx2_sampler.h"
 #include "core/file_sys/romfs.h"
 #include "core/file_sys/vfs/vfs_offset.h"
 #include "core/file_sys/errors.h"
@@ -59,9 +60,12 @@ Result IStorage::Read(
     }
 
     // Read the data from the Storage backend
-    const ReadTraceScope trace{ReadTraceSource::Storage, length};
-    backend->Read(out_bytes.data(), length, offset);
-    TraceRomFSRead(offset, length);
+    const u64 begin_qpc = ::Nx2Sampler::Recording() ? ::Nx2Sampler::NowQpc() : 0;
+    {
+        const ReadTraceScope trace{ReadTraceSource::Storage, length};
+        backend->Read(out_bytes.data(), length, offset);
+    }
+    TraceRomFSRead(offset, length, begin_qpc);
 
     R_SUCCEED();
 }
@@ -92,9 +96,10 @@ const std::vector<std::string>& RomFSTracePatterns() {
 }
 } // namespace
 
-void IStorage::TraceRomFSRead(s64 offset, s64 length) {
+void IStorage::TraceRomFSRead(s64 offset, s64 length, u64 begin_qpc) {
     const auto& patterns = RomFSTracePatterns();
-    if (patterns.empty() || length <= 0) {
+    const bool record = begin_qpc != 0;
+    if ((patterns.empty() && !record) || length <= 0) {
         return;
     }
     std::call_once(trace_index_once, [&] {
@@ -110,12 +115,17 @@ void IStorage::TraceRomFSRead(s64 offset, s64 length) {
                     if (view == nullptr || file->GetSize() == 0) {
                         continue;
                     }
+                    bool logged = false;
                     for (const auto& pattern : patterns) {
                         if (path.find(pattern) != std::string::npos) {
-                            traced_files.push_back(
-                                {view->GetOffset(), view->GetOffset() + file->GetSize(), path});
+                            logged = true;
                             break;
                         }
+                    }
+                    if (logged || record) {
+                        traced_files.push_back({view->GetOffset(),
+                                                view->GetOffset() + file->GetSize(), path,
+                                                logged});
                     }
                 }
                 for (const auto& sub : dir->GetSubdirectories()) {
@@ -135,8 +145,17 @@ void IStorage::TraceRomFSRead(s64 offset, s64 length) {
         --it;
     }
     const auto now = std::chrono::steady_clock::now();
+    bool noted = false;
     for (; it != traced_files.end() && it->begin < end; ++it) {
         if (it->end <= begin) {
+            continue;
+        }
+        if (record && !noted) {
+            noted = true;
+            ::Nx2Sampler::NoteFileRead(begin_qpc, ::Nx2Sampler::NowQpc(),
+                                       static_cast<u64>(length), it->path);
+        }
+        if (!it->logged) {
             continue;
         }
         std::scoped_lock lock{trace_mutex};
@@ -145,6 +164,11 @@ void IStorage::TraceRomFSRead(s64 offset, s64 length) {
             last = now;
             LOG_INFO(Service_FS, "Nx2RomFS read {}", it->path);
         }
+    }
+    if (record && !noted) {
+        static const std::string unknown;
+        ::Nx2Sampler::NoteFileRead(begin_qpc, ::Nx2Sampler::NowQpc(), static_cast<u64>(length),
+                                   unknown);
     }
 }
 

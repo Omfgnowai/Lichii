@@ -38,8 +38,11 @@ private:
         u64 begin;
         u64 end;
         std::string path;
+        bool logged; ///< matches EDEN_NX2_ROMFS_TRACE (else indexed only for the sampler)
     };
-    void TraceRomFSRead(s64 offset, s64 length);
+    /// With EDEN_NX2_SAMPLE every RomFS file is indexed and each read goes to the sampler's
+    /// timeline (Nx2Sampler::NoteFileRead) with its time and the first file it touches.
+    void TraceRomFSRead(s64 offset, s64 length, u64 begin_qpc);
     std::once_flag trace_index_once;
     std::vector<TracedFile> traced_files; ///< sorted by begin
     std::unordered_map<std::string, std::chrono::steady_clock::time_point> trace_last_logged;

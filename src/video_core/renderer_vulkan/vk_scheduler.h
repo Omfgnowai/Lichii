@@ -9,6 +9,7 @@
 #include <array>
 #include <chrono>
 #include <condition_variable>
+#include <deque>
 #include <cstddef>
 #include <functional>
 #include <memory>
@@ -489,6 +490,23 @@ private:
     bool uploads_pending{};
     /// Records pending uploads before another command, worker handoff, or submission tick.
     void FlushUploads();
+
+    /// EDEN_NX2_SAMPLE timeline: every submission timed on the GPU (begin and end timestamps
+    /// in a ring of query pairs), read back once its tick is free and handed to Nx2Sampler.
+    void TimelineCollect();
+    vk::QueryPool timeline_pool;
+    static constexpr u32 TimelineSlots = 2048;
+    struct TimelinePending {
+        u64 tick;
+        u64 submit_qpc;
+        u32 slot;
+    };
+    std::deque<TimelinePending> timeline_pending;
+    u32 timeline_next_slot{};
+    u32 timeline_slot{};
+    u32 timeline_bits{};
+    float timeline_period{};
+    bool timeline_recording{};
 
     vk::QueryPool trace_query_pool;
     static constexpr u32 TraceMaxSubmissions = 512;
