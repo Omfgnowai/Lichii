@@ -687,6 +687,42 @@ private:
     /// GuardLoaded trips kept off the shape guard (EDEN_NX2_RELOC_FAR_LOAD).
     u64 relocation_far_loads{};
 
+    /// EDEN_NX2_TC_KEEP_TEXTURES=<frames>: the collector leaves loaded textures (images the GPU
+    /// never wrote) this many frames after their last use while device memory is under the
+    /// expected threshold (13.8 GB on a 24 GB card); 0 (default) collects them at 50 frames.
+    [[nodiscard]] static u64 TextureKeepFrames() {
+        static const u64 frames = [] {
+            const char* const value = std::getenv("EDEN_NX2_TC_KEEP_TEXTURES");
+            return value != nullptr ? std::strtoull(value, nullptr, 10) : 0ULL;
+        }();
+        return frames;
+    }
+    /// Counts images the collector deleted and the cache made again (same address and shape).
+    [[nodiscard]] static bool RebuildTracking() {
+        static const bool enabled = [] {
+            const char* const value = std::getenv("EDEN_NX2_TC_REBUILD_LOG");
+            return (value != nullptr && value[0] == '1') || TextureKeepFrames() != 0;
+        }();
+        return enabled;
+    }
+    [[nodiscard]] static u64 CollectedKey(GPUVAddr gpu_addr, const ImageInfo& info) noexcept {
+        return (gpu_addr * 0x9E3779B97F4A7C15ULL) ^ RelocationShapeKey(info) ^
+               (u64{static_cast<u32>(info.type) & 0xF} << 60) ^ u64{info.size.depth};
+    }
+    struct CollectedEntry {
+        u64 frame{};
+        bool texture{};
+    };
+    ::Common::unordered_map<u64, CollectedEntry> collected_images;
+    struct RebuildTally {
+        u64 count{};
+        u64 ns{};
+        u64 age_sum{};
+    };
+    RebuildTally rebuilt_textures{};
+    RebuildTally rebuilt_targets{};
+    u64 tc_kept_textures{};
+
     /// Removes the image from its overlaps' overlap lists (DeleteImage, RelocateImage).
     void DropOverlapLinks(ImageId image_id);
 

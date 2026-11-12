@@ -146,6 +146,7 @@ TextureCache<P>::TextureCache(Runtime& runtime_, Tegra::MaxwellDeviceMemoryManag
 template <class P>
 void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
     const StutterTrace::SiteScope site{StutterTrace::Site::TextureCollect};
+    static const u64 keep_textures = TextureKeepFrames();
     bool high_priority_mode = false;
     bool aggressive_mode = false;
     bool evict_old_costly = false;
@@ -194,6 +195,10 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
             UntrackImage(image, image_id);
         }
         ++(True(image.flags & ImageFlagBits::CostlyLoad) ? gc_costly_deletes : gc_deletes);
+        if (RebuildTracking()) {
+            collected_images[CollectedKey(image.gpu_addr, image.info)] =
+                CollectedEntry{frame_tick, image.last_write_frame == ~u64{0}};
+        }
         UnregisterImage(image_id);
         DeleteImage(image_id, image.scale_tick > frame_tick + 5);
         if (out_of_memory) {
@@ -219,6 +224,17 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
             std::vector<ImageId> candidates;
             const size_t limit = num_iterations * 8;
             lru_cache.ForEachItemBelow(frame_tick - ticks_to_destroy, [&](ImageId image_id) {
+                if (keep_textures != 0 && !high_priority_mode) {
+                    // EDEN_NX2_TC_KEEP_TEXTURES: loaded textures (never written by the GPU)
+                    // stay this many frames after their last use while memory is under the
+                    // expected threshold; render targets go as before.
+                    const ImageBase& image = slot_images[image_id];
+                    if (image.last_write_frame == ~u64{0} && !image.reuse_pooled &&
+                        image.last_use_frame + keep_textures > frame_tick) {
+                        ++tc_kept_textures;
+                        return false;
+                    }
+                }
                 candidates.push_back(image_id);
                 return candidates.size() >= limit;
             });
@@ -650,6 +666,27 @@ void TextureCache<P>::TickFrame() {
 
     runtime.TickFrame();
     ++frame_tick;
+    if (RebuildTracking() && frame_tick % 600 == 0) {
+        // EDEN_NX2_TC_REBUILD_LOG=1 (or EDEN_NX2_TC_KEEP_TEXTURES): images the collector
+        // deleted that were made again at the same address and shape, and what that cost.
+        const auto line = [](const RebuildTally& tally) {
+            return fmt::format("{} ({:.1f} ms, {} frames after deletion on average)", tally.count,
+                               tally.ns / 1e6,
+                               tally.count == 0 ? 0 : tally.age_sum / tally.count);
+        };
+        LOG_INFO(HW_GPU,
+                 "Texture cache rebuilds last 600 frames: textures {}, render targets {}; {} "
+                 "deletions remembered, {} kept textures passed over (EDEN_NX2_TC_KEEP_TEXTURES={})",
+                 line(rebuilt_textures), line(rebuilt_targets), collected_images.size(),
+                 tc_kept_textures, TextureKeepFrames());
+        rebuilt_textures = {};
+        rebuilt_targets = {};
+        tc_kept_textures = 0;
+        // Deletions older than a minute are forgotten.
+        boost::unordered::erase_if(collected_images, [this](const auto& entry) {
+            return entry.second.frame + 3600 < frame_tick;
+        });
+    }
     if ((relocation_seen || ReuseEnabled()) && frame_tick % 600 == 0) {
         u32 guarded_shapes = 0;
         for (const auto& [key, shape] : relocation_shapes) {
@@ -2996,6 +3033,18 @@ ImageId TextureCache<P>::InsertImage(const ImageInfo& info, GPUVAddr gpu_addr,
     SCOPE_EXIT {
         const auto now = std::chrono::steady_clock::now();
         const auto elapsed = now - create_start;
+        if (created_id && !collected_images.empty()) {
+            if (const auto it = collected_images.find(CollectedKey(gpu_addr, info));
+                it != collected_images.end()) {
+                const u64 ns = static_cast<u64>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count());
+                RebuildTally& tally = it->second.texture ? rebuilt_textures : rebuilt_targets;
+                ++tally.count;
+                tally.ns += ns;
+                tally.age_sum += frame_tick - it->second.frame;
+                collected_images.erase(it);
+            }
+        }
         // EDEN_NX2_CHURN_LOG=1: every 10 s, the image shapes made most (by time), how many
         // landed where that shape's previous image was, and how far the others drifted from it:
         // tells whether render target relocation (Fritchii EXP43) would catch Ocarina of Time's
