@@ -2639,6 +2639,19 @@ bool TextureCache<P>::ImageCanRescale(ImageBase& image) {
     if (!image.info.rescaleable) {
         return false;
     }
+    // EDEN_NX2_NO_RESCALE_SQUARE: keep square images (shadow maps) at guest size when the
+    // resolution scale is not 1x. 1 = depth images only, 2 = depth and color images of 256+.
+    static const int no_rescale_square = [] {
+        const char* value = std::getenv("EDEN_NX2_NO_RESCALE_SQUARE");
+        return value != nullptr ? std::atoi(value) : 0;
+    }();
+    if (no_rescale_square != 0 && image.info.type == ImageType::e2D &&
+        image.info.size.width == image.info.size.height) {
+        const bool is_color = GetFormatType(image.info.format) == SurfaceType::ColorTexture;
+        if (!is_color || (no_rescale_square >= 2 && image.info.size.width >= 256)) {
+            return false;
+        }
+    }
     if (Settings::values.resolution_info.downscale && !image.info.downscaleable) {
         return false;
     }

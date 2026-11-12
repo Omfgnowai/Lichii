@@ -344,7 +344,7 @@ jobs:
             "-DCMAKE_CXX_COMPILER=$LLVM_ROOT/bin/clang-cl.exe" \
             "-DCMAKE_LINKER=$LLVM_ROOT/bin/lld-link.exe" \
             "-DCMAKE_AR=$LLVM_ROOT/bin/llvm-lib.exe" \
-            "-DCMAKE_EXE_LINKER_FLAGS=/MAP" \
+            "-DCMAKE_EXE_LINKER_FLAGS=-MAP" \
             "-DCMAKE_C_FLAGS=$flags" \
             "-DCMAKE_CXX_FLAGS=-EHsc $flags"
 
