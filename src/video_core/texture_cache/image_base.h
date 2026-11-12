@@ -136,6 +136,11 @@ struct ImageBase {
     u64 newest_alias_tick = 0;
     size_t lru_index = SIZE_MAX;
 
+    /// Render target relocation guard (EDEN_NX2_EXP43): the frame the GPU last wrote the image
+    /// (~0 = never, or contents discarded), and the guard reasons this image already reported.
+    u64 last_write_frame = ~u64{0};
+    u8 relocation_guard_noted = 0;
+
     std::array<u32, MAX_MIP_LEVELS> mip_level_offsets{};
 
     std::vector<ImageViewInfo> image_view_infos;
