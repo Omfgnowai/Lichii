@@ -1294,6 +1294,8 @@ if (ARCHITECTURE_x86_64 OR ARCHITECTURE_arm64 OR ARCHITECTURE_riscv64 OR ARCHITE
     target_sources(core PRIVATE
         arm/dynarmic/arm_dynarmic.h
         arm/dynarmic/arm_dynarmic_64.cpp
+        arm/nx2_jit_share.cpp
+        arm/nx2_jit_share.h
         arm/dynarmic/arm_dynarmic_64.h
         arm/dynarmic/arm_dynarmic_32.cpp
         arm/dynarmic/arm_dynarmic_32.h

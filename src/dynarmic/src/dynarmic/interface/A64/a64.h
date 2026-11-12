@@ -52,6 +52,13 @@ public:
     void InvalidateCacheRange(std::uint64_t start_address, std::size_t length);
 
     /**
+     * Compiles the block at a location descriptor value (as passed to g_block_hook) if it is not
+     * in the code cache yet, without running it. Not while running (or from a callback); applies
+     * pending cache invalidations first. Returns whether a block was compiled.
+     */
+    bool Precompile(std::uint64_t location);
+
+    /**
      * Reset CPU state to state at startup. Does not clear code cache.
      * Cannot be called from a callback.
      */

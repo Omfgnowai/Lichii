@@ -15,6 +15,7 @@
 #include "common/common_types.h"
 #include "common/hash.h"
 #include "core/arm/arm_interface.h"
+#include "core/arm/nx2_jit_share.h"
 #include "core/arm/dynarmic/dynarmic_exclusive_monitor.h"
 #include "dynarmic/interface/A64/config.h"
 
@@ -102,6 +103,7 @@ public:
     void SignalInterrupt(Kernel::KThread* thread) override;
     void ClearInstructionCache() override;
     void InvalidateCacheRange(u64 addr, std::size_t size) override;
+    std::size_t PrecompileShared(const std::atomic<bool>& stop) override;
 
 protected:
     const Kernel::DebugWatchpoint* HaltedWatchpoint() const override;
@@ -119,6 +121,10 @@ private:
     std::size_t m_core_index{};
 
     std::optional<Dynarmic::A64::Jit> m_jit{};
+
+    // EDEN_NX2_JIT_SHARE: this process's ring of compiled blocks, and how far this core read it.
+    Core::Nx2JitShare::Ring* m_share_ring{};
+    u64 m_share_cursor{};
 
     // SVC callback
     u32 m_svc{};

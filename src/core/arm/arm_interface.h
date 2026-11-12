@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <atomic>
+
 #include <array>
 #include <span>
 #include <string>
@@ -71,6 +73,12 @@ public:
 
     // Clear a range of the instruction cache for this CPU.
     virtual void InvalidateCacheRange(u64 addr, std::size_t size) = 0;
+
+    // EDEN_NX2_JIT_SHARE: compile blocks other cores compiled (Core::Nx2JitShare) until caught up
+    // or `stop` is set. Only on the host thread that runs this interface, while it runs nothing.
+    virtual std::size_t PrecompileShared(const std::atomic<bool>& stop) {
+        return 0;
+    }
 
     // Get the current architecture.
     // This returns AArch64 when PSTATE.nRW == 0 and AArch32 when PSTATE.nRW == 1.

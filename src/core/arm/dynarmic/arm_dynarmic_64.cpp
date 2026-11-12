@@ -303,10 +303,15 @@ void DynarmicCallbacks64::ReturnException(u64 pc, Dynarmic::HaltReason hr) {
 void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_space_bits) {
     // EDEN_NX2_SAMPLE: log every JIT block (host range -> guest PC) so the sampling profiler
     // can name game code.
-    if (::Nx2Sampler::Recording() && Dynarmic::g_block_hook == nullptr) {
+    // EDEN_NX2_JIT_SHARE: list every block for the other cores (Core::Nx2JitShare).
+    if ((::Nx2Sampler::Recording() || Core::Nx2JitShare::Enabled()) &&
+        Dynarmic::g_block_hook == nullptr) {
         Dynarmic::g_block_hook = [](const void* start, std::size_t size, std::uint64_t location) {
             constexpr std::uint64_t PcMask = (std::uint64_t{1} << 56) - 1;
-            ::Nx2Sampler::NoteJitBlock(start, size, location & PcMask);
+            if (::Nx2Sampler::Recording()) {
+                ::Nx2Sampler::NoteJitBlock(start, size, location & PcMask);
+            }
+            Core::Nx2JitShare::NoteBlock(location);
         };
     }
     Dynarmic::A64::UserConfig config;
@@ -471,7 +476,33 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
 
 HaltReason ArmDynarmic64::RunThread(Kernel::KThread* thread) {
     m_jit->ClearExclusiveState();
-    return TranslateHaltReason(m_jit->Run());
+    if (m_share_ring == nullptr) {
+        return TranslateHaltReason(m_jit->Run());
+    }
+    Core::Nx2JitShare::SetRunning(m_share_ring);
+    const auto halt = m_jit->Run();
+    Core::Nx2JitShare::SetRunning(nullptr);
+    return TranslateHaltReason(halt);
+}
+
+std::size_t ArmDynarmic64::PrecompileShared(const std::atomic<bool>& stop) {
+    if (m_share_ring == nullptr) {
+        return 0;
+    }
+    const Core::Nx2JitShare::PrecompileScope scope;
+    std::size_t seen = 0;
+    std::size_t compiled = 0;
+    u64 location = 0;
+    while (!stop.load(std::memory_order_relaxed) && m_share_ring->Next(m_share_cursor, location)) {
+        ++seen;
+        if (location != 0 && m_jit->Precompile(location)) {
+            ++compiled;
+        }
+    }
+    if (seen != 0) {
+        Core::Nx2JitShare::Count(seen, compiled);
+    }
+    return compiled;
 }
 
 HaltReason ArmDynarmic64::StepThread(Kernel::KThread* thread) {
@@ -511,6 +542,10 @@ ArmDynarmic64::ArmDynarmic64(System& system, bool uses_wall_clock, Kernel::KProc
     auto& page_table = process->GetPageTable().GetBasePageTable();
     auto& page_table_impl = page_table.GetImpl();
     MakeJit(&page_table_impl, page_table.GetAddressSpaceWidth());
+    if (Core::Nx2JitShare::Enabled() && process->IsApplication()) {
+        m_share_ring = Core::Nx2JitShare::RingFor(process);
+        m_share_cursor = m_share_ring->Head();
+    }
 }
 
 ArmDynarmic64::~ArmDynarmic64() = default;

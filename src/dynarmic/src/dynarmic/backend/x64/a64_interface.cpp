@@ -120,6 +120,19 @@ public:
         jit_state = {};
     }
 
+    bool Precompile(u64 location) {
+        if (is_executing) {
+            return false;
+        }
+        PerformRequestedCacheInvalidation(static_cast<HaltReason>(Atomic::Load(&jit_state.halt_reason)));
+        const IR::LocationDescriptor descriptor{location};
+        if (emitter.GetBasicBlock(descriptor)) {
+            return false;
+        }
+        GetBlock(descriptor);
+        return true;
+    }
+
     void HaltExecution(HaltReason hr) {
         Atomic::Or(&jit_state.halt_reason, static_cast<u32>(hr));
     }
@@ -320,6 +333,10 @@ void Jit::InvalidateCacheRange(u64 start_address, size_t length) {
 
 void Jit::Reset() {
     impl->Reset();
+}
+
+bool Jit::Precompile(u64 location) {
+    return impl->Precompile(location);
 }
 
 void Jit::HaltExecution(HaltReason hr) {

@@ -9,6 +9,7 @@
 #include <thread>
 #include "common/scope_exit.h"
 #include "common/settings.h"
+#include "core/arm/nx2_jit_share.h"
 #include "core/core.h"
 #include "core/debugger/debugger.h"
 #include "core/hle/kernel/k_process.h"
@@ -242,6 +243,17 @@ void PhysicalCore::Idle(KernelCore& kernel) {
         spin_us = process != nullptr && process->IsSwitch2() ? 100 : 0;
 #endif
     }
+    // EDEN_NX2_JIT_SHARE: compile what other cores compiled while this one has nothing to run,
+    // and again every millisecond it stays idle (Core::Nx2JitShare).
+    Core::ArmInterface* share_arm = nullptr;
+    if (Core::Nx2JitShare::Enabled() && !m_is_single_core) {
+        if (const KProcess* process = kernel.ApplicationProcess()) {
+            share_arm = process->GetArmInterface(m_core_index);
+        }
+    }
+    if (share_arm != nullptr) {
+        share_arm->PrecompileShared(m_is_interrupted);
+    }
     const auto spin = std::chrono::microseconds{spin_us};
     if (spin.count() > 0) {
         const auto deadline = std::chrono::steady_clock::now() + spin;
@@ -251,6 +263,15 @@ void PhysicalCore::Idle(KernelCore& kernel) {
         }
     }
     std::unique_lock lk{m_guard};
+    if (share_arm != nullptr) {
+        while (!m_on_interrupt.wait_for(lk, std::chrono::milliseconds{1},
+                                        [this] { return m_is_interrupted.load(); })) {
+            lk.unlock();
+            share_arm->PrecompileShared(m_is_interrupted);
+            lk.lock();
+        }
+        return;
+    }
     m_on_interrupt.wait(lk, [this] { return m_is_interrupted.load(); });
 }
 

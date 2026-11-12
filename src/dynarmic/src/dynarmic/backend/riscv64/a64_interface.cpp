@@ -200,6 +200,10 @@ void Jit::Reset() {
     impl->Reset();
 }
 
+bool Jit::Precompile(std::uint64_t) {
+    return false;
+}
+
 void Jit::HaltExecution(HaltReason hr) {
     impl->HaltExecution(hr);
 }
