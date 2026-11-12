@@ -8,6 +8,7 @@
 
 #include <chrono>
 #include <algorithm>
+#include <functional>
 #include <numeric>
 #include <cstdlib>
 #include <limits>
@@ -2937,7 +2938,84 @@ ImageId TextureCache<P>::InsertImage(const ImageInfo& info, GPUVAddr gpu_addr,
     const auto create_start = std::chrono::steady_clock::now();
     ImageId created_id{};
     SCOPE_EXIT {
-        const auto elapsed = std::chrono::steady_clock::now() - create_start;
+        const auto now = std::chrono::steady_clock::now();
+        const auto elapsed = now - create_start;
+        // EDEN_NX2_CHURN_LOG=1: every 10 s, the image shapes made most (by time), how many
+        // landed where that shape's previous image was, and how far the others drifted from it:
+        // tells whether render target relocation (Fritchii EXP43) would catch Ocarina of Time's
+        // gameplay image churn.
+        static const bool churn_log = [] {
+            const char* const value = std::getenv("EDEN_NX2_CHURN_LOG");
+            return value != nullptr && value[0] == '1';
+        }();
+        if (churn_log && created_id) {
+            struct ChurnShape {
+                u64 count{};
+                u64 ns{};
+                u64 same_address{};
+                u64 drift_sum{};
+                u64 drift_count{};
+                u64 cleared{};
+                GPUVAddr last_address{};
+                ImageInfo info{};
+            };
+            static ::Common::unordered_map<u64, ChurnShape> churn_shapes;
+            static std::chrono::steady_clock::time_point churn_report = now;
+            const u64 key = (u64{static_cast<u32>(info.format) & 0xFF} << 56) ^
+                            (u64{static_cast<u32>(info.type) & 0xF} << 52) ^
+                            (u64{info.num_samples & 0xF} << 48) ^
+                            (u64{static_cast<u32>(info.resources.levels) & 0xF} << 44) ^
+                            (u64{static_cast<u32>(info.resources.layers) & 0xFFF} << 32) ^
+                            (u64{info.size.width & 0xFFFF} << 16) ^ (info.size.height & 0xFFFF) ^
+                            (u64{info.size.depth & 0xFFF} << 20);
+            auto& shape = churn_shapes[key];
+            if (shape.count == 0) {
+                shape.info = info;
+            } else if (shape.last_address == gpu_addr) {
+                ++shape.same_address;
+            } else {
+                const u64 drift = gpu_addr > shape.last_address ? gpu_addr - shape.last_address
+                                                                : shape.last_address - gpu_addr;
+                shape.drift_sum += drift;
+                ++shape.drift_count;
+            }
+            shape.last_address = gpu_addr;
+            ++shape.count;
+            shape.cleared += clearing_render_targets ? 1 : 0;
+            shape.ns += static_cast<u64>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count());
+            if (now - churn_report >= std::chrono::seconds{10}) {
+                const double seconds =
+                    std::chrono::duration<double>(now - churn_report).count();
+                churn_report = now;
+                std::vector<std::pair<u64, const ChurnShape*>> order;
+                u64 total{};
+                u64 total_ns{};
+                for (const auto& [shape_key, entry] : churn_shapes) {
+                    order.emplace_back(entry.ns, &entry);
+                    total += entry.count;
+                    total_ns += entry.ns;
+                }
+                std::ranges::sort(order, std::greater{}, &std::pair<u64, const ChurnShape*>::first);
+                LOG_INFO(HW_GPU, "Image churn: {:.0f} creates/s, {:.1f} ms/s, {} shapes", total / seconds,
+                         total_ns / 1e6 / seconds, churn_shapes.size());
+                for (size_t index = 0; index < order.size() && index < 10; ++index) {
+                    const ChurnShape& entry = *order[index].second;
+                    LOG_INFO(HW_GPU,
+                             "  churn {}: type {} {}x{}x{} levels {} layers {} format {} samples {}: "
+                             "{} made ({:.1f} ms), {} by a clear, {} at the previous address, "
+                             "{} drifted by {} KiB on average",
+                             index, static_cast<u32>(entry.info.type), entry.info.size.width,
+                             entry.info.size.height, entry.info.size.depth,
+                             entry.info.resources.levels, entry.info.resources.layers,
+                             static_cast<u32>(entry.info.format), entry.info.num_samples,
+                             entry.count, entry.ns / 1e6, entry.cleared, entry.same_address,
+                             entry.drift_count,
+                             entry.drift_count == 0 ? 0 : entry.drift_sum / entry.drift_count / 1024);
+                }
+                churn_shapes.clear();
+            }
+        }
         if (elapsed < std::chrono::milliseconds{15} || !created_id) {
             return;
         }
@@ -3309,11 +3387,45 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
         }
         copied_whole = std::ranges::all_of(written, [](u8 whole) { return whole != 0; });
     }
+    // EDEN_NX2_DEPTH_SKIP_UPLOAD_MIB=N (off unless set): a new depth or stencil image of N MiB
+    // or more that no GPU-written image overlaps takes no upload from guest memory. Ocarina of
+    // Time makes its 12288x12288 D16 shadow map (288 MiB) again at each area change and its tiles
+    // are cleared one by one, so the clear rule above never covers it: the upload took 95-134 ms
+    // of the GPU back thread each time. Games don't write depth buffers from the CPU; if this one
+    // does later, tracking marks it CPU-modified and it uploads then.
+    static const u64 depth_skip_upload_bytes = [] {
+        const char* const value = std::getenv("EDEN_NX2_DEPTH_SKIP_UPLOAD_MIB");
+        const long mib = value != nullptr ? std::atol(value) : 0;
+        return mib > 0 ? static_cast<u64>(mib) << 20 : u64{0};
+    }();
+    const auto skips_depth_upload = [&] {
+        if (depth_skip_upload_bytes == 0 || size_bytes < depth_skip_upload_bytes ||
+            !join_copies_to_do.empty()) {
+            return false;
+        }
+        switch (VideoCore::Surface::GetFormatType(new_info.format)) {
+        case VideoCore::Surface::SurfaceType::Depth:
+        case VideoCore::Surface::SurfaceType::Stencil:
+        case VideoCore::Surface::SurfaceType::DepthStencil:
+            break;
+        default:
+            return false;
+        }
+        static std::atomic<u32> logged{};
+        if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+            LOG_INFO(HW_GPU,
+                     "Depth upload skipped (EDEN_NX2_DEPTH_SKIP_UPLOAD_MIB): {:#x} {}x{} format {}, "
+                     "{} KiB guest",
+                     gpu_addr, new_info.size.width, new_info.size.height,
+                     static_cast<u32>(new_info.format), size_bytes / 1024);
+        }
+        return true;
+    };
     if (overwritten_by_clear()) {
         // Stays CpuModified: UpdateRenderTargets' PrepareImage drops the upload only when
         // IsFullClear agrees the clear covers the whole image, and uploads it otherwise.
         runtime.TransitionImageLayout(new_image);
-    } else if (copied_whole) {
+    } else if (copied_whole || skips_depth_upload()) {
         // What RefreshContents does, without the upload.
         new_image.flags &= ~ImageFlagBits::CpuModified;
         if (False(new_image.flags & ImageFlagBits::Tracked)) {
