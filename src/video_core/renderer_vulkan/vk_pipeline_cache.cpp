@@ -925,12 +925,8 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipeline() {
             mask = vertex->generic_read_mask;
         }
         graphics_key.state.CanonicalizeNative(mask);
-        // Fast draw breaks on attribute formats by the same mask (mesh draws never delta).
-        VideoCommon::Nx2FastDraw::g_attribute_read_mask.store(
-            maxwell3d->regs.IsMeshEnabled() ? ~0U : mask, std::memory_order_relaxed);
     } else {
         graphics_key.state.Refresh(*maxwell3d, dynamic_features);
-        VideoCommon::Nx2FastDraw::g_attribute_read_mask.store(~0U, std::memory_order_relaxed);
     }
 
     if (current_pipeline) {

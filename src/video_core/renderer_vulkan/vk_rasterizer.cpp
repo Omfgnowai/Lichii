@@ -1046,6 +1046,25 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     const bool delta_holds =
         delta_pipeline != nullptr && DeltaStillHolds(draw_serial, draw_map_serial);
     const DrawPath path = delta_holds && !verify_pipeline ? DrawPath::Delta : DrawPath::Full;
+    if (path == DrawPath::Full && FastDraw::AttributeMaskEnabled()) {
+        // EDEN_NX2_FAST_ATTR_MASK: what the vertex shader loads decides which attribute format
+        // writes can end delta draws. A function of the vertex program alone: cached by its hash.
+        static u64 mask_program = ~u64{0};
+        static u32 mask = ~0U;
+        const u64 program = pipeline->ShaderHashes()[1];
+        const Shader::Info* const vertex = pipeline->StageInfo(0);
+        if (vertex == nullptr || vertex->is_task || vertex->is_mesh) {
+            mask_program = ~u64{0};
+            mask = ~0U;
+        } else if (program != mask_program) {
+            mask_program = program;
+            mask = 0;
+            for (u32 index = 0; index < 32; ++index) {
+                mask |= vertex->loads.Generic(index) ? 1U << index : 0U;
+            }
+        }
+        FastDraw::g_attribute_read_mask.store(mask, std::memory_order_relaxed);
+    }
     buffer_cache.BeginGraphicsUniforms(path == DrawPath::Delta ? &taken_delta : nullptr);
     if (path == DrawPath::Delta) {
         if (Profile::Scope scope{Profile::Zone::Configure}; !pipeline->ConfigureDelta(is_indexed)) {

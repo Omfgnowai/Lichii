@@ -99,10 +99,13 @@ inline std::atomic<bool> g_vertex_layout_dynamic{false};
     return allowed && g_vertex_layout_dynamic.load(std::memory_order_relaxed);
 }
 
-/// The generic attributes the current graphics pipeline's vertex shader reads, as its key was
-/// canonicalized with (PipelineCache::CurrentGraphicsPipeline; all ones when the key keeps every
-/// attribute). An attribute format write that changes the type class of an attribute outside it
-/// leaves the canonical key, so the pipeline, as it was (FixedPipelineState::CanonicalizeNative).
+/// The generic attributes the current graphics pipeline's vertex shader loads (its compiled
+/// Shader::Info, published by RasterizerVulkan::PrepareDraw for each full draw; all ones for mesh
+/// pipelines and before the first draw). An attribute format write that changes the type class
+/// of an attribute outside it changes nothing the shader reads: canonical native keys drop those
+/// attributes' types (FixedPipelineState::CanonicalizeNative), and the formats themselves reach
+/// vkCmdSetVertexInputEXT on both paths. Set outside the pipeline cache, whose sources key the
+/// precompiled shader preparation (NX2_SHADER_ABI).
 inline std::atomic<u32> g_attribute_read_mask{~0U};
 
 /// EDEN_NX2_FAST_ATTR_MASK=1: attribute format writes to attributes the current pipeline does
