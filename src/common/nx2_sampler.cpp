@@ -24,6 +24,7 @@
 
 #include <windows.h>
 #include <tlhelp32.h>
+#include <psapi.h>
 #include <dbghelp.h>
 
 namespace Nx2Sampler {
@@ -146,7 +147,67 @@ std::vector<Target> FindThreads(const std::vector<std::string>& patterns) {
 // could be paused holding the heap lock. A wrong unwind step (code with missing or wrong unwind
 // data) leaves a garbage stack pointer: reading through it crashed the process, so the walk
 // stops once the stack pointer leaves the thread's stack.
-unsigned Walk(CONTEXT context, std::array<DWORD64, MaxDepth>& frames, const NT_TIB* tib) {
+// Address ranges of the loaded modules, listed before any thread is suspended. Code outside
+// them is JIT code: its unwind data comes from dynamic function tables, which RtlLookupFunctionEntry
+// reads under a lock a suspended thread may hold, and following it crashed the process inside
+// ntdll (sampling the CPU cores, build-91). Such frames end the walk.
+struct ModuleRange {
+    DWORD64 begin;
+    DWORD64 end;
+};
+
+std::vector<ModuleRange> ListModules() {
+    std::vector<ModuleRange> ranges;
+    std::vector<HMODULE> modules(1024);
+    DWORD needed = 0;
+    if (!K32EnumProcessModules(GetCurrentProcess(), modules.data(),
+                               static_cast<DWORD>(modules.size() * sizeof(HMODULE)), &needed)) {
+        return ranges;
+    }
+    modules.resize(std::min<size_t>(modules.size(), needed / sizeof(HMODULE)));
+    for (const HMODULE module : modules) {
+        MODULEINFO info{};
+        if (K32GetModuleInformation(GetCurrentProcess(), module, &info, sizeof(info))) {
+            const auto begin = reinterpret_cast<DWORD64>(info.lpBaseOfDll);
+            ranges.push_back({begin, begin + info.SizeOfImage});
+        }
+    }
+    return ranges;
+}
+
+bool InModules(const std::vector<ModuleRange>& ranges, DWORD64 address) {
+    for (const ModuleRange& range : ranges) {
+        if (address >= range.begin && address < range.end) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// One unwind step, with a fault in it ending the walk instead of the process. No C++ objects
+// here: SEH needs a function without unwinding cleanups.
+bool UnwindStep(DWORD64 image_base, PRUNTIME_FUNCTION function, CONTEXT* context) {
+    __try {
+        PVOID handler_data{};
+        DWORD64 establisher_frame{};
+        RtlVirtualUnwind(UNW_FLAG_NHANDLER, image_base, context->Rip, function, context,
+                         &handler_data, &establisher_frame, nullptr);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+PRUNTIME_FUNCTION LookupFunction(DWORD64 rip, DWORD64* image_base) {
+    __try {
+        return RtlLookupFunctionEntry(rip, image_base, nullptr);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return nullptr;
+    }
+}
+
+unsigned Walk(CONTEXT context, std::array<DWORD64, MaxDepth>& frames, const NT_TIB* tib,
+              const std::vector<ModuleRange>& modules) {
     if (tib == nullptr) {
         return 0;
     }
@@ -157,8 +218,11 @@ unsigned Walk(CONTEXT context, std::array<DWORD64, MaxDepth>& frames, const NT_T
     unsigned depth = 0;
     while (depth < MaxDepth && context.Rip != 0 && on_stack(context.Rsp)) {
         frames[depth++] = context.Rip;
+        if (!InModules(modules, context.Rip)) {
+            break;
+        }
         DWORD64 image_base{};
-        const PRUNTIME_FUNCTION function = RtlLookupFunctionEntry(context.Rip, &image_base, nullptr);
+        const PRUNTIME_FUNCTION function = LookupFunction(context.Rip, &image_base);
         if (function == nullptr) {
             // A leaf function (no unwind data): its return address is on top of the stack. JIT
             // code has none either; past the first frame, stop there.
@@ -169,10 +233,9 @@ unsigned Walk(CONTEXT context, std::array<DWORD64, MaxDepth>& frames, const NT_T
             context.Rsp += 8;
             continue;
         }
-        PVOID handler_data{};
-        DWORD64 establisher_frame{};
-        RtlVirtualUnwind(UNW_FLAG_NHANDLER, image_base, context.Rip, function, &context,
-                         &handler_data, &establisher_frame, nullptr);
+        if (!UnwindStep(image_base, function, &context)) {
+            break;
+        }
     }
     return depth;
 }
@@ -224,9 +287,17 @@ struct Symbolizer {
         // from the unwind tables (a chained entry leads back to the function's primary entry);
         // the linker map (/MAP) that CI builds can put next to the exe turns those into names.
         static const DWORD64 exe_base = reinterpret_cast<DWORD64>(GetModuleHandleA(nullptr));
+        static const DWORD64 exe_end = [] {
+            MODULEINFO info{};
+            K32GetModuleInformation(GetCurrentProcess(), GetModuleHandleA(nullptr), &info,
+                                    sizeof(info));
+            return exe_base + info.SizeOfImage;
+        }();
         DWORD64 image_base{};
-        if (const RUNTIME_FUNCTION* function = RtlLookupFunctionEntry(address, &image_base, nullptr);
-            function != nullptr && image_base == exe_base) {
+        const RUNTIME_FUNCTION* function =
+            address >= exe_base && address < exe_end ? LookupFunction(address, &image_base)
+                                                     : nullptr;
+        if (function != nullptr && image_base == exe_base) {
             for (int link = 0; link < 16; ++link) {
                 const auto* const info =
                     reinterpret_cast<const unsigned char*>(image_base + function->UnwindData);
@@ -378,6 +449,7 @@ std::string SampleThreads(const std::vector<std::string>& patterns, double secon
     if (targets.empty()) {
         return "no thread matches";
     }
+    const std::vector<ModuleRange> modules = ListModules();
     std::vector<Sample> samples;
     samples.reserve(static_cast<size_t>(seconds * 1100.0) * targets.size() + 16);
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::duration<double>(seconds);
@@ -393,7 +465,7 @@ std::string SampleThreads(const std::vector<std::string>& patterns, double secon
             if (GetThreadContext(handle, &context)) {
                 Sample& sample = samples.emplace_back();
                 sample.thread = i;
-                sample.depth = Walk(context, sample.frames, targets[i].tib);
+                sample.depth = Walk(context, sample.frames, targets[i].tib, modules);
             }
             ResumeThread(handle);
         }
