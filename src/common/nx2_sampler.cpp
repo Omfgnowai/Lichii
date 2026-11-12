@@ -469,6 +469,21 @@ void WriteTimeline(const std::vector<Target>& targets, const std::vector<Sample>
         }
         std::fclose(out);
     }
+    // <out>.jit.tsv: every JIT block emitted since boot (qpc, guest pc, host bytes): compile
+    // bursts per frame (new game code reached) show up here.
+    if (std::FILE* const out = std::fopen((base + ".jit.tsv").c_str(), "w")) {
+        std::vector<JitBlock> blocks;
+        {
+            std::scoped_lock lock{g_log_mutex};
+            blocks = g_jit_blocks;
+        }
+        for (const JitBlock& block : blocks) {
+            std::fprintf(out, "%llu\t%llx\t%llu\n", static_cast<unsigned long long>(block.qpc),
+                         static_cast<unsigned long long>(block.guest_pc),
+                         static_cast<unsigned long long>(block.end - block.start));
+        }
+        std::fclose(out);
+    }
     if (std::FILE* const out = std::fopen((base + ".presents.tsv").c_str(), "w")) {
         for (const DWORD64 qpc : presents) {
             std::fprintf(out, "%llu\n", static_cast<unsigned long long>(qpc));
