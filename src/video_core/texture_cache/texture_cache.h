@@ -3690,6 +3690,7 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
         }
         if (True(overlap.flags & ImageFlagBits::GpuModified)) {
             new_image.flags |= ImageFlagBits::GpuModified;
+            MarkGpuModifiedPages(new_image);
             const auto& resolution = Settings::values.resolution_info;
             const SubresourceBase base = new_image.TryFindBase(overlap.gpu_addr).value();
             const u32 up_scale = can_rescale ? resolution.up_scale : 1;
@@ -4158,11 +4159,25 @@ ImageViewId TextureCache<P>::FindOrEmplaceImageView(ImageId image_id, const Imag
 }
 
 template <class P>
+void TextureCache<P>::MarkGpuModifiedPages(ImageBase& image) {
+    if (False(image.flags & ImageFlagBits::Sparse)) {
+        gpu_modified_filter.Mark(image.cpu_addr, image.guest_size_bytes);
+        return;
+    }
+    ForEachSparseSegment(image, [this](GPUVAddr, DAddr cpu_addr, size_t size) {
+        gpu_modified_filter.Mark(cpu_addr, size);
+    });
+}
+
+template <class P>
 void TextureCache<P>::RegisterImage(ImageId image_id) {
     ImageBase& image = slot_images[image_id];
     ASSERT_MSG(False(image.flags & ImageFlagBits::Registered),
                "Trying to register an already registered image");
     image.flags |= ImageFlagBits::Registered;
+    if (True(image.flags & ImageFlagBits::GpuModified)) {
+        MarkGpuModifiedPages(image);
+    }
     image.channel = current_channel_id;
     image.address_space = current_address_space;
     total_used_memory += ImageMemoryBytes(slot_images[image_id]);
@@ -4573,6 +4588,9 @@ void TextureCache<P>::UnindexFramebuffer(FramebufferId framebuffer_id, const Ren
 
 template <class P>
 void TextureCache<P>::MarkModification(ImageBase& image) noexcept {
+    if (False(image.flags & ImageFlagBits::GpuModified)) {
+        MarkGpuModifiedPages(image);
+    }
     image.flags |= ImageFlagBits::GpuModified;
     SetModificationTick(slot_images, image, ++modification_tick);
     image.last_write_frame = frame_tick;
@@ -4906,6 +4924,7 @@ void TextureCache<P>::SynchronizeAliases(ImageId image_id) {
     image.newest_alias_tick = most_recent_tick;
     if (any_modified) {
         image.flags |= ImageFlagBits::GpuModified;
+        MarkGpuModifiedPages(image);
     }
     std::ranges::sort(aliased_images, [this](const AliasedImage* lhs, const AliasedImage* rhs) {
         const ImageBase& lhs_image = slot_images[lhs->id];

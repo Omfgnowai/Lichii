@@ -13,6 +13,7 @@
 #include <memory>
 #include <limits>
 #include <cstdio>
+#include <atomic>
 #include <cstdlib>
 #include <filesystem>
 #include <tuple>
@@ -2516,10 +2517,26 @@ bool RasterizerVulkan::HasPendingQueries(DAddr addr, u64 size) {
 }
 
 VideoCore::RasterizerDownloadArea RasterizerVulkan::GetFlushArea(DAddr addr, u64 size) {
+    // EDEN_NX2_FLUSH_AREA_FILTER: 1 (default) skips the texture cache (and its lock) for reads
+    // where no GPU-modified image ever was; 0 always asks it; 2 asks anyway and logs a read the
+    // filter would have skipped that the cache has an area for.
+    static const int filter_mode = [] {
+        const char* value = std::getenv("EDEN_NX2_FLUSH_AREA_FILTER");
+        return value == nullptr ? 1 : std::atoi(value);
+    }();
     std::optional<VideoCore::RasterizerDownloadArea> texture_area;
-    {
+    const bool may_hold = filter_mode == 0 || texture_cache.gpu_modified_filter.Any(addr, size);
+    if (may_hold || filter_mode == 2) {
         std::scoped_lock lock{texture_cache.mutex};
         texture_area = texture_cache.GetFlushArea(addr, size);
+        if (!may_hold && texture_area) {
+            static std::atomic<u32> logged{};
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
+                LOG_ERROR(Render_Vulkan,
+                          "Flush area filter missed a GPU-modified image at [{:#x}, {:#x})", addr,
+                          addr + size);
+            }
+        }
     }
     if (texture_area) {
         // The core disarmed the read's pages before asking, and skips later reads in this area,
@@ -2640,11 +2657,13 @@ bool RasterizerVulkan::OnCPUWrite(DAddr addr, u64 size) {
             return true;
         }
     }
-    {
+    if (texture_cache.page_filter.Any(addr, size)) {
         std::scoped_lock lock{texture_cache.mutex};
         texture_cache.WriteMemory(addr, size);
     }
-    pipeline_cache.InvalidateRegion(addr, size);
+    if (pipeline_cache.page_filter.Any(addr, size)) {
+        pipeline_cache.InvalidateRegion(addr, size);
+    }
     return false;
 }
 

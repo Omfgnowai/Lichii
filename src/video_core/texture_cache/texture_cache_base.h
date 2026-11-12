@@ -263,6 +263,10 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
 public:
     /// Device pages this cache ever registered objects on (InnerInvalidation skips the rest).
     VideoCommon::PageFilter page_filter;
+    /// Device pages that ever held a GPU-modified image: a guest CPU read elsewhere needs no
+    /// flush from this cache, so GetFlushArea can skip the cache's lock (the GPU back thread
+    /// holds it through image creation and garbage collection; guest reads waited on it).
+    VideoCommon::PageFilter gpu_modified_filter;
 
     explicit TextureCache(Runtime&, Tegra::MaxwellDeviceMemoryManager&);
 
@@ -678,6 +682,9 @@ private:
 
     /// Mark an image as modified from the GPU
     void MarkModification(ImageBase& image) noexcept;
+
+    /// Marks the image's device pages in gpu_modified_filter.
+    void MarkGpuModifiedPages(ImageBase& image);
 
     /// Synchronize image aliases, copying data if needed
     void SynchronizeAliases(ImageId image_id);
