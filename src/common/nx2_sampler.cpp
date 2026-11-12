@@ -219,6 +219,28 @@ struct Symbolizer {
         if (!is_new) {
             return it->second;
         }
+        // The release exe ships no PDB, so DbgHelp names its code after whatever export or
+        // nothing lies below. Name it by the start of its function instead ("lichii.exe+0x..."),
+        // from the unwind tables (a chained entry leads back to the function's primary entry);
+        // the linker map (/MAP) that CI builds can put next to the exe turns those into names.
+        static const DWORD64 exe_base = reinterpret_cast<DWORD64>(GetModuleHandleA(nullptr));
+        DWORD64 image_base{};
+        if (const RUNTIME_FUNCTION* function = RtlLookupFunctionEntry(address, &image_base, nullptr);
+            function != nullptr && image_base == exe_base) {
+            for (int link = 0; link < 16; ++link) {
+                const auto* const info =
+                    reinterpret_cast<const unsigned char*>(image_base + function->UnwindData);
+                constexpr unsigned ChainInfo = 4; // UNW_FLAG_CHAININFO
+                if (((info[0] >> 3) & ChainInfo) == 0) {
+                    break;
+                }
+                const unsigned codes = info[2];
+                function = reinterpret_cast<const RUNTIME_FUNCTION*>(info + 4 +
+                                                                     ((codes + 1) & ~1U) * 2);
+            }
+            it->second = fmt::format("lichii.exe+{:#x}", function->BeginAddress);
+            return it->second;
+        }
         if (from_address != nullptr) {
             alignas(SYMBOL_INFO) char buffer[sizeof(SYMBOL_INFO) + 1024]{};
             auto* const symbol = reinterpret_cast<SYMBOL_INFO*>(buffer);
