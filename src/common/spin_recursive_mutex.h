@@ -6,6 +6,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <thread>
 
 #if defined(_M_X64) || defined(_M_IX86) || defined(__x86_64__) || defined(__i386__)
@@ -41,6 +42,9 @@ public:
             ++depth;
             return;
         }
+        if (handoff.load(std::memory_order_relaxed)) {
+            WaitForHandoff();
+        }
         std::uint32_t expected = 0;
         if (!state.compare_exchange_strong(expected, 1, std::memory_order_acquire,
                                            std::memory_order_relaxed)) {
@@ -72,6 +76,9 @@ public:
         }
         owner.store(std::thread::id{}, std::memory_order_relaxed);
         if (state.exchange(0, std::memory_order_release) == 2) {
+            if (FairEnabled()) {
+                handoff.store(true, std::memory_order_relaxed);
+            }
             state.notify_one();
         }
     }
@@ -124,10 +131,32 @@ private:
         while (state.exchange(2, std::memory_order_acquire) != 0) {
             state.wait(2, std::memory_order_relaxed);
         }
+        handoff.store(false, std::memory_order_relaxed);
         return true;
     }
 
+    /// EDEN_NX2_FAIR_SPIN_MUTEX=1: an unlock that wakes a sleeper lets it take the lock before
+    /// the unlocking thread (or another) can take it right back. Without it the GPU back thread,
+    /// which locks the caches for every draw, re-took them before a woken guest CPU thread ran,
+    /// so guest reads/writes of GPU-tracked memory waited for a gap between draws.
+    static bool FairEnabled() {
+        static const bool enabled = [] {
+            const char* value = std::getenv("EDEN_NX2_FAIR_SPIN_MUTEX");
+            return value != nullptr && value[0] == '1';
+        }();
+        return enabled;
+    }
+
+    /// Bounded (~50 us): a sleeper slow to wake must not stall the next locker for long.
+    void WaitForHandoff() {
+        for (int spin = 0; spin < 4096 && handoff.load(std::memory_order_relaxed); ++spin) {
+            Pause();
+        }
+        handoff.store(false, std::memory_order_relaxed);
+    }
+
     std::atomic<std::uint32_t> state{0}; ///< 0 free, 1 held, 2 held with sleepers
+    std::atomic<bool> handoff{}; ///< A woken sleeper should take the lock next
     std::atomic<std::thread::id> owner{};
     std::uint32_t depth{}; ///< Recursion depth, touched only by the owner
 };
