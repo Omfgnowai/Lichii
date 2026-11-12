@@ -3,7 +3,9 @@
 
 #pragma once
 
+#include <array>
 #include <chrono>
+#include <cstdlib>
 #include <filesystem>
 #include <optional>
 #include <span>
@@ -17,6 +19,24 @@
 /// them at the end of each presented frame, so every cache they touch is used from its owner.
 /// Without the server nothing is posted and the per-frame cost is one relaxed atomic load.
 namespace VideoCore::Nx2Debug {
+
+/// Numbered experiment switches EDEN_NX2_EXP0 .. EDEN_NX2_EXP63 (ports of Fritchii's slots; see
+/// docs there). Read from the environment on first use: the frontend applies nx2_switches.txt
+/// after static initialization. 0 (off) unless set.
+inline constexpr int ExperimentCount = 64;
+[[nodiscard]] inline int Experiment(int n) {
+    static const std::array<int, ExperimentCount> values = [] {
+        std::array<int, ExperimentCount> result{};
+        for (int i = 0; i < ExperimentCount; ++i) {
+            const std::string name = "EDEN_NX2_EXP" + std::to_string(i);
+            if (const char* const value = std::getenv(name.c_str()); value != nullptr) {
+                result[i] = std::atoi(value);
+            }
+        }
+        return result;
+    }();
+    return n >= 0 && n < ExperimentCount ? values[n] : 0;
+}
 
 struct CaptureRequest {
     u64 id;
