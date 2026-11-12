@@ -752,6 +752,19 @@ void TextureCache<P>::TickFrame() {
                  relocation_relocated, relocation_retired, relocation_crowded, guarded_shapes,
                  relocation_shapes.size(), relocation_guarded_addresses.size(), relocation_reused,
                  reuse_misses);
+        if (EarlyFreeMode() != 0) {
+            u64 recycled_bytes = 0;
+            if constexpr (requires { runtime.GetRecycledImageMemory(); }) {
+                recycled_bytes = runtime.GetRecycledImageMemory();
+            }
+            LOG_INFO(HW_GPU,
+                     "Render target early free (EDEN_NX2_RT_EARLY_FREE={}) last 600 frames: {} "
+                     "dead targets under new clears deleted ({} KiB), {} kept (used lately, "
+                     "bound, aliased or downloading); recycler holds {} KiB",
+                     EarlyFreeMode(), early_freed, early_free_bytes / 1024, early_free_skipped,
+                     recycled_bytes / 1024);
+            early_freed = early_free_bytes = early_free_skipped = 0;
+        }
         relocation_candidates = relocation_guarded = relocation_relocated = relocation_retired =
             relocation_crowded = relocation_reused = reuse_misses = 0;
         if (LineageGuard()) {
@@ -3571,6 +3584,75 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
                 }
                 return old_id;
             }
+        }
+    }
+    // EDEN_NX2_RT_EARLY_FREE: the clear overwrites the guest memory of the dead per-frame
+    // targets under it, so they go now (as EXP43=1 retires a predecessor) and their host images
+    // reach the recycler before the next targets of their shapes are made. Without it they wait
+    // for a collector pass, which does not run while the cache is under its expected size, and
+    // each new target misses the recycler (~0.5 ms a frame of vmaCreateImage in Kokiri Forest).
+    if (const int early_mode = EarlyFreeMode();
+        early_mode != 0 && clearing_render_targets && RelocationShaped(new_info) &&
+        overwritten_by_clear() && !join_bad_overlap_ids.empty() && join_copies_to_do.empty()) {
+        constexpr ImageFlagBits excluded =
+            ImageFlagBits::Sparse | ImageFlagBits::SparseLayers | ImageFlagBits::SparseTiles |
+            ImageFlagBits::UnwrittenSparse | ImageFlagBits::Unbacked | ImageFlagBits::Converted |
+            ImageFlagBits::AsynchronousDecode | ImageFlagBits::IsDecoding |
+            ImageFlagBits::Remapped | ImageFlagBits::Alias | ImageFlagBits::CostlyLoad;
+        const DAddr new_end = cpu_addr + CalculateGuestSizeInBytes(new_info);
+        const auto& regs = maxwell3d->regs;
+        const auto bound = [&](const ImageBase& image) {
+            for (u32 index = 0; index < regs.rt_control.count && index < NUM_RT; ++index) {
+                const auto& rt = regs.rt[index];
+                if (rt.Address() != 0 && rt.format != Tegra::RenderTargetFormat::NONE &&
+                    image.OverlapsGPU(rt.Address(), 1)) {
+                    return true;
+                }
+            }
+            return regs.zeta_enable && regs.zeta.Address() != 0 &&
+                   image.OverlapsGPU(regs.zeta.Address(), 1);
+        };
+        const auto queued = [](ImageId id, const auto& downloads) {
+            return std::ranges::any_of(downloads, [id](const auto& download) {
+                return download.is_swizzle && download.object_id == id;
+            });
+        };
+        early_free_ids.clear();
+        for (const ImageId id : join_bad_overlap_ids) {
+            const ImageBase& old = slot_images[id];
+            if (!RelocationShaped(old.info) || old.last_write_frame == ~u64{0}) {
+                continue; // textures and never-rendered images: not per-frame targets
+            }
+            const bool covered = old.cpu_addr >= cpu_addr && old.cpu_addr_end <= new_end;
+            if (!covered && early_mode != 2) {
+                continue;
+            }
+            // Used or written in this frame or the previous one: it may still be read.
+            if (old.last_use_frame + 2 > frame_tick || old.last_write_frame + 2 > frame_tick ||
+                True(old.flags & excluded) || !old.aliased_images.empty() ||
+                old.info.forced_flushed || old.info.dma_downloaded ||
+                False(old.flags & ImageFlagBits::Registered) || bound(old) ||
+                queued(id, uncommitted_downloads) ||
+                std::ranges::any_of(committed_downloads,
+                                    [&](const auto& downloads) { return queued(id, downloads); })) {
+                ++early_free_skipped;
+                continue;
+            }
+            early_free_ids.push_back(id);
+        }
+        for (const ImageId id : early_free_ids) {
+            Image& old = slot_images[id];
+            ++early_freed;
+            early_free_bytes += old.guest_size_bytes;
+            MarkStale(old); // before UntrackImage (see MarkStale)
+            if (True(old.flags & ImageFlagBits::Tracked)) {
+                UntrackImage(old, id);
+            }
+            UnregisterImage(id);
+            DeleteImage(id);
+            join_bad_overlap_ids.erase(std::remove(join_bad_overlap_ids.begin(),
+                                                   join_bad_overlap_ids.end(), id),
+                                       join_bad_overlap_ids.end());
         }
     }
     const ImageId new_image_id = slot_images.insert(runtime, new_info, gpu_addr, cpu_addr);

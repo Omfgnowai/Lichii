@@ -603,6 +603,20 @@ private:
         return enabled;
     }
     u64 relocation_shape_trips_skipped{}; ///< Shape trips the lineage guard kept to the address
+    /// EDEN_NX2_RT_EARLY_FREE: 1 deletes the dead render targets a new cleared target covers
+    /// whole (2: any it overlaps) when it is made, not when the collector gets to them, so the
+    /// image recycler holds their host images for the next target of their shape.
+    [[nodiscard]] static int EarlyFreeMode() {
+        static const int mode = [] {
+            const char* const value = std::getenv("EDEN_NX2_RT_EARLY_FREE");
+            return value != nullptr ? std::atoi(value) : 0;
+        }();
+        return mode;
+    }
+    u64 early_freed{};       ///< Since the last relocation report
+    u64 early_free_bytes{};  ///< Guest bytes of those
+    u64 early_free_skipped{}; ///< Covered overlaps kept (used lately, bound, aliased, ...)
+    std::vector<ImageId> early_free_ids;
     bool pending_churn_born{};
     ::Common::unordered_map<u64, RelocationShape> relocation_shapes;
     /// The guard by address too: OoT draws every dialogue box's text into a render target at one
