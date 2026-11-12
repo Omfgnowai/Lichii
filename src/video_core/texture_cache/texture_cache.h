@@ -224,9 +224,13 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
             std::vector<ImageId> candidates;
             const size_t limit = num_iterations * 8;
             lru_cache.ForEachItemBelow(frame_tick - ticks_to_destroy, [&](ImageId image_id) {
-                if (keep_textures != 0 && !high_priority_mode) {
+                // Below 3/4 of the expected threshold only (thresholds scale with the card's
+                // memory): on a smaller card keeping stops early, leaving a quarter of the
+                // threshold for the usual collection before the high-priority mode.
+                if (keep_textures != 0 && !high_priority_mode &&
+                    total_used_memory < expected_memory - expected_memory / 4) {
                     // EDEN_NX2_TC_KEEP_TEXTURES: loaded textures (never written by the GPU)
-                    // stay this many frames after their last use while memory is under the
+                    // stay this many frames after their last use while memory is well under the
                     // expected threshold; render targets go as before.
                     const ImageBase& image = slot_images[image_id];
                     if (image.last_write_frame == ~u64{0} && !image.reuse_pooled &&
