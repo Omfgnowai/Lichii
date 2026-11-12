@@ -337,6 +337,21 @@ public:
         return delta_mismatch;
     }
 
+    /// EDEN_NX2_FAST_COMPUTED_HANDLES=1: a pipeline whose shaders compute texture handles at
+    /// draw time (Shader::Info::handle_programs) takes delta draws while every computed handle
+    /// evaluates as at the captured Configure. The rasterizer keeps the values here: set after
+    /// each full Configure, compared before each delta draw.
+    [[nodiscard]] bool HasDeltaHandlePrograms() const noexcept {
+        return delta_handle_programs;
+    }
+    void SetDeltaHandleValues(std::span<const u32> values) {
+        delta_handle_values.assign(values.begin(), values.end());
+        delta_handle_values_valid = true;
+    }
+    [[nodiscard]] bool SameDeltaHandleValues(std::span<const u32> values) const noexcept {
+        return delta_handle_values_valid && std::ranges::equal(values, delta_handle_values);
+    }
+
     /// Whether an image the kept views sample has an upload pending or a newer alias to copy in:
     /// ConfigureDelta prepares none, Configure does.
     [[nodiscard]] bool DeltaImagesChange() const noexcept;
@@ -422,6 +437,9 @@ private:
     bool writes_images{};
 
     DeltaBlocker delta_blocker{};
+    bool delta_handle_programs{};
+    bool delta_handle_values_valid{};
+    std::vector<u32> delta_handle_values;
     bool delta_views_valid{};
     bool capture_delta{};
     bool verify_delta{};

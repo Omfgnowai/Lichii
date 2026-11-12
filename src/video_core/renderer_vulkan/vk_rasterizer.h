@@ -425,6 +425,8 @@ private:
         u64 pipeline_mismatches{};
         u64 view_mismatches{};
         u64 binding_mismatches{};
+        /// HandleData draws whose computed handles changed (EDEN_NX2_FAST_COMPUTED_HANDLES).
+        u64 computed_handle_changes{};
         /// DeltaPipeline draws by GraphicsPipeline::DeltaDrawBlocker.
         std::array<u64, static_cast<size_t>(GraphicsPipeline::DeltaBlocker::Count)> delta_blockers{};
         /// StateChanged draws by the reason of the last break, and by its 3D method.
@@ -442,6 +444,8 @@ private:
                           u64 map_serial);
     void ReportFastDraws();
     ReusableDraw reusable_draw;
+    /// Scratch for EvaluateComputedHandles (EDEN_NX2_FAST_COMPUTED_HANDLES).
+    std::vector<u32> computed_handle_values;
     ReusableDraw taken_draw; ///< The draw TakeReusableDraw last returned the pipeline of
     /// Device memory of the constant buffers TakeReusableDraw checks for texture handle writes.
     std::array<std::array<VideoCommon::Nx2FastDraw::DeviceSpans, Maxwell::MaxConstBuffers>,

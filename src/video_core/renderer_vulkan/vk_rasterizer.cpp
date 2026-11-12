@@ -66,6 +66,7 @@
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
 #include "video_core/shader_cache.h"
+#include "video_core/shader_handle_program.h"
 #include "video_core/texture_cache/texture_cache_base.h"
 #include "video_core/textures/texture.h"
 #include "video_core/vulkan_common/vulkan_device.h"
@@ -440,6 +441,37 @@ RasterizerVulkan::~RasterizerVulkan() {
 }
 
 namespace {
+/// EDEN_NX2_FAST_COMPUTED_HANDLES: every texture and image handle the pipeline's shaders compute
+/// at draw time, evaluated from the current constant and storage buffer words as
+/// GraphicsPipeline's read_handle evaluates them, in stage and descriptor order.
+void EvaluateComputedHandles(const GraphicsPipeline& pipeline, Tegra::MemoryManager& memory,
+                             const Tegra::Engines::Maxwell3D& maxwell3d, u64 storage_alignment,
+                             std::vector<u32>& values) {
+    values.clear();
+    for (size_t stage = 0; stage < Maxwell::MaxShaderStage; ++stage) {
+        const Shader::Info* const info = pipeline.StageInfo(stage);
+        if (info == nullptr || info->handle_programs.empty()) {
+            continue;
+        }
+        const auto& cbufs = maxwell3d.state.shader_stages[stage].const_buffers;
+        const auto cbuf_address = [&](u32 cbuf) -> GPUVAddr {
+            return cbuf < cbufs.size() && cbufs[cbuf].enabled ? cbufs[cbuf].address : GPUVAddr{};
+        };
+        const auto evaluate = [&](const auto& descriptors) {
+            for (const auto& desc : descriptors) {
+                if (desc.handle_program != ~0U) {
+                    values.push_back(VideoCommon::EvaluateTextureHandle(
+                        *info, desc.handle_program, memory, cbuf_address, storage_alignment));
+                }
+            }
+        };
+        evaluate(info->texture_buffer_descriptors);
+        evaluate(info->image_buffer_descriptors);
+        evaluate(info->texture_descriptors);
+        evaluate(info->image_descriptors);
+    }
+}
+
 /// EDEN_NX2_FAST_HANDLE_WORDS=1: a constant buffer write into a buffer that holds texture
 /// handles ends delta draws only when it reaches a handle word the pipeline reads, not anywhere
 /// in the buffer (off by default while it is measured).
@@ -577,6 +609,14 @@ GraphicsPipeline* RasterizerVulkan::TakeReusableDraw(bool is_indexed, bool is_in
             }
         }
     }
+    if (draw.pipeline->HasDeltaHandlePrograms()) {
+        EvaluateComputedHandles(*draw.pipeline, *gpu_memory, *maxwell3d,
+                                device.GetStorageBufferAlignment(), computed_handle_values);
+        if (!draw.pipeline->SameDeltaHandleValues(computed_handle_values)) {
+            ++fast_draw_stats.computed_handle_changes;
+            return full(FullDraw::HandleData);
+        }
+    }
     taken_draw = draw;
     return draw.pipeline;
 }
@@ -707,6 +747,10 @@ void RasterizerVulkan::ReportFastDraws() {
         }
     }
     ineligible += " | pipelines without delta draws:" + (blockers.empty() ? std::string{" none"} : blockers);
+    if (stats.computed_handle_changes != 0) {
+        ineligible += fmt::format(" | computed handles changed {:.0f}",
+                                  static_cast<double>(stats.computed_handle_changes) / seconds);
+    }
     LOG_INFO(Render_Vulkan,
              "Fast draw ineligible per second:{} | prepare us per draw: full {:.2f}, delta {:.2f}, "
              "all {:.2f} ({:.0f} draws/s)",
@@ -1164,6 +1208,12 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
             report_failure("configure failed");
             TraceRenderState(is_indexed, "configure-failed", nullptr);
             return;
+        }
+        if (fast_draw_on && pipeline->HasDeltaHandlePrograms()) {
+            // The computed handles the views just captured were resolved from.
+            EvaluateComputedHandles(*pipeline, *gpu_memory, *maxwell3d,
+                                    device.GetStorageBufferAlignment(), computed_handle_values);
+            pipeline->SetDeltaHandleValues(computed_handle_values);
         }
         if (verify_views && pipeline->DeltaMismatch()) {
             ++fast_draw_stats.view_mismatches;

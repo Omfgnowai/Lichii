@@ -447,12 +447,23 @@ GraphicsPipeline::GraphicsPipeline(
     if (IsMeshPipeline()) {
         block(DeltaBlocker::Mesh);
     }
+    static const bool fast_computed_handles = [] {
+        const char* const value = std::getenv("EDEN_NX2_FAST_COMPUTED_HANDLES");
+        return value != nullptr && value[0] == '1';
+    }();
+    const auto computed_handle = [&] {
+        if (fast_computed_handles) {
+            delta_handle_programs = true;
+        } else {
+            block(DeltaBlocker::ComputedHandles);
+        }
+    };
     for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
         const Shader::Info& info = stage_infos[stage];
         u32& handles = handle_constant_buffers[stage];
         for (const auto& desc : info.texture_buffer_descriptors) {
             if (desc.handle_program != ~0U) {
-                block(DeltaBlocker::ComputedHandles);
+                computed_handle();
             }
             handles |= 1U << desc.cbuf_index;
             if (desc.has_secondary) {
@@ -461,13 +472,13 @@ GraphicsPipeline::GraphicsPipeline(
         }
         for (const auto& desc : info.image_buffer_descriptors) {
             if (desc.handle_program != ~0U) {
-                block(DeltaBlocker::ComputedHandles);
+                computed_handle();
             }
             handles |= 1U << desc.cbuf_index;
         }
         for (const auto& desc : info.texture_descriptors) {
             if (desc.handle_program != ~0U) {
-                block(DeltaBlocker::ComputedHandles);
+                computed_handle();
             }
             handles |= 1U << desc.cbuf_index;
             if (desc.has_secondary) {
@@ -476,7 +487,7 @@ GraphicsPipeline::GraphicsPipeline(
         }
         for (const auto& desc : info.image_descriptors) {
             if (desc.handle_program != ~0U) {
-                block(DeltaBlocker::ComputedHandles);
+                computed_handle();
             }
             handles |= 1U << desc.cbuf_index;
         }
@@ -904,6 +915,7 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed, BackSplit* back_split) {
         }
         delta_views.assign(views.begin(), views.end());
         delta_samplers.assign(samplers.begin(), samplers.end());
+        delta_handle_values_valid = false;
         configured_stages = Spec::enabled_stages;
         delta_views_valid = true;
         kept_images_valid = false;
