@@ -629,6 +629,40 @@ private:
     /// Moves a registered image to a new address, keeping its host image, views and
     /// framebuffers; its contents at the old address are dropped as the collector drops them.
     void RelocateImage(ImageId image_id, GPUVAddr gpu_addr, DAddr cpu_addr);
+    /// Render target reuse (EDEN_NX2_RT_REUSE=1): Ocarina of Time's busiest per-frame targets
+    /// (1280x720) drift ~10 MB a frame, past their own size, so they overlap nothing and EXP43
+    /// never sees them. Cleared render targets of relocation shape go to a pool per shape; a new
+    /// one that overlaps nothing takes a pooled image of exactly its shape that was not used in
+    /// this frame or the previous one, under the same guard (shape, both addresses, the image's
+    /// own guard bits) and exclusions as EXP43.
+    [[nodiscard]] static bool ReuseEnabled() {
+        static const bool enabled = [] {
+            const char* const value = std::getenv("EDEN_NX2_RT_REUSE");
+            return value != nullptr && value[0] == '1';
+        }();
+        return enabled;
+    }
+    [[nodiscard]] static bool SameRelocationShape(const ImageInfo& info,
+                                                  const ImageInfo& new_info) noexcept {
+        return RelocationShaped(info) && info.format == new_info.format &&
+               info.size.width == new_info.size.width &&
+               info.size.height == new_info.size.height &&
+               info.size.depth == new_info.size.depth && info.block == new_info.block &&
+               info.layer_stride == new_info.layer_stride &&
+               info.maybe_unaligned_layer_stride == new_info.maybe_unaligned_layer_stride &&
+               info.tile_width_spacing == new_info.tile_width_spacing &&
+               info.native_tiling == new_info.native_tiling &&
+               info.rescaleable == new_info.rescaleable &&
+               info.downscaleable == new_info.downscaleable &&
+               info.is_sparse == new_info.is_sparse && info.astc_opaque == new_info.astc_opaque;
+    }
+    /// A pooled image the new render target can take, or none.
+    [[nodiscard]] ImageId ReuseCandidate(const ImageInfo& new_info, GPUVAddr gpu_addr,
+                                         DAddr cpu_addr);
+    ::Common::unordered_map<u64, std::vector<ImageId>> reuse_pool;
+    u64 relocation_reused{};
+    u64 reuse_misses{};
+
     /// Removes the image from its overlaps' overlap lists (DeleteImage, RelocateImage).
     void DropOverlapLinks(ImageId image_id);
 

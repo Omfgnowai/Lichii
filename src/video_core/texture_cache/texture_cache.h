@@ -658,12 +658,14 @@ void TextureCache<P>::TickFrame() {
         LOG_INFO(HW_GPU,
                  "Render target relocation (EXP43={}) last 600 frames: {} candidates, {} kept by "
                  "the guard, {} relocated, {} retired early, {} over 2+ images of their shape; {} "
-                 "of {} shapes and {} addresses guarded",
+                 "of {} shapes and {} addresses guarded; reuse (EDEN_NX2_RT_REUSE) {} reused, {} "
+                 "without a pooled image",
                  VideoCore::Nx2Debug::Experiment(43), relocation_candidates, relocation_guarded,
                  relocation_relocated, relocation_retired, relocation_crowded, guarded_shapes,
-                 relocation_shapes.size(), relocation_guarded_addresses.size());
+                 relocation_shapes.size(), relocation_guarded_addresses.size(), relocation_reused,
+                 reuse_misses);
         relocation_candidates = relocation_guarded = relocation_relocated = relocation_retired =
-            relocation_crowded = 0;
+            relocation_crowded = relocation_reused = reuse_misses = 0;
     }
 
     if constexpr (IMPLEMENTS_ASYNC_DOWNLOADS) {
@@ -3371,6 +3373,23 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
             }
         }
     }
+    // EDEN_NX2_RT_REUSE: a cleared render target that overlaps nothing takes a pooled image of
+    // its exact shape (not used for a frame), as EXP43 moves a drifted one.
+    const bool reuse_shaped = ReuseEnabled() && clearing_render_targets &&
+                              RelocationShaped(new_info) && overwritten_by_clear();
+    if (reuse_shaped && join_bad_overlap_ids.empty() && join_copies_to_do.empty() &&
+        join_left_aliased_ids.empty() && join_right_aliased_ids.empty() &&
+        join_ignore_textures.empty()) {
+        const RelocationShape& shape = relocation_shapes[RelocationShapeKey(new_info)];
+        if (shape.guard == 0 && !relocation_guarded_addresses.contains(gpu_addr)) {
+            if (const ImageId old_id = ReuseCandidate(new_info, gpu_addr, cpu_addr)) {
+                relocation_seen = true;
+                ++relocation_reused;
+                RelocateImage(old_id, gpu_addr, cpu_addr);
+                return old_id;
+            }
+        }
+    }
     const ImageId new_image_id = slot_images.insert(runtime, new_info, gpu_addr, cpu_addr);
     if constexpr (requires(const Image& image) { image.OutOfMemory(); }) {
         if (slot_images[new_image_id].OutOfMemory()) {
@@ -3389,6 +3408,11 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
     Image& new_image = slot_images[new_image_id];
 
     new_image.allocation_tick = frame_tick;
+    new_image.last_use_frame = frame_tick;
+    if (reuse_shaped) {
+        reuse_pool[RelocationShapeKey(new_info)].push_back(new_image_id);
+        new_image.reuse_pooled = true;
+    }
     {
         // Which shapes are being created (periodic log): format, type, levels, layers, size.
         const u64 key = (u64{static_cast<u32>(new_info.format)} << 56) |
@@ -4263,6 +4287,13 @@ void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
     const StutterTrace::SiteScope site{StutterTrace::Site::ImageDelete};
     ImageBase& image = slot_images[image_id];
     ++images_deleted;
+    if (image.reuse_pooled) {
+        if (const auto pool = reuse_pool.find(RelocationShapeKey(image.info));
+            pool != reuse_pool.end()) {
+            std::erase(pool->second, image_id);
+        }
+        image.reuse_pooled = false;
+    }
     VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Invalidation);
     // Drop every decode still queued for it, whatever IsDecoding says: an image re-decoded while
     // a decode was in flight has two, and the first to finish clears the flag. A decode left
@@ -4484,6 +4515,8 @@ void TextureCache<P>::DropOverlapLinks(ImageId image_id) {
 template <class P>
 void TextureCache<P>::RelocateImage(ImageId image_id, GPUVAddr gpu_addr, DAddr cpu_addr) {
     Image& image = slot_images[image_id];
+    // As DeleteImage: draws that kept bindings to it resolve again.
+    VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Invalidation);
     // 1. The GPU's data at the old address is lost, as when the collector deletes the image.
     MarkStale(image); // before UntrackImage (see MarkStale)
     if (True(image.flags & ImageFlagBits::Tracked)) {
@@ -4527,6 +4560,7 @@ void TextureCache<P>::RelocateImage(ImageId image_id, GPUVAddr gpu_addr, DAddr c
     image.flags |= ImageFlagBits::CpuModified;
     image.last_write_frame = ~u64{0};
     image.relocation_guard_noted = 0;
+    image.last_use_frame = frame_tick;
     // 5. Page tables, map view, LRU.
     RegisterImage(image_id);
     // 6. As DeleteImage: render targets and descriptor tables are looked up again.
@@ -4651,6 +4685,85 @@ ImageId TextureCache<P>::RelocationCandidate(const ImageInfo& new_info, GPUVAddr
 }
 
 template <class P>
+ImageId TextureCache<P>::ReuseCandidate(const ImageInfo& new_info, GPUVAddr gpu_addr,
+                                        DAddr cpu_addr) {
+    const auto pool = reuse_pool.find(RelocationShapeKey(new_info));
+    if (pool == reuse_pool.end()) {
+        return ImageId{};
+    }
+    constexpr DAddr StandInBase = ~(1ULL << 40);
+    if (cpu_addr >= StandInBase) {
+        return ImageId{};
+    }
+    constexpr ImageFlagBits excluded =
+        ImageFlagBits::Sparse | ImageFlagBits::SparseLayers | ImageFlagBits::SparseTiles |
+        ImageFlagBits::UnwrittenSparse | ImageFlagBits::Unbacked | ImageFlagBits::Converted |
+        ImageFlagBits::AsynchronousDecode | ImageFlagBits::IsDecoding | ImageFlagBits::Remapped |
+        ImageFlagBits::Alias | ImageFlagBits::CostlyLoad | ImageFlagBits::Rescaled |
+        ImageFlagBits::TrimmedLevels;
+    const auto& regs = maxwell3d->regs;
+    const auto& gpu_pages = *channel_state->gpu_page_table;
+    const auto queued = [](ImageId id, const auto& downloads) {
+        return std::ranges::any_of(downloads, [id](const auto& download) {
+            return download.is_swizzle && download.object_id == id;
+        });
+    };
+    ImageId best{};
+    u64 best_use = ~u64{0};
+    for (const ImageId id : pool->second) {
+        const ImageBase& image = slot_images[id];
+        // Used (prepared) or written in this frame or the previous one: it may still be read.
+        if (image.last_use_frame + 2 > frame_tick ||
+            (image.last_write_frame != ~u64{0} && image.last_write_frame + 2 > frame_tick)) {
+            continue;
+        }
+        if (!SameRelocationShape(image.info, new_info) || image.relocation_guard_noted != 0 ||
+            relocation_guarded_addresses.contains(image.gpu_addr) ||
+            image.info.forced_flushed || image.info.dma_downloaded ||
+            True(image.flags & excluded) || False(image.flags & ImageFlagBits::Registered) ||
+            image.HasScaled() || !image.aliased_images.empty() || image.cpu_addr >= StandInBase) {
+            continue;
+        }
+        if (image.last_use_frame >= best_use) {
+            continue;
+        }
+        // Registered in this channel's GPU page table.
+        const auto page = gpu_pages.find(image.gpu_addr >> YUZU_PAGEBITS);
+        if (page == gpu_pages.end() || std::ranges::find(page->second, id) == page->second.end()) {
+            continue;
+        }
+        if (queued(id, uncommitted_downloads) ||
+            std::ranges::any_of(committed_downloads,
+                                [&](const auto& downloads) { return queued(id, downloads); })) {
+            continue;
+        }
+        // Not bound as a target of this clear.
+        bool bound = false;
+        for (u32 index = 0; index < regs.rt_control.count && index < NUM_RT; ++index) {
+            const auto& rt = regs.rt[index];
+            if (rt.Address() != 0 && rt.format != Tegra::RenderTargetFormat::NONE &&
+                image.OverlapsGPU(rt.Address(), 1)) {
+                bound = true;
+            }
+        }
+        if (regs.zeta_enable && regs.zeta.Address() != 0 &&
+            image.OverlapsGPU(regs.zeta.Address(), 1)) {
+            bound = true;
+        }
+        if (bound) {
+            continue;
+        }
+        best = id;
+        best_use = image.last_use_frame;
+    }
+    if (!best) {
+        ++reuse_misses;
+    }
+    (void)gpu_addr;
+    return best;
+}
+
+template <class P>
 void TextureCache<P>::NoteRelocationGuard(ImageBase& image, RelocationGuard reason) {
     image.relocation_guard_noted |= reason;
     relocation_guarded_addresses[image.gpu_addr] |= reason;
@@ -4746,6 +4859,7 @@ void TextureCache<P>::PrepareImage(ImageId image_id, bool is_modification, bool 
     }
     Image& image = slot_images[image_id];
     CheckCrossFrameUse(image, is_modification, invalidate);
+    image.last_use_frame = frame_tick;
     if (invalidate) {
         image.flags &= ~(ImageFlagBits::CpuModified | ImageFlagBits::GpuModified);
         if (False(image.flags & ImageFlagBits::Tracked)) {

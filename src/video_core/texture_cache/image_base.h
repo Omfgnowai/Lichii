@@ -140,6 +140,10 @@ struct ImageBase {
     /// (~0 = never, or contents discarded), and the guard reasons this image already reported.
     u64 last_write_frame = ~u64{0};
     u8 relocation_guard_noted = 0;
+    /// Render target reuse (EDEN_NX2_RT_REUSE): the frame the image was last prepared (sampled,
+    /// copied, rendered to), and whether it is in the reuse pool of its shape.
+    u64 last_use_frame = 0;
+    bool reuse_pooled = false;
 
     std::array<u32, MAX_MIP_LEVELS> mip_level_offsets{};
 
