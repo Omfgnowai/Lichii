@@ -162,6 +162,11 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
 
     // Periodic statistics (TickFrame).
     u64 gc_deletes{};
+    u64 gc_passes[4]{};      ///< Collector passes: low priority, high priority, aggressive, out of memory
+    u64 gc_deferred{};       ///< Low-priority passes skipped on frames that made images (TC_GC_DEFER)
+    u64 gc_budget_stops{};   ///< Low-priority passes stopped by EDEN_NX2_TC_GC_BUDGET_US
+    u32 frame_images_created{}; ///< Images made since the last TickFrame
+    u32 gc_deferred_in_row{};
     u64 gc_costly_deletes{};
     u64 gc_download_deletes{}; ///< Evictions that downloaded the image first (a full GPU wait)
     u64 async_decodes_queued{};

@@ -152,6 +152,25 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
     bool evict_old_costly = false;
     u64 ticks_to_destroy = 0;
     size_t num_iterations = 0;
+    // EDEN_NX2_TC_GC_DEFER=N: a low-priority pass (memory between the minimum and the expected
+    // threshold: nothing urgent) waits while a frame made N or more images, at most 30 frames in
+    // a row. Frames that make images are the slow ones (area changes, new render targets), and
+    // deleting there added ~1.2 ms to them (DropOverlapLinks, DeleteImage) on the back thread.
+    // EDEN_NX2_TC_GC_BUDGET_US=N: a low-priority pass stops after N microseconds; the rest waits
+    // for the next frame.
+    static const u32 gc_defer = [] {
+        const char* value = std::getenv("EDEN_NX2_TC_GC_DEFER");
+        return value != nullptr ? static_cast<u32>(std::strtoul(value, nullptr, 10)) : 0U;
+    }();
+    static const s64 gc_budget_us = [] {
+        const char* value = std::getenv("EDEN_NX2_TC_GC_BUDGET_US");
+        return value != nullptr ? static_cast<s64>(std::strtoll(value, nullptr, 10)) : s64{0};
+    }();
+    const auto gc_start = std::chrono::steady_clock::now();
+    const auto over_budget = [&] {
+        return gc_budget_us > 0 && !high_priority_mode && !aggressive_mode && !out_of_memory &&
+               std::chrono::steady_clock::now() - gc_start >= std::chrono::microseconds{gc_budget_us};
+    };
     const auto Configure = [&](bool allow_aggressive) {
         high_priority_mode = out_of_memory || total_used_memory >= expected_memory;
         aggressive_mode =
@@ -166,8 +185,13 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
         num_iterations = aggressive_mode ? 40 : (high_priority_mode ? 20 : 10);
     };
     const auto Cleanup = [this, &num_iterations, &high_priority_mode, &aggressive_mode,
-                          &evict_old_costly, out_of_memory](ImageId image_id) {
+                          &evict_old_costly, &over_budget, out_of_memory](ImageId image_id) {
         if (num_iterations == 0) {
+            return true;
+        }
+        if (over_budget()) {
+            ++gc_budget_stops;
+            num_iterations = 0;
             return true;
         }
         --num_iterations;
@@ -261,6 +285,15 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
         }
     };
     Configure(false);
+    const bool low_priority = !out_of_memory && !high_priority_mode;
+    ++gc_passes[out_of_memory ? 3 : aggressive_mode ? 2 : high_priority_mode ? 1 : 0];
+    if (low_priority && gc_defer != 0 && frame_images_created >= gc_defer &&
+        gc_deferred_in_row < 30) {
+        ++gc_deferred_in_row;
+        ++gc_deferred;
+        return;
+    }
+    gc_deferred_in_row = 0;
     static const u64 old_age = [] {
         const char* value = std::getenv("EDEN_NX2_TC_OLD_AGE");
         return value != nullptr ? std::strtoull(value, nullptr, 10) : 1800ULL;
@@ -590,6 +623,11 @@ void TextureCache<P>::TickFrame() {
                  images_created, images_deleted, gc_deletes + gc_costly_deletes, gc_costly_deletes,
                  gc_download_deletes,
                  async_decodes_queued, astc_opaque_images, astc_alpha_images);
+        LOG_INFO(HW_GPU, "Texture cache last 600 frames: collector passes {} low / {} high / {} aggressive / {} out of memory; {} deferred, {} stopped by the time budget",
+                 gc_passes[0], gc_passes[1], gc_passes[2], gc_passes[3], gc_deferred,
+                 gc_budget_stops);
+        gc_passes[0] = gc_passes[1] = gc_passes[2] = gc_passes[3] = 0;
+        gc_deferred = gc_budget_stops = 0;
         LOG_INFO(HW_GPU, "Texture cache last 600 frames: {} uploads from guest memory, {} MiB (largest {} MiB, {} by layer)",
                  images_uploaded, uploaded_bytes >> 20, largest_upload >> 20, layer_uploads);
         LOG_INFO(HW_GPU,
@@ -627,6 +665,7 @@ void TextureCache<P>::TickFrame() {
     if (out_of_memory || total_used_memory > minimum_memory) {
         RunGarbageCollector(out_of_memory);
     }
+    frame_images_created = 0;
     if (out_of_memory) {
         // Textures left out for lack of memory are made again on their next read, once a frame
         // while images keep failing.
@@ -3506,6 +3545,7 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
             shape.second = gpu_addr;
         }
         ++images_created;
+        ++frame_images_created;
     }
 
     if (!gpu_memory->IsContinuousRange(new_image.gpu_addr, new_image.guest_size_bytes) &&
