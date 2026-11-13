@@ -142,6 +142,7 @@ module offsets.
 | `0x3293410` | Ocarina playback tick | Truncating a step below one stalls playback. | Advance by accumulated whole ticks. |
 | `0x2F53268` | Step rate manager countdown | `max(round(step), 1)` per frame runs fast above 60 fps. | Decrement by accumulated whole ticks. |
 | `0x53F914` | Ambient wave phase | Counting frames makes the phase run fast above 60 fps. | Accumulate the raw step instead of adding one. |
+| `0x32926C8`, `0x3296B08`, `0x3296DA4` | Ocarina tick counter while the player plays (fork) | The same counter as `0x3293410`, also advanced by a truncated step: it stays 0, so the 360-tick idle check never passes and recorded notes get zero lengths. | Advance by accumulated whole ticks, under the playback hook's slot. Stubs at `0x3C46A40`, `0x3C46A68`, `0x3C46A90` (40 bytes each). |
 
 The helper takes the counter address in `x13` and step in `s0`, returning ticks
 in `w13`. Each of 16 slots retains a fractional remainder. A new or evicted
