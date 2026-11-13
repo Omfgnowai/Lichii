@@ -1000,13 +1000,6 @@ private:
             const char* value = std::getenv("EDEN_NX2_EXACT_PREFLUSH");
             return value == nullptr || value[0] != '0';
         }();
-        // Native titles: until this write's download lands, a guest read of a Preflushable page
-        // must reach GetFlushArea, which waits for the download or flushes it. Arming its read
-        // trap again also drops the cores' cached read areas (reactive flushing).
-        if (Tegra::g_nx2_ampere.load(std::memory_order_relaxed) &&
-            memory_tracker.IsRegionPreflushable(device_addr, size)) {
-            ArmReadTraps(device_addr, size);
-        }
         if (AsyncBufferDownloads()) {
             uncommitted_gpu_modified_ranges.Add(device_addr, size);
             return;
