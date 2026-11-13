@@ -173,8 +173,6 @@ add_library(shader_recompiler STATIC
     frontend/maxwell/translate_program.cpp
     frontend/maxwell/translate_program.h
     host_translate_info.h
-    info_serialize.cpp
-    info_serialize.h
     translate_profile.cpp
     translate_profile.h
     ir_opt/collect_shader_info_pass.cpp
