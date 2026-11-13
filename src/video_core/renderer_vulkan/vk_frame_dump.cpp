@@ -13,6 +13,7 @@
 #include <fmt/format.h>
 
 #include "common/cityhash.h"
+#include "common/fs/fs_util.h"
 #include "common/logging.h"
 #include "common/settings.h"
 #include "common/stb.h"
@@ -264,7 +265,8 @@ FrameDump::FrameDump(const Device& device_, MemoryAllocator& memory_allocator_,
         buffers_value && buffers_value[0] == '1') {
         schedule.RecordBuffers();
     }
-    LOG_INFO(Render_Vulkan, "Frame dump armed: dir={} at={}", directory.string(), value);
+    LOG_INFO(Render_Vulkan, "Frame dump armed: dir={} at={}",
+             Common::FS::PathToUTF8String(directory), value);
 }
 
 FrameDump::~FrameDump() {
@@ -781,7 +783,7 @@ void FrameDump::WriterLoop() {
                      << '\n';
             manifest.close();
             LOG_INFO(Render_Vulkan, "Frame dump done: {} images, {}, {} MiB in {}{}", images,
-                     job.tags, written_bytes >> 20, directory.string(),
+                     job.tags, written_bytes >> 20, Common::FS::PathToUTF8String(directory),
                      job.truncated ? fmt::format(" (stopped at the {} GiB cap)", SizeCap() >> 30)
                                    : "");
             if (const u64 id = schedule.CaptureId(); id != 0) {
@@ -1077,7 +1079,8 @@ void FrameDump::TickFrame() {
     std::filesystem::create_directories(directory, error);
     manifest.open(directory / "manifest.jsonl", std::ios::trunc);
     if (!manifest) {
-        LOG_ERROR(Render_Vulkan, "Frame dump: cannot write {}", directory.string());
+        LOG_ERROR(Render_Vulkan, "Frame dump: cannot write {}",
+                  Common::FS::PathToUTF8String(directory));
         if (const u64 id = schedule.CaptureId(); id != 0) {
             VideoCore::Nx2Debug::FinishCapture(
                 id, {.error = fmt::format("cannot write {}", directory.generic_string())});
@@ -1090,7 +1093,7 @@ void FrameDump::TickFrame() {
              << '\n';
     writer = std::thread{[this] { WriterLoop(); }};
     LOG_INFO(Render_Vulkan, "Frame dump: capturing frame {} ({:.1f} s after boot){} into {}", frame,
-             elapsed, schedule.Sampled() ? (schedule.Buffers() ? " with sampled textures and buffers" : " with sampled textures") : (schedule.Buffers() ? " with buffers" : ""), directory.string());
+             elapsed, schedule.Sampled() ? (schedule.Buffers() ? " with sampled textures and buffers" : " with sampled textures") : (schedule.Buffers() ? " with buffers" : ""), Common::FS::PathToUTF8String(directory));
 }
 
 void FrameDumpSchedule::Configure(std::string_view at, std::filesystem::path trigger_file_,

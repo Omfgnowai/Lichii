@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: 2022 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #pragma once
@@ -88,12 +87,15 @@ public:
         [[nodiscard]] bool WaitsToReach() const;
     };
 
+    Puller() = default;
+    /// Leaves the semaphore waiters, so a channel torn down mid-wait leaves no slot (and no host
+    /// pointer to its semaphore word) for the next session's GPU thread.
+    ~Puller();
+
     [[nodiscard]] bool HasPendingAcquire() const {
         return pending_acquire.has_value();
     }
     [[nodiscard]] bool CanResumeAcquire(DmaPusher& dma_pusher);
-    /// EDEN_NX2_ACQUIRE_VALVE_LOG: what a drain by the 1 ms valve found.
-    void NoteValveDrain(DmaPusher& dma_pusher, u32 before, u32 after);
     /// Clears the pending acquire once it is met; false while the channel has to keep waiting.
     bool ResumeAcquire(DmaPusher& dma_pusher);
 

@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
@@ -364,7 +363,14 @@ std::optional<s64> CoreTiming::Advance() {
             } else {
                 basic_lock.unlock();
 
-                const auto new_schedule_time{event_type->callback(evt_time, late)};
+                // Time spent paused is not lateness: a callback that makes up for being late (the
+                // sysmix pump) would otherwise wait out the pause again after it.
+                const std::chrono::nanoseconds late_since_pause{
+                    evt_time < pause_end_time
+                        ? (std::min)(late.count(),
+                                     GetGlobalTimeNs().count() - static_cast<s64>(pause_end_time))
+                        : late.count()};
+                const auto new_schedule_time{event_type->callback(evt_time, late_since_pause)};
 
                 basic_lock.lock();
 

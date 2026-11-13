@@ -52,7 +52,12 @@ constexpr double LongSiteMs = 2.0;
 constexpr size_t MaxLongSites = 256;
 constexpr size_t DetailZones = 8;
 constexpr std::array<std::string_view, LookupCount> lookup_names{
-    "gfx_prebuilt", "gfx_background", "gfx_recorded", "gfx_new", "compute_prebuilt", "compute_new",
+    "gfx_prebuilt",     "gfx_background", "gfx_recorded", "gfx_new",
+    "compute_prebuilt", "compute_new",    "program_hit",  "program_miss",
+    "program_stale",
+};
+constexpr std::array<std::string_view, DriverBuildCount> driver_build_names{
+    "binary", "compiled", "rejected",
 };
 
 
@@ -123,6 +128,7 @@ struct FrameState {
     u64 window_graphics_builds{};
     u64 window_compute_builds{};
     std::array<u64, LookupCount> lookups{};
+    std::array<u64, DriverBuildCount> driver_builds{};
 };
 
 FrameState g_frame;
@@ -163,13 +169,20 @@ void Summarize(FrameState& state, u64 now) {
                                total - state.lookups[index]);
         state.lookups[index] = total;
     }
+    std::string driver_builds;
+    for (size_t index = 0; index < DriverBuildCount; ++index) {
+        const u64 total = g_totals.driver_builds[index].load(std::memory_order_relaxed);
+        driver_builds += fmt::format("{}{}:{}", index == 0 ? "" : ",", driver_build_names[index],
+                                     total - state.driver_builds[index]);
+        state.driver_builds[index] = total;
+    }
     LOG_INFO(HW_GPU,
              "Nx2StutterSummary window_s={:.2f} frames={} over33={} over100={} hist={} cat_ms={} "
-             "builds=gfx:{},compute:{} lookups={} cache_bytes={} sites={}",
+             "builds=gfx:{},compute:{} lookups={} driver_builds={} cache_bytes={} sites={}",
              static_cast<double>(now - state.window_start_ns) / 1e9, state.window_frames,
              state.window_over_33, state.window_over_100, histogram.empty() ? "none" : histogram,
              categories, state.window_graphics_builds, state.window_compute_builds, lookups,
-             CacheFileBytes(), sites.empty() ? "none" : sites);
+             driver_builds, CacheFileBytes(), sites.empty() ? "none" : sites);
     state.window_start_ns = now;
     state.window_frames = 0;
     state.window_over_33 = 0;
@@ -356,6 +369,10 @@ void OnPresent() {
         state.window_start_ns = now;
         for (size_t index = 0; index < LookupCount; ++index) {
             state.lookups[index] = g_totals.lookups[index].load(std::memory_order_relaxed);
+        }
+        for (size_t index = 0; index < DriverBuildCount; ++index) {
+            state.driver_builds[index] =
+                g_totals.driver_builds[index].load(std::memory_order_relaxed);
         }
         return;
     }

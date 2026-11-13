@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <cstddef>
@@ -78,6 +77,12 @@ namespace {
     }
     if (window_type != Core::Frontend::WindowSystemType::Headless) {
         extensions.push_back(VK_KHR_SURFACE_EXTENSION_NAME);
+        if (std::ranges::any_of(properties, [](const VkExtensionProperties& property) {
+                return std::strcmp(property.extensionName,
+                                   VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME) == 0;
+            })) {
+            extensions.push_back(VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME);
+        }
     }
     // Probe optional extensions against the same snapshot the caller verifies against, so the
     // check here and the verification in CreateInstance can never disagree (see TOCTOU note below).

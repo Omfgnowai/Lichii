@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2019 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
@@ -16,6 +15,7 @@
 #include <fmt/format.h>
 
 #include "video_core/nx2_profile.h"
+#include "video_core/renderer_vulkan/pipeline_build_failure.h"
 #include "video_core/renderer_vulkan/pipeline_build_trace.h"
 #include "video_core/renderer_vulkan/pipeline_helper.h"
 #include "video_core/renderer_vulkan/pipeline_optimization.h"
@@ -24,6 +24,7 @@
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
 #include "video_core/renderer_vulkan/vk_descriptor_pool.h"
 #include "video_core/renderer_vulkan/vk_frame_dump.h"
+#include "video_core/renderer_vulkan/vk_pipeline_binaries.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
@@ -203,19 +204,20 @@ void ComputePipeline::TickUpscalerTrace() {
 }
 
 ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk::PipelineCache& pipeline_cache_,
+                                 PipelineBinaries* binaries_, u64 binary_key_,
                                  DescriptorPool& descriptor_pool,
                                  GuestDescriptorQueue& guest_descriptor_queue_,
                                  DescriptorBufferRing& descriptor_buffer_ring_,
-                                 Common::ThreadWorker* thread_worker,
+                                 const PipelineBuildQueue& build_queue,
                                  PipelineStatistics* pipeline_statistics,
                                  VideoCore::ShaderNotify* shader_notify, const Shader::Info& info_,
                                  vk::ShaderModule spv_module_, u64 shader_hash_,
-                                 std::function<vk::ShaderModule()> emit_module_)
+                                 std::function<vk::ShaderModule()> emit)
     : device{device_},
-      pipeline_cache(pipeline_cache_), guest_descriptor_queue{guest_descriptor_queue_},
+      pipeline_cache(pipeline_cache_), binaries{binaries_}, binary_key{binary_key_},
+      guest_descriptor_queue{guest_descriptor_queue_},
       descriptor_buffer_ring{descriptor_buffer_ring_}, info{info_},
-      shader_hash{shader_hash_}, spv_module(std::move(spv_module_)),
-      emit_module{std::move(emit_module_)} {
+      shader_hash{shader_hash_}, spv_module(std::move(spv_module_)) {
     if (shader_notify) {
         shader_notify->MarkShaderBuilding();
     }
@@ -253,23 +255,6 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
     }
 
     auto func{[this, shader_notify, pipeline_statistics] {
-        if (emit_module) {
-            try {
-                spv_module = emit_module();
-            } catch (const std::exception& exception) {
-                LOG_ERROR(Render_Vulkan, "Compute pipeline {:016x}: {}", shader_hash,
-                          exception.what());
-                build_failed = true;
-                std::scoped_lock lock{build_mutex};
-                is_built = true;
-                build_condvar.notify_one();
-                if (shader_notify) {
-                    shader_notify->MarkShaderComplete();
-                }
-                return;
-            }
-            emit_module = nullptr;
-        }
         const VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT subgroup_size_ci{
             .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT,
             .pNext = nullptr,
@@ -277,7 +262,11 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
         };
         // Only warp-level ops observe the subgroup size. Forcing 32 on other shaders makes Intel
         // compile SIMD32, which can spill a register-heavy kernel for minutes (Mario Kart World).
-        const bool uses_warp_ops = info.uses_subgroup_vote || info.uses_subgroup_invocation_id ||
+        // A shader that lost a conditional barrier relies on a whole warp running in step: at a
+        // smaller subgroup size it reads stale shared memory, which shows as banding over the image
+        // in Mario Kart World on Intel's Windows driver.
+        const bool uses_warp_ops = info.removed_conditional_barrier ||
+                                   info.uses_subgroup_vote || info.uses_subgroup_invocation_id ||
                                    info.uses_subgroup_shuffles || info.uses_subgroup_mask ||
                                    info.uses_quad_shuffles || info.uses_fswzadd ||
                                    info.uses_cooperative_matrix;
@@ -319,14 +308,18 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
             const bool unoptimized = (flags & VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT) != 0;
             const auto trace_begin = std::chrono::steady_clock::now();
             TracePipelineBuild("BEGIN", "compute", shader_hash, traced, unoptimized);
-            pipeline = device.GetLogical().CreateComputePipeline(compute_ci, *pipeline_cache);
+            pipeline = binaries ? binaries->CreateComputePipeline(compute_ci, *pipeline_cache,
+                                                                  binary_key)
+                                : device.GetLogical().CreateComputePipeline(compute_ci,
+                                                                            *pipeline_cache);
             TracePipelineBuild("END", "compute", shader_hash, traced, unoptimized,
                                std::chrono::duration<double, std::milli>(
                                    std::chrono::steady_clock::now() - trace_begin)
                                    .count());
         } catch (const vk::Exception& exception) {
-            LOG_CRITICAL(Render_Vulkan, "Adreno rejected compute shader {:016X}: {}", shader_hash,
+            LOG_CRITICAL(Render_Vulkan, "Driver rejected compute shader {:016X}: {}", shader_hash,
                          exception.what());
+            ReportPipelineBuildFailure(exception.GetResult());
             std::scoped_lock lock{build_mutex};
             is_built = true;
             build_condvar.notify_one();
@@ -357,15 +350,56 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
         }
     }};
     build_task = std::move(func);
-    if (thread_worker) {
-        build_task_done = false;
-        thread_worker->QueueWork([this] {
-            RunBuild();
-            // The last access to this pipeline from the worker.
-            build_task_done.store(true, std::memory_order::release);
-        });
-    } else {
+    if (build_queue.jobs) {
+        jobs = build_queue.jobs;
+        VideoCommon::ShaderJob build_job{
+            .priority = VideoCommon::ShaderJobPriority::Soon,
+            .cpu_bytes = build_queue.cpu_bytes,
+            .driver_bytes = build_queue.driver_bytes,
+        };
+        if (emit) {
+            // The SPIR-V is emitted first, in the job's CPU stage (shader cache v2)
+            build_job.cpu = [this, shader_notify, emit = std::move(emit)](
+                                VideoCommon::ShaderJobContext&) -> VideoCommon::ShaderDriverStage {
+                // A pipeline that fails here is built without a VkPipeline: its dispatches are
+                // skipped, as for one the driver rejects
+                const auto fail = [&](const char* what) {
+                    LOG_ERROR(Render_Vulkan,
+                              "Compute pipeline compilation failed shader={:#016x}: {}",
+                              shader_hash, what);
+                    build_failed = true;
+                    std::scoped_lock lock{build_mutex};
+                    is_built = true;
+                    build_condvar.notify_one();
+                    if (shader_notify) {
+                        shader_notify->MarkShaderComplete();
+                    }
+                };
+                try {
+                    spv_module = emit();
+                } catch (const std::exception& exception) {
+                    fail(exception.what());
+                    return {};
+                } catch (...) {
+                    fail("unknown exception");
+                    return {};
+                }
+                return [this] { RunBuild(); };
+            };
+        } else {
+            build_job.driver = [this] { RunBuild(); };
+        }
+        job = jobs->Submit(std::move(build_job));
+    } else if (!build_queue.owner_builds) {
         RunBuild();
+    }
+}
+
+ComputePipeline::~ComputePipeline() {
+    if (jobs) {
+        // Nothing needs a pipeline that goes: a build still queued is dropped.
+        jobs->Cancel(job);
+        job.Wait();
     }
 }
 
@@ -381,7 +415,9 @@ void ComputePipeline::RunBuild() {
 
 bool ComputePipeline::CanReplaceOcarinaUpscale() const {
     const bool known_shader =
-        shader_hash == 0xe40f5efb5480e692ULL || shader_hash == Ocarina1440pShader;
+        shader_hash == OcarinaThreeQuarterShader || shader_hash == 0xef542df87cacfe9eULL ||
+        shader_hash == Ocarina1440pShader || shader_hash == Ocarina1440pScaledShader ||
+        shader_hash == Ocarina1440pScaledFieldShader || shader_hash == OcarinaFullSizeShader;
     return known_shader && !info.stores_global_memory &&
            info.image_buffer_descriptors.empty() && info.image_descriptors.size() == 1 &&
            info.image_descriptors.front().count == 1 && info.image_descriptors.front().is_written &&
@@ -418,19 +454,17 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
     const auto& qmd{kepler_compute.launch_description};
     const auto& cbufs{qmd.const_buffer_config};
     const bool via_header_index{qmd.linked_tsc != 0};
+    const auto cbuf_address{[&](u32 cbuf) -> GPUVAddr {
+        return cbuf < cbufs.size() && ((qmd.const_buffer_enable_mask >> cbuf) & 1) != 0
+                   ? cbufs[cbuf].Address()
+                   : GPUVAddr{};
+    }};
     const auto read_handle{[&](const auto& desc, u32 index) {
         if (desc.handle_program != ~0U) {
             // Read by the shader from a storage buffer: computed for this dispatch.
             return TexturePair(VideoCommon::EvaluateTextureHandle(
-                                   info, desc.handle_program, gpu_memory,
-                                   [&](u32 cbuf) -> GPUVAddr {
-                                       return cbuf < cbufs.size() &&
-                                                      ((qmd.const_buffer_enable_mask >> cbuf) &
-                                                       1) != 0
-                                                  ? cbufs[cbuf].Address()
-                                                  : GPUVAddr{};
-                                   },
-                                   device.GetStorageBufferAlignment()),
+                                   info, desc.handle_program, gpu_memory, cbuf_address,
+                                   device.GetStorageBufferAlignment(), index),
                                via_header_index);
         }
         ASSERT(((qmd.const_buffer_enable_mask >> desc.cbuf_index) & 1) != 0);
@@ -467,7 +501,35 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
     for (const auto& desc : info.image_buffer_descriptors) {
         add_image(desc, false);
     }
+    u32 texture{};
     for (const auto& desc : info.texture_descriptors) {
+        if (desc.count > 1 && desc.handle_program != ~0U) {
+            // A table of handles the shader indexes, read in one go; elements repeating a
+            // sampler share its lookup.
+            const size_t first{views.size()};
+            u32 last_sampler_index{~0U};
+            VideoCommon::SamplerId sampler{};
+            VideoCommon::EvaluateTextureHandles(
+                info, desc.handle_program, gpu_memory, cbuf_address,
+                device.GetStorageBufferAlignment(), desc.count, [&](u32, u32 raw) {
+                    const auto handle{TexturePair(raw, via_header_index)};
+                    views.push_back({handle.first});
+                    if (handle.second != last_sampler_index) {
+                        sampler = texture_cache.GetSamplerId(handle.second, true);
+                        last_sampler_index = handle.second;
+                    }
+                    samplers.push_back(sampler);
+                });
+            if (VideoCommon::HandleTableNotes::Wanted()) {
+                std::vector<u32> tics(desc.count);
+                for (u32 index = 0; index < desc.count; ++index) {
+                    tics[index] = views[first + index].index;
+                }
+                VideoCommon::HandleTableNotes::Note(shader_hash, texture, tics);
+            }
+            ++texture;
+            continue;
+        }
         for (u32 index = 0; index < desc.count; ++index) {
             const auto handle{VideoCommon::HandleIsStoragePointer(info, desc, index)
                                   ? VideoCommon::NULL_TEXTURE_HANDLE
@@ -477,6 +539,7 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
             VideoCommon::SamplerId sampler = texture_cache.GetSamplerId(handle.second, true);
             samplers.push_back(sampler);
         }
+        ++texture;
     }
     for (const auto& desc : info.image_descriptors) {
         add_image(desc, desc.is_written);
@@ -646,12 +709,17 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
         scheduler.Record([this](vk::CommandBuffer) {
             const VideoCommon::Nx2Profile::Scope scope{VideoCommon::Nx2Profile::Zone::PipelineWait};
             const auto begin = std::chrono::steady_clock::now();
-            RunBuild();
-            {
-                std::unique_lock lock{build_mutex};
-                build_condvar.wait(lock,
-                                   [this] { return is_built.load(std::memory_order::relaxed); });
+            if (jobs) {
+                // Raised to NeedNow, and built here unless a driver worker builds it already
+                jobs->RunOrWait(job);
+                if (job.Status() == VideoCommon::ShaderJobStatus::Cancelled) {
+                    return; // The scheduler shut down
+                }
+            } else {
+                RunBuild();
             }
+            std::unique_lock lock{build_mutex};
+            build_condvar.wait(lock, [this] { return is_built.load(std::memory_order::relaxed); });
             // Every GPU channel waits with the dispatch, so long waits are freezes.
             const auto waited = std::chrono::steady_clock::now() - begin;
             if (waited > std::chrono::milliseconds{50}) {

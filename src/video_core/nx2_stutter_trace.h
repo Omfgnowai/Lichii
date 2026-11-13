@@ -51,7 +51,8 @@ enum class Thread : u8 {
 
 inline constexpr size_t ThreadCount = static_cast<size_t>(Thread::Count);
 
-/// Pipeline lookups, counted at each pipeline's first use in the session.
+/// Pipeline lookups, counted at each pipeline's first use in the session, and native program
+/// lookups (shader cache v2), at each program's first bind.
 enum class Lookup : u8 {
     GraphicsPrebuilt,   ///< Built from the disk cache at boot
     GraphicsBackground, ///< Built from the disk cache by the background prebuild
@@ -59,10 +60,23 @@ enum class Lookup : u8 {
     GraphicsNew,        ///< Not in the disk cache
     ComputePrebuilt,
     ComputeNew,
+    ProgramHit,   ///< Native program from a shader cache v2 record, not lowered
+    ProgramMiss,  ///< Native program lowered: no record
+    ProgramStale, ///< Native program lowered: a record of another build's lowering
     Count,
 };
 
 inline constexpr size_t LookupCount = static_cast<size_t>(Lookup::Count);
+
+/// Pipelines created through shader cache v2's driver layer (VK_KHR_pipeline_binary).
+enum class DriverBuild : u8 {
+    Binary,   ///< From the binaries stored for it
+    Compiled, ///< Compiled by the driver, its binaries stored
+    Rejected, ///< Stored binaries that were stale or the driver refused (it is then compiled)
+    Count,
+};
+
+inline constexpr size_t DriverBuildCount = static_cast<size_t>(DriverBuild::Count);
 
 /// Room for every Nx2Profile::Zone (nx2_profile.h checks it).
 inline constexpr size_t ZoneSlots = 64;
@@ -129,6 +143,7 @@ struct Totals {
     std::array<std::atomic<u32>, ThreadCount> sequence{};
     std::array<std::atomic<bool>, ThreadCount> running{};
     std::array<std::atomic<u64>, LookupCount> lookups{};
+    std::array<std::atomic<u64>, DriverBuildCount> driver_builds{};
     /// Each zone's exclusive time (nested zones excluded) and closes, by thread.
     std::array<std::array<std::atomic<u64>, ZoneSlots>, ThreadCount> zone_ticks{};
     std::array<std::array<std::atomic<u64>, ZoneSlots>, ThreadCount> zone_counts{};
@@ -251,6 +266,10 @@ private:
 
 inline void CountLookup(Lookup lookup) {
     g_totals.lookups[static_cast<size_t>(lookup)].fetch_add(1, std::memory_order_relaxed);
+}
+
+inline void CountDriverBuild(DriverBuild build) {
+    g_totals.driver_builds[static_cast<size_t>(build)].fetch_add(1, std::memory_order_relaxed);
 }
 
 using ThreadTicks = std::array<std::array<u64, CategoryCount>, ThreadCount>;

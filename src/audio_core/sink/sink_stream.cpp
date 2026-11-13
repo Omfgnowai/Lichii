@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
@@ -32,10 +31,10 @@ void SinkStream::AppendBuffer(SinkBuffer& buffer, std::span<s16> samples) {
     constexpr s32 min = (std::numeric_limits<s16>::min)();
     constexpr s32 max = (std::numeric_limits<s16>::max)();
 
-    auto yuzu_volume = Settings::Volume();
-    if (yuzu_volume > 1.0f)
-        yuzu_volume = 0.6f + 20.0f * std::log10(yuzu_volume);
-    auto const volume = system_volume * device_volume * yuzu_volume;
+    auto lichii_volume = Settings::Volume();
+    if (lichii_volume > 1.0f)
+        lichii_volume = 0.6f + 20.0f * std::log10(lichii_volume);
+    auto const volume = system_volume * device_volume * lichii_volume;
     std::size_t pushed{};
     const auto device_samples = samples.size() / system_channels * device_channels;
 
@@ -91,11 +90,24 @@ void SinkStream::AppendBuffer(SinkBuffer& buffer, std::span<s16> samples) {
     }
 }
 
+/// Blocks a sysmix stream may queue: enough for the host's largest callback plus one block.
+/// A host that asks for more than the queue holds (PipeWire's default 1024 frames against three
+/// 240-frame blocks) gets silence for the rest of every callback. The sample ring must hold the
+/// queued blocks and the one playing, at the device's channel count.
+u32 SinkStream::SysmixQueueLimit() const {
+    constexpr u64 MinimumBlocks = 3;
+    const u64 ring_blocks = SampleRingCapacity / (u64{TargetSampleCount} * device_channels) - 1;
+    const u64 request = largest_request_frames.load(std::memory_order_relaxed);
+    const u64 blocks = (request + TargetSampleCount - 1) / TargetSampleCount + 1;
+    return static_cast<u32>(std::clamp<u64>(blocks, MinimumBlocks, (std::min<u64>)(ring_blocks, 64)));
+}
+
 bool SinkStream::TryAppendOutputBlock(SinkBuffer& buffer, std::span<s16> samples) {
     if (type != StreamType::Sysmix || !IsReady() || buffer.frames != TargetSampleCount ||
         buffer.frames_played != 0 || buffer.consumed || system_channels != 2 ||
         (device_channels != 2 && device_channels != 6) ||
-        samples.size() != TargetSampleCount * system_channels || queued_buffers.load() >= 3) {
+        samples.size() != TargetSampleCount * system_channels ||
+        queued_buffers.load() >= SysmixQueueLimit()) {
         return false;
     }
     AppendBuffer(buffer, samples);
@@ -212,6 +224,12 @@ void SinkStream::ProcessAudioOutAndRender(std::span<s16> output_buffer, std::siz
         for (size_t i = 0; i < num_frames; i++)
             std::memset(&output_buffer[i * frame_size], 0, frame_size_bytes);
         return;
+    }
+
+    if (type == StreamType::Sysmix && num_frames > largest_request_frames.load()) {
+        largest_request_frames.store(num_frames);
+        LOG_INFO(Audio, "sysmix {}: host asks for {} frames per callback, queue limit {} blocks",
+                 name, num_frames, SysmixQueueLimit());
     }
 
     while (frames_written < num_frames) {

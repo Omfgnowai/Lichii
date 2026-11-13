@@ -21,9 +21,15 @@ namespace VideoCommon::ShaderWarm {
 /// so the two must move together.
 constexpr u32 WarmCacheVersion = VideoCommon::VulkanPipelineCacheVersion;
 
+/// What the builder finds in the game files, recorded in the precache's count file. A file built by
+/// an older builder is built again at launch (WarmFilesStale). 2: Mario Kart World's .esetb
+/// effects. 3: .ptcl particle effects (Fire Emblem).
+constexpr u32 WarmBuilderVersion = 3;
+
 using ComputeKey = std::array<u8, 24>;
 
-/// A program lowered and laid out like LowerNativeCode (video_core/shader_environment.cpp).
+/// A program lowered and laid out as LowerNativeCode (video_core/shader_environment.cpp) does,
+/// with the same functions (video_core/native_lowering.h).
 struct LoweredCode {
     std::vector<u8> code;
     /// Constant buffer the program's bound textures read, ~0U when it names none.
@@ -36,7 +42,7 @@ struct LoweredCode {
 /// map, its count and the magic. Returns the error text when the program cannot be lowered.
 std::optional<std::string> LowerProgram(std::span<const u8> program, LoweredCode& out);
 
-/// NativeShaderHash: CityHash64(code) ^ 0x4f554e4345000002.
+/// NativeShaderHash of the code
 u64 StageHash(std::span<const u8> code);
 
 struct ComputeControl {

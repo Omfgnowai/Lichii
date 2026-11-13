@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: 2021 yuzu Emulator Project
 // SPDX-FileCopyrightText: 2021 Skyline Team and Contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -197,8 +196,8 @@ private:
     std::mutex mutex; //!< Locks all AS operations
 
     struct VM {
-        static constexpr u32 YUZU_PAGESIZE{0x1000};
-        static constexpr u32 PAGE_SIZE_BITS{static_cast<u32>(std::countr_zero<u32>(YUZU_PAGESIZE))};
+        static constexpr u32 LICHII_PAGESIZE{0x1000};
+        static constexpr u32 PAGE_SIZE_BITS{static_cast<u32>(std::countr_zero<u32>(LICHII_PAGESIZE))};
 
         static constexpr u32 SUPPORTED_BIG_PAGE_SIZES{0x30000};
         static constexpr u32 DEFAULT_BIG_PAGE_SIZE{0x20000};
@@ -240,14 +239,9 @@ private:
         bool heap; ///< Mapped through the session's heap mapper (else an SMMU allocation)
         bool shared{}; ///< A reference to the process's range in Nx2GpuMemoryRegistry
         size_t asid{};
-        u32 gpu_maps{}; ///< GPU mappings of this address space that use the range
     };
     std::map<std::pair<u64, u64>, Nx2DeviceRange> nx2_device_ranges;
-    /// GPU mapping start -> (size, CPU range key in nx2_device_ranges)
-    std::map<u64, std::pair<u64, std::pair<u64, u64>>> nx2_gpu_maps;
     void Nx2Release(u64 cpu_address, u64 size);
-    /// Frees the device range of a CPU range (after queued GPU work). Needs `mutex`.
-    void Nx2ReleaseRangeLocked(std::map<std::pair<u64, u64>, Nx2DeviceRange>::iterator it);
 
     // Switch 2 sparse regions: a device range per region, mapped for the GPU when it's created;
     // blocks get memory behind their device pages as the GPU writes them.

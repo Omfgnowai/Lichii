@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -20,6 +19,7 @@
 #include "common/common_types.h"
 #include "common/logging.h"
 #include "common/settings.h"
+#include "video_core/fsr4_support.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
 VK_DEFINE_HANDLE(VmaAllocator)
@@ -59,6 +59,7 @@ VK_DEFINE_HANDLE(VmaPool)
 #define FOR_EACH_VK_FEATURE_EXT(FEATURE)                                                           \
     FEATURE(EXT, BorderColorSwizzle, BORDER_COLOR_SWIZZLE, border_color_swizzle)                   \
     FEATURE(EXT, ColorWriteEnable, COLOR_WRITE_ENABLE, color_write_enable)                         \
+    FEATURE(KHR, ComputeShaderDerivatives, COMPUTE_SHADER_DERIVATIVES, compute_shader_derivatives) \
     FEATURE(EXT, CustomBorderColor, CUSTOM_BORDER_COLOR, custom_border_color)                      \
     FEATURE(EXT, DepthBiasControl, DEPTH_BIAS_CONTROL, depth_bias_control)                         \
     FEATURE(EXT, DepthClipControl, DEPTH_CLIP_CONTROL, depth_clip_control)                         \
@@ -74,13 +75,17 @@ VK_DEFINE_HANDLE(VmaPool)
             primitive_topology_list_restart)                                                       \
     FEATURE(EXT, ProvokingVertex, PROVOKING_VERTEX, provoking_vertex)                              \
     FEATURE(EXT, Robustness2, ROBUSTNESS_2, robustness2)                                           \
+    FEATURE(EXT, ShaderFloat8, SHADER_FLOAT8, shader_float8)                                       \
     FEATURE(EXT, TransformFeedback, TRANSFORM_FEEDBACK, transform_feedback)                        \
     FEATURE(EXT, VertexInputDynamicState, VERTEX_INPUT_DYNAMIC_STATE, vertex_input_dynamic_state)  \
     FEATURE(KHR, CooperativeMatrix, COOPERATIVE_MATRIX, cooperative_matrix)                        \
+    FEATURE(NV, CooperativeMatrix2, COOPERATIVE_MATRIX_2, cooperative_matrix2)                     \
     FEATURE(KHR, Maintenance5, MAINTENANCE_5, maintenance5)                                        \
     FEATURE(KHR, Maintenance6, MAINTENANCE_6, maintenance6)                                        \
+    FEATURE(KHR, PipelineBinary, PIPELINE_BINARY, pipeline_binary)                                 \
     FEATURE(KHR, PipelineExecutableProperties, PIPELINE_EXECUTABLE_PROPERTIES,                     \
             pipeline_executable_properties)                                                        \
+    FEATURE(KHR, ShaderIntegerDotProduct, SHADER_INTEGER_DOT_PRODUCT, shader_integer_dot_product)  \
     FEATURE(KHR, ShaderQuadControl, SHADER_QUAD_CONTROL, shader_quad_control)                      \
     FEATURE(KHR, ShaderMaximalReconvergence, SHADER_MAXIMAL_RECONVERGENCE,                        \
             shader_maximal_reconvergence)                                                        \
@@ -94,6 +99,7 @@ VK_DEFINE_HANDLE(VmaPool)
     EXTENSION(EXT, CONDITIONAL_RENDERING, conditional_rendering)                                   \
     EXTENSION(EXT, CONSERVATIVE_RASTERIZATION, conservative_rasterization)                         \
     EXTENSION(EXT, DEPTH_RANGE_UNRESTRICTED, depth_range_unrestricted)                             \
+    EXTENSION(EXT, HDR_METADATA, hdr_metadata)                                                     \
     EXTENSION(EXT, MEMORY_BUDGET, memory_budget)                                                   \
     EXTENSION(EXT, ROBUSTNESS_2, robustness_2)                                                     \
     EXTENSION(EXT, SAMPLER_FILTER_MINMAX, sampler_filter_minmax)                                   \
@@ -339,6 +345,16 @@ public:
         return properties.properties.deviceID;
     }
 
+    /// Returns the PCI vendor ID of the physical device.
+    u32 GetVendorID() const {
+        return properties.properties.vendorID;
+    }
+
+    /// Returns the UUID the driver's pipeline cache data is valid for.
+    std::span<const u8, VK_UUID_SIZE> GetPipelineCacheUUID() const {
+        return properties.properties.pipelineCacheUUID;
+    }
+
     /// Returns the device name.
     std::string_view GetModelName() const {
         return properties.properties.deviceName;
@@ -378,6 +394,12 @@ public:
         const VkDriverIdKHR id = GetDriverID();
         return id != VK_DRIVER_ID_AMD_PROPRIETARY && id != VK_DRIVER_ID_AMD_OPEN_SOURCE &&
                id != VK_DRIVER_ID_MESA_RADV;
+    }
+
+    /// Whether a pipeline cache can be read while pipelines build into it, as Vulkan allows. Intel's
+    /// Windows driver crashes in vkGetPipelineCacheData when a build is running.
+    bool CanReadPipelineCacheDuringBuilds() const {
+        return GetDriverID() != VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS;
     }
 
     /// Returns true for tile-based deferred renderers.
@@ -425,6 +447,7 @@ public:
     FN_MAX_LIMIT_ELEM(PerStageDescriptorSampledImages) \
     FN_MAX_LIMIT_ELEM(PerStageDescriptorStorageBuffers) \
     FN_MAX_LIMIT_ELEM(PerStageResources) \
+    FN_MAX_LIMIT_ELEM(PerStageDescriptorSamplers) \
     FN_MAX_LIMIT_ELEM(DescriptorSetSamplers) \
     FN_MAX_LIMIT_ELEM(DescriptorSetUniformBuffers) \
     FN_MAX_LIMIT_ELEM(DescriptorSetUniformBuffersDynamic) \
@@ -655,6 +678,11 @@ FN_MAX_LIMIT_LIST
     /// Returns true if VK_KHR_swapchain_mutable_format is enabled.
     bool IsKhrSwapchainMutableFormatEnabled() const {
         return extensions.swapchain_mutable_format;
+    }
+
+    /// Returns true if VK_EXT_hdr_metadata is enabled.
+    bool IsExtHdrMetadataEnabled() const {
+        return extensions.hdr_metadata;
     }
 
     /// Returns true if VK_KHR_shader_float_controls is enabled.
@@ -1152,6 +1180,12 @@ FN_MAX_LIMIT_LIST
         return extensions.maintenance4;
     }
 
+    /// Returns true if VK_KHR_pipeline_binary is enabled: only shader cache v2 enables it, on
+    /// drivers that don't prefer their own cache.
+    bool IsKhrPipelineBinarySupported() const {
+        return extensions.pipeline_binary;
+    }
+
     /// Returns true if the device supports VK_KHR_maintenance5.
     bool IsKhrMaintenance5Supported() const {
         return extensions.maintenance5;
@@ -1195,6 +1229,9 @@ FN_MAX_LIMIT_LIST
                features.bit16_storage.storageBuffer16BitAccess;
     }
 
+    /// What the fsr4-vk FSR 4 port needs, as enabled on this device.
+    [[nodiscard]] VideoCommon::Fsr4PortDevice Fsr4PortDevice() const;
+
     [[nodiscard]] static constexpr bool CheckBrokenCompute(VkDriverId driver_id,
                                                            u32 driver_version) {
         if (driver_id == VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS) {
@@ -1213,6 +1250,15 @@ FN_MAX_LIMIT_LIST
 
     bool IsNvidia() const noexcept {
         return properties.driver.driverID == VK_DRIVER_ID_NVIDIA_PROPRIETARY;
+    }
+
+    /// NVIDIA's and AMD's drivers keep a disk cache of built pipelines of their own, so the
+    /// emulator keeps none on top: a VkPipelineCache only kept every pipeline the title ever built
+    /// in host memory (title 1: a 245 MB file, ~0.35 GB of RAM for the session) and copied it whole
+    /// at each save, which stalled frames, and pipelines built no slower without it.
+    bool DriverCachesPipelines() const noexcept {
+        return properties.driver.driverID == VK_DRIVER_ID_NVIDIA_PROPRIETARY ||
+               properties.driver.driverID == VK_DRIVER_ID_AMD_PROPRIETARY;
     }
 
     bool IsMoltenVK() const noexcept {
@@ -1331,6 +1377,7 @@ private:
         VkPhysicalDeviceSubgroupSizeControlProperties subgroup_size_control{};
         VkPhysicalDeviceTransformFeedbackPropertiesEXT transform_feedback{};
         VkPhysicalDeviceMaintenance5PropertiesKHR maintenance5{};
+        VkPhysicalDevicePipelineBinaryPropertiesKHR pipeline_binary{};
         VkPhysicalDeviceDepthStencilResolveProperties depth_stencil_resolve{};
         VkPhysicalDeviceCustomBorderColorPropertiesEXT custom_border_color{};
         VkPhysicalDeviceCooperativeMatrixPropertiesKHR cooperative_matrix{};
@@ -1355,6 +1402,7 @@ private:
     bool float16_math{};                       ///< Shaders may do float16 arithmetic.
     bool cooperative_hmma_16x8x16{};           ///< HMMA runs on the guest's matrix shape.
     bool cooperative_hmma_16x16x16{};          ///< HMMA runs on 16x16x16 matrices.
+    bool fp8_matrix_shapes{}; ///< 16x16x16 FP16 and FP8 matrices with FP32 results (fsr4-vk).
     bool is_integrated{};                      ///< Is GPU an iGPU.
     bool is_virtual{};                         ///< Is GPU a virtual GPU.
     bool is_non_gpu{};                         ///< Is SoftwareRasterizer, FPGA, non-GPU device.

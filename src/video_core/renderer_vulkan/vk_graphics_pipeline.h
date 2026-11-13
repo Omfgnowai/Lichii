@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -10,14 +9,18 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <span>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 #include "common/thread_worker.h"
 #include "shader_recompiler/shader_info.h"
+#include "video_core/evicted_pointer_slots.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/renderer_vulkan/fixed_pipeline_state.h"
 #include "video_core/renderer_vulkan/pipeline_build.h"
@@ -68,13 +71,23 @@ struct hash<Vulkan::GraphicsPipelineCacheKey> {
 
 namespace Vulkan {
 
-class BackSplit;
 class Device;
+class PipelineBinaries;
 class PipelineStatistics;
 class RenderPassCache;
 class RescalingPushConstant;
 class RenderAreaPushConstant;
 class Scheduler;
+
+/// EDEN_NX2_DRAW_REUSE_PROBE=1: how many draws repeat the previous frame's slowly changing state,
+/// and what preparing them costs (RasterizerVulkan::NoteDrawReuse).
+inline bool DrawReuseProbeEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_DRAW_REUSE_PROBE");
+        return value != nullptr && value[0] == '1';
+    }();
+    return enabled;
+}
 
 /// Mesh emulation on a device without VK_EXT_mesh_shader: the mesh program (stage 0) is built as
 /// a compute shader that writes its output to a storage buffer, and this vertex shader draws it
@@ -99,25 +112,42 @@ struct MeshEmulationSetup {
     std::array<u32, 4> position_lines{~0U, ~0U, ~0U, ~0U}; ///< line of PositionX..W
 };
 
+/// What an evicted graphics pipeline needs to be built again without translating its shaders
+struct KeptGraphicsStages {
+    static constexpr size_t NUM_STAGES = Tegra::Engines::Maxwell3D::Regs::MaxShaderStage;
+
+    std::array<std::vector<u8>, NUM_STAGES> spirv; ///< zstd, empty for absent stages
+    std::array<std::unique_ptr<Shader::Info>, NUM_STAGES> infos;
+    std::optional<MeshEmulationSetup> mesh_emulation;
+    VideoCommon::EvictedPointerSlots::Slots mapped_pointers;
+
+    /// Memory it holds, roughly
+    [[nodiscard]] u64 Bytes() const noexcept;
+};
+
 class GraphicsPipeline {
     static constexpr size_t NUM_STAGES = Tegra::Engines::Maxwell3D::Regs::MaxShaderStage;
 
 public:
     explicit GraphicsPipeline(
         Scheduler& scheduler, BufferCache& buffer_cache, TextureCache& texture_cache,
-        vk::PipelineCache& pipeline_cache, VideoCore::ShaderNotify* shader_notify,
+        vk::PipelineCache& pipeline_cache, PipelineBinaries* binaries,
+        VideoCore::ShaderNotify* shader_notify,
         const Device& device, DescriptorPool& descriptor_pool,
         GuestDescriptorQueue& guest_descriptor_queue,
-        DescriptorBufferRing& descriptor_buffer_ring, Common::ThreadWorker* worker_thread,
+        DescriptorBufferRing& descriptor_buffer_ring, const PipelineBuildQueue& build_queue,
         PipelineStatistics* pipeline_statistics, RenderPassCache& render_pass_cache,
-        const GraphicsPipelineCacheKey& key, std::array<vk::ShaderModule, NUM_STAGES> stages,
+        const GraphicsPipelineCacheKey& key, std::array<std::vector<u32>, NUM_STAGES> stages,
         const std::array<const Shader::Info*, NUM_STAGES>& infos,
-        std::function<std::array<vk::ShaderModule, NUM_STAGES>()> emit_stages = {},
+        std::function<std::array<std::vector<u32>, NUM_STAGES>()> emit_stages = {},
         std::optional<MeshEmulationSetup> mesh_emulation = std::nullopt);
 
     static std::chrono::nanoseconds TakeHoldTime() noexcept;
+    /// Draws resolved from the texture memo and in full since the last call.
+    static std::pair<u64, u64> TakeTextureMemoCounts() noexcept;
 
     bool HasDynamicVertexInput() const noexcept { return key.state.dynamic_vertex_input; }
+    u64 DynamicAttributeTypes() const noexcept { return key.state.attribute_types; }
     const std::array<u64, 6>& ShaderHashes() const noexcept {
         return key.unique_hashes;
     }
@@ -129,7 +159,8 @@ public:
         VideoCommon::SamplerId sampler;
     };
 
-    /// The sampled textures of the last configured draw, kept while a sampled frame dump runs.
+    /// The sampled textures of the last configured draw, kept while a sampled frame dump or the
+    /// draw reuse probe runs.
     std::span<const SampledImage> SampledImages() const noexcept {
         return sampled_images;
     }
@@ -221,9 +252,8 @@ public:
 
     void AddTransition(GraphicsPipeline* transition);
 
-    /// `back_split`: the draw's EDEN_NX2_BACK_SPLIT pool, or nullptr.
-    bool Configure(bool is_indexed, BackSplit* back_split) {
-        return configure_func(this, is_indexed, back_split);
+    bool Configure(bool is_indexed) {
+        return configure_func(this, is_indexed);
     }
 
     [[nodiscard]] GraphicsPipeline* Next(const GraphicsPipelineCacheKey& current_key) noexcept {
@@ -251,21 +281,18 @@ public:
         return used;
     }
 
-    /// Translated while a texture handle indexed past the descriptor pool: that texture was
-    /// compiled as a null 2D texture, whatever the game binds there once the handle is written
-    /// (PipelineCache::RebuildPastPoolPipeline).
-    void MarkPastPoolTexture(u64 frame) noexcept {
-        past_pool_frame = frame;
-        past_pool_texture = true;
+    /// The constant buffer slots each program binds as storage buffer pointers
+    [[nodiscard]] const VideoCommon::EvictedPointerSlots::Slots& MappedPointers() const noexcept {
+        return mapped_pointers;
     }
 
-    [[nodiscard]] bool ReadPastPoolTexture() const noexcept {
-        return past_pool_texture;
+    void SetMappedPointers(VideoCommon::EvictedPointerSlots::Slots slots) noexcept {
+        mapped_pointers = std::move(slots);
     }
 
-    [[nodiscard]] u64 PastPoolFrame() const noexcept {
-        return past_pool_frame;
-    }
+    /// Moves out the SPIR-V kept after the build, with the stage infos: for a built pipeline being
+    /// evicted
+    [[nodiscard]] KeptGraphicsStages TakeKeptStages();
 
     /// Forgets the transitions, which may point to pipelines the cache evicted.
     void ClearTransitions() noexcept {
@@ -286,6 +313,11 @@ public:
         return build->IsBuilt();
     }
 
+    /// Builds it on this thread, for a pipeline made with PipelineBuildQueue::owner_builds
+    void Build() {
+        build->Build();
+    }
+
     /// Waits up to `timeout` for the build; true when built.
     [[nodiscard]] bool WaitBuilt(std::chrono::microseconds timeout) const {
         return build->WaitFor(timeout);
@@ -296,17 +328,22 @@ public:
     }
 
     /// Fast draw (nx2_fast_draw.h): whether draws can keep the image views and samplers the last
-    /// captured Configure resolved. Handles computed at draw time are resolved on every draw.
+    /// captured Configure resolved. Handles computed at draw time are evaluated again for each
+    /// delta draw (ComputedHandlesChanged).
     [[nodiscard]] bool TakesDeltaDraws() const noexcept {
         return delta_blocker == DeltaBlocker::None && delta_views_valid;
     }
+
+    /// Whether a handle the last captured Configure computed at draw time (a handle program, which
+    /// reads constant and storage buffers) evaluates to another value now: a delta draw would keep
+    /// views and samplers resolved from the old one.
+    [[nodiscard]] bool ComputedHandlesChanged() const;
 
     /// Why TakesDeltaDraws is false (diagnostics).
     enum class DeltaBlocker : u8 {
         None,
         WritesImages,
         Mesh,
-        ComputedHandles,
         NotConfigured,
         Count,
     };
@@ -319,6 +356,18 @@ public:
     /// Constant buffer slots per stage the pipeline reads texture and image handles from.
     [[nodiscard]] const std::array<u32, NUM_STAGES>& HandleConstantBuffers() const noexcept {
         return handle_constant_buffers;
+    }
+
+    /// The bytes [first, second) of a HandleConstantBuffers slot that handles are read from.
+    [[nodiscard]] std::pair<u32, u32> HandleRange(size_t stage, u32 slot) const noexcept {
+        return handle_ranges[stage][slot];
+    }
+
+    /// The same bytes word by word: sorted, disjoint ranges within HandleRange.
+    [[nodiscard]] std::span<const std::pair<u32, u32>> HandleWords(size_t stage,
+                                                                   u32 slot) const noexcept {
+        const auto [first, count] = handle_word_index[stage][slot];
+        return std::span{handle_words}.subspan(first, count);
     }
 
     /// Resolves and binds every buffer as Configure does (storage buffer addresses are read from
@@ -341,26 +390,9 @@ public:
     /// ConfigureDelta prepares none, Configure does.
     [[nodiscard]] bool DeltaImagesChange() const noexcept;
 
-    /// The shader info of a pipeline stage (vertex B to fragment), null for a stage it lacks.
-    [[nodiscard]] const Shader::Info* StageInfo(size_t stage) const noexcept {
-        return stage_present[stage] ? &stage_infos[stage] : nullptr;
-    }
-
-    /// Built from a precompiled pipeline's recorded environments and shader infos (see
-    /// PipelineCache::CreatePrecompiledGraphicsPipeline): a failed build is replaced by a
-    /// pipeline translated from the game's state.
-    void MarkPrecompiled() noexcept {
-        precompiled = true;
-    }
-    [[nodiscard]] bool IsPrecompiled() const noexcept {
-        return precompiled;
-    }
-
     template <typename Spec>
     static auto MakeConfigureSpecFunc() {
-        return [](GraphicsPipeline* pl, bool is_indexed, BackSplit* back_split) {
-            return pl->ConfigureImpl<Spec>(is_indexed, back_split);
-        };
+        return [](GraphicsPipeline* pl, bool is_indexed) { return pl->ConfigureImpl<Spec>(is_indexed); };
     }
 
     void SetEngine(Tegra::Engines::Maxwell3D* maxwell3d_, Tegra::MemoryManager* gpu_memory_) {
@@ -370,7 +402,7 @@ public:
 
 private:
     template <typename Spec>
-    bool ConfigureImpl(bool is_indexed, BackSplit* back_split);
+    bool ConfigureImpl(bool is_indexed);
 
     void KeepImageDescriptors(size_t stage, size_t first_entry);
 
@@ -388,24 +420,24 @@ private:
     TextureCache& texture_cache;
     BufferCache& buffer_cache;
     vk::PipelineCache& pipeline_cache;
+    PipelineBinaries* const binaries; ///< Shader cache v2's driver layer, else null
     Scheduler& scheduler;
     GuestDescriptorQueue& guest_descriptor_queue;
     DescriptorBufferRing& descriptor_buffer_ring;
 
-    bool (*configure_func)(GraphicsPipeline*, bool, BackSplit*){};
+    bool (*configure_func)(GraphicsPipeline*, bool){};
 
     std::vector<GraphicsPipelineCacheKey> transition_keys;
     std::vector<GraphicsPipeline*> transitions;
+    VideoCommon::EvictedPointerSlots::Slots mapped_pointers;
     u64 last_use_frame{};
     bool used{};
-    u64 past_pool_frame{};
-    bool past_pool_texture{};
 
+    std::array<std::vector<u32>, NUM_STAGES> spirv; ///< Until the build makes its modules
     std::array<vk::ShaderModule, NUM_STAGES> spv_modules;
+    std::array<std::vector<u8>, NUM_STAGES> kept_spirv; ///< zstd, after the build
 
     std::array<Shader::Info, NUM_STAGES> stage_infos;
-    std::array<bool, NUM_STAGES> stage_present{};
-    bool precompiled{};
     std::array<u32, 5> enabled_uniform_buffer_masks{};
     VideoCommon::UniformBufferSizes uniform_buffer_sizes{};
     u32 num_descriptor_entries{};
@@ -428,8 +460,28 @@ private:
     bool delta_mismatch{};
     std::array<bool, NUM_STAGES> configured_stages{};
     std::array<u32, NUM_STAGES> handle_constant_buffers{};
+    std::array<std::array<std::pair<u32, u32>, Tegra::Engines::Maxwell3D::Regs::MaxConstBuffers>,
+               NUM_STAGES>
+        handle_ranges{};
+    std::vector<std::pair<u32, u32>> handle_words;
+    std::array<std::array<std::pair<u16, u16>, Tegra::Engines::Maxwell3D::Regs::MaxConstBuffers>,
+               NUM_STAGES>
+        handle_word_index{};
     std::vector<VideoCommon::ImageViewInOut> delta_views;
     std::vector<VideoCommon::SamplerId> delta_samplers;
+    /// A descriptor whose handles the captured Configure computed at draw time: the descriptor
+    /// (stage, kind as ComputedHandleKind, index in its list) and its elements' values, count of
+    /// them from delta_computed_values[first_value].
+    struct ComputedHandle {
+        u8 stage;
+        u8 kind;
+        u16 descriptor;
+        u32 count;
+        u32 first_value;
+    };
+    enum ComputedHandleKind : u8 { TextureBuffer, ImageBuffer, Texture, Image };
+    std::vector<ComputedHandle> delta_computed_handles;
+    std::vector<u32> delta_computed_values;
     /// Delta draws: the image descriptor entries (first entry and count per
     /// stage) and rescaling words pushed for delta_views, which delta draws push again while no
     /// image changed its scale (TextureCache::ScaleEpoch).

@@ -4,7 +4,6 @@
 // SPDX-FileCopyrightText: Copyright 2024 Torzu Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -13,8 +12,10 @@
 #include <memory>
 #include <utility>
 #include <vector>
+#include <QByteArray>
 #include <QObject>
 #include <QString>
+#include <QTranslator>
 #include "common/common_types.h"
 #include "common/settings_enums.h"
 
@@ -27,15 +28,59 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent);
 
 std::unique_ptr<ComboboxTranslationMap> ComboboxEnumeration(QObject* parent);
 
+/// A text from the maps below, in the UI's language (the language `translator` holds). The maps
+/// hold the English texts, which QT_TRANSLATE_NOOP only marks for lupdate, so they are translated
+/// where they are shown. Many languages translate a setting's name in the settings dialog
+/// (ConfigurationShared) but have no status-bar translation (MainWindow) for it; those take the
+/// settings dialog's. A status-bar translation that keeps the English text, such as an acronym,
+/// stays: the translator returns it, and returns an empty string only for a missing one.
+inline QString TranslateMapText(const QTranslator& translator, const QString& text) {
+    const QByteArray source = text.toUtf8();
+    for (const char* const context : {"MainWindow", "ConfigurationShared"}) {
+        const QString translated = translator.translate(context, source.constData());
+        if (!translated.isEmpty()) {
+            return translated;
+        }
+    }
+    return text;
+}
+
 static const std::map<Settings::AntiAliasing, QString> anti_aliasing_texts_map = {
     {Settings::AntiAliasing::None, QStringLiteral(QT_TRANSLATE_NOOP("MainWindow", "None"))},
     {Settings::AntiAliasing::Fxaa, QStringLiteral(QT_TRANSLATE_NOOP("MainWindow", "FXAA"))},
     {Settings::AntiAliasing::Smaa, QStringLiteral(QT_TRANSLATE_NOOP("MainWindow", "SMAA"))},
 };
 
+static const std::map<Settings::NvidiaDlssQuality, QString> nvidia_dlss_quality_texts_map = {
+    {Settings::NvidiaDlssQuality::Automatic,
+     QStringLiteral(QT_TRANSLATE_NOOP("MainWindow", "Auto"))},
+    {Settings::NvidiaDlssQuality::Native, QStringLiteral(QT_TRANSLATE_NOOP("MainWindow", "DLAA"))},
+    {Settings::NvidiaDlssQuality::Quality,
+     QStringLiteral(QT_TRANSLATE_NOOP("MainWindow", "Quality"))},
+    {Settings::NvidiaDlssQuality::Balanced,
+     QStringLiteral(QT_TRANSLATE_NOOP("MainWindow", "Balanced"))},
+    {Settings::NvidiaDlssQuality::Performance,
+     QStringLiteral(QT_TRANSLATE_NOOP("MainWindow", "Performance"))},
+    {Settings::NvidiaDlssQuality::UltraPerformance,
+     QStringLiteral(QT_TRANSLATE_NOOP("MainWindow", "Ultra Performance"))},
+};
+
+static const std::map<Settings::NvidiaDlssPreset, QString> nvidia_dlss_preset_texts_map = {
+    {Settings::NvidiaDlssPreset::M, QStringLiteral(QT_TRANSLATE_NOOP("MainWindow", "M"))},
+    {Settings::NvidiaDlssPreset::NvidiaDefault,
+     QStringLiteral(QT_TRANSLATE_NOOP("MainWindow", "NVIDIA default"))},
+    {Settings::NvidiaDlssPreset::E, QStringLiteral(QT_TRANSLATE_NOOP("MainWindow", "E"))},
+    {Settings::NvidiaDlssPreset::F, QStringLiteral(QT_TRANSLATE_NOOP("MainWindow", "F"))},
+    {Settings::NvidiaDlssPreset::J, QStringLiteral(QT_TRANSLATE_NOOP("MainWindow", "J"))},
+    {Settings::NvidiaDlssPreset::K, QStringLiteral(QT_TRANSLATE_NOOP("MainWindow", "K"))},
+    {Settings::NvidiaDlssPreset::L, QStringLiteral(QT_TRANSLATE_NOOP("MainWindow", "L"))},
+};
+
 static const std::map<Settings::FrameGenType, QString> frame_gen_type_texts_map = {
     {Settings::FrameGenType::Lsfg, QStringLiteral(QT_TRANSLATE_NOOP("MainWindow", "LSFG"))},
     {Settings::FrameGenType::Fsr3, QStringLiteral(QT_TRANSLATE_NOOP("MainWindow", "Optical Flow"))},
+    {Settings::FrameGenType::NvidiaDlssG,
+     QStringLiteral(QT_TRANSLATE_NOOP("MainWindow", "NVIDIA DLSS Frame Generation"))},
 };
 
 static const std::map<Settings::ScalingFilter, QString> scaling_filter_texts_map = {
