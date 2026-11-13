@@ -15,6 +15,7 @@
 
 #include <fmt/ranges.h>
 
+#include "common/nx2_block_count.h"
 #include "common/display_hdr.h"
 #include "common/logging.h"
 #include <ranges>
@@ -271,6 +272,7 @@ void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebu
         return;
     }
 
+    Common::Nx2BlockCount::OnFrame();
     if (VideoCommon::StutterTrace::Enabled()) {
         VideoCommon::StutterTrace::OnPresent();
     }

@@ -26,6 +26,7 @@
 #include "dynarmic/backend/x64/perf_map.h"
 #include "dynarmic/backend/x64/stack_layout.h"
 #include "dynarmic/frontend/A64/a64_location_descriptor.h"
+#include "dynarmic/interface/block_hook.h"
 #include "dynarmic/frontend/A64/a64_types.h"
 #include "dynarmic/ir/basic_block.h"
 #include "dynarmic/ir/cond.h"
@@ -154,6 +155,21 @@ A64EmitX64::BlockDescriptor A64EmitX64::Emit(IR::Block& block) noexcept {
     if (!conf.omit_block_frame) {
         code.mov(code.qword[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, abi_base_pointer)], rbp);
         code.lea(rbp, code.ptr[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, abi_base_pointer) - 8]);
+    }
+
+    if (const BlockCounter counter_for = g_block_counter) {
+        // Runs before the block's own code. Only push, pop, mov and lea: no host flag and no
+        // register changes, so nothing a block may hold at its entry is touched.
+        const u64 counter = reinterpret_cast<u64>(
+            counter_for(A64::LocationDescriptor{block.Location()}.PC()));
+        code.push(rax);
+        code.push(rcx);
+        code.mov(rax, counter);
+        code.mov(rcx, code.qword[rax]);
+        code.lea(rcx, code.ptr[rcx + 1]);
+        code.mov(code.qword[rax], rcx);
+        code.pop(rcx);
+        code.pop(rax);
     }
 
     DEBUG_ASSERT(block.GetCondition() == IR::Cond::AL);

@@ -20,6 +20,7 @@
 #include "core/hle/kernel/nx2_thread_stats.h"
 #include "dynarmic/interface/A64/config.h"
 #include "dynarmic/interface/block_hook.h"
+#include "common/nx2_block_count.h"
 #include "common/nx2_sampler.h"
 
 namespace Core {
@@ -330,6 +331,9 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
             }
             Core::Nx2JitShare::NoteBlock(location);
         };
+    }
+    if (Common::Nx2BlockCount::Enabled() && Dynarmic::g_block_counter == nullptr) {
+        Dynarmic::g_block_counter = &Common::Nx2BlockCount::CounterFor;
     }
     Dynarmic::A64::UserConfig config;
 
